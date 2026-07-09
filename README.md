@@ -26,6 +26,9 @@ CMS server, the reading-room UI, and a server-verified relying party.
    shell** (`dist/index.html`): a WASM wire codec (`encodeIssue`/`decodeReply`) + the
    WebTransport transport + a minimal htmx, restylable with three stylesheets. *Then:*
    swap the Rust render template for XSLT stylesheet resources (`urn:cms:style:*`).
+3. **Passkey gate** (`webauthn-rs` relying party) — *this crate, now.* The room is gated
+   by a verified passkey that raises the connection's capability ceiling.
+4. WebGPU view (a `<cms-graph>` web component; view = query, SHACL-shape renderers).
 
 ## Run the reading room
 
@@ -41,16 +44,20 @@ cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files
 #    then: http://localhost:8080/#cert=<the printed sha-256>
 ```
 
-The page opens a WebTransport connection to `cms-server`, resolves
-`urn:cms:view:quic` over the wire, and swaps the returned HTML in; clicking a tag chip
-re-queries the graph. Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any
-browser once WebTransport went Baseline in March 2026 — but the local page uses
-`serverCertificateHashes` to trust the self-signed cert, and Firefox's support for
-that self-signed path lags, so it may not connect locally; with a real CA cert in
-production, drop `serverCertificateHashes` and all of them work). Auth is deferred to
-rung 3 — the server resolves under root, so run it on a trusted host.
-3. Server-verified passkey (relying party) → cap-scoped views; cap-on-entry.
-4. WebGPU view (a `<cms-graph>` web component; view = query, SHACL-shape renderers).
+The page opens a WebTransport connection to `cms-server`. **The room is gated by a
+passkey** (rung 3): the server resolves under a public ceiling until a verified passkey
+raises it, so on first run click **register passkey** (Touch ID) to enrol, then **sign
+in** — the WebAuthn ceremony rides over the wire as `urn:auth:*`, the server (a
+`webauthn-rs` relying party) verifies it and mints the connection's capability. After
+sign-in the reading room loads; clicking a tag chip re-queries the graph. The passkey
+store persists at `<src_dir>/.cms-passkeys.json` (override with `CMS_PASSKEYS`); the RP
+origin defaults to `http://localhost:8080` (override with `CMS_RP_ORIGIN`/`CMS_RP_ID`).
+
+Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any browser once WebTransport
+went Baseline in March 2026 — but the local page uses `serverCertificateHashes` to trust
+the self-signed cert, and Firefox's support for that self-signed path lags, so it may not
+connect locally; with a real CA cert in production, drop `serverCertificateHashes` and all
+of them work).
 
 ## The render pipeline (target)
 

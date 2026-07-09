@@ -16,6 +16,8 @@
   .seg button { border:none; border-right:1px solid var(--line); background:transparent; color:var(--mut); padding:6px 11px; font:13px system-ui; cursor:pointer; }
   .seg button:last-child { border-right:none; }
   .seg button[aria-pressed=true] { background:var(--card); color:var(--fg); font-weight:500; }
+  .auth button { border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--fg); padding:6px 11px; font:13px system-ui; cursor:pointer; margin-left:6px; }
+  .auth button:hover { background:var(--card); }
   .status { margin-left:auto; font:12px ui-monospace, monospace; color:var(--mut); }
   .status.err { color:#c0392b; }
   .connect { border:1px solid var(--line); border-radius:12px; padding:16px 18px; background:var(--card); margin-top:12px; }
@@ -33,6 +35,10 @@
       <button data-style="catalog" aria-pressed="true">catalog</button>
       <button data-style="mosaic" aria-pressed="false">mosaic</button>
       <button data-style="agenda" aria-pressed="false">agenda</button>
+    </div>
+    <div class="auth">
+      <button id="signin">sign in</button>
+      <button id="register">register passkey</button>
     </div>
     <span class="status" id="status">not connected</span>
   </header>
@@ -60,6 +66,7 @@ const START_VIEW = 'urn:cms:view:quic';
 let wt = null;
 let currentStyle = 'catalog';   // the named urn:cms:style:* the view renders through
 let currentView = START_VIEW;   // the current urn:cms:view:{tag}, re-rendered on restyle
+let signedIn = false;           // a verified passkey has raised the server ceiling
 
 async function readAll(readable) {
   const reader = readable.getReader(), chunks = [];
@@ -107,6 +114,43 @@ document.querySelectorAll('.seg button').forEach((b) =>
   })
 );
 
+// --- passkey identity (rung 3b) ---------------------------------------------
+// The room is gated: the server resolves under a public ceiling until a verified passkey
+// raises it. The WebAuthn ceremony runs in THIS page's origin (that's where WebAuthn
+// binds); the wire just ferries the challenge/assertion to the server's relying party.
+async function authCall(iri, args) {
+  const resp = await wireCall(encodeIssue(iri, JSON.stringify(args || {})));
+  let obj;
+  try { obj = JSON.parse(resp); } catch { throw new Error(resp.replace(/<[^>]+>/g, '').trim()); }
+  if (obj.error) throw new Error(obj.error);
+  return obj;
+}
+
+async function passkeyLogin() {
+  try {
+    setStatus('waiting for passkey…');
+    const opts = await authCall('urn:auth:login:start', {});
+    const options = PublicKeyCredential.parseRequestOptionsFromJSON(opts.publicKey || opts);
+    const assertion = await navigator.credentials.get({ publicKey: options });
+    await authCall('urn:auth:login:finish', { credential: JSON.stringify(assertion.toJSON()) });
+    signedIn = true;
+    setStatus('signed in');
+    document.querySelector('.auth').style.display = 'none';
+    await loadView(currentView);
+  } catch (e) { setStatus('sign-in failed: ' + e.message, true); }
+}
+
+async function passkeyRegister() {
+  try {
+    setStatus('creating a passkey…');
+    const opts = await authCall('urn:auth:register:start', { name: 'ikigai' });
+    const options = PublicKeyCredential.parseCreationOptionsFromJSON(opts.publicKey || opts);
+    const cred = await navigator.credentials.create({ publicKey: options });
+    await authCall('urn:auth:register:finish', { credential: JSON.stringify(cred.toJSON()) });
+    setStatus('passkey enrolled — now sign in');
+  } catch (e) { setStatus('registration failed: ' + e.message, true); }
+}
+
 async function connectAndLoad(certHex) {
   if (typeof WebTransport === 'undefined') { setStatus('no WebTransport — use Chrome/Edge or Safari 26.4+', true); return; }
   const port = params.get('port') || '4433';
@@ -116,12 +160,15 @@ async function connectAndLoad(certHex) {
     wt = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBytes(certHex) }] });
     await wt.ready;
     connect.style.display = 'none';
-    setStatus('connected · ' + url);
-    await loadView(START_VIEW);
+    setStatus('connected — sign in to read');
+    room.innerHTML = '<p style="color:var(--mut)">Sign in with your passkey to read the room. (First run: register a passkey.)</p>';
   } catch (err) {
     setStatus('connect failed: ' + err, true);
   }
 }
+
+document.getElementById('signin').addEventListener('click', passkeyLogin);
+document.getElementById('register').addEventListener('click', passkeyRegister);
 
 await init();
 const certParam = params.get('cert');
