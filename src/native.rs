@@ -305,4 +305,30 @@ mod tests {
             "expected 2 tagged bookmarks, got: {json}"
         );
     }
+
+    #[test]
+    fn the_view_chain_enforces_capabilities() {
+        use ikigai_core::Capability;
+        let (_dir, kernel) = kernel_over_fixture();
+        let iri = || Iri::parse("urn:cms:view:quic").unwrap();
+        // The whole view chain bottoms out in an fs read of the source jail, which the
+        // FileEndpoint gates on the session capability. Under root it's allowed → the
+        // view resolves. This is the boundary rung 3's clamp will enforce per-principal.
+        assert!(
+            Resolver::issue_as(
+                &kernel,
+                Request::new(Verb::Source, iri()),
+                &Capability::root()
+            )
+            .is_ok(),
+            "root resolves the view"
+        );
+        // Under a capability that doesn't grant the source read, the fs endpoint denies
+        // and the whole view fails — so clamping the session cap down actually gates it.
+        let restricted = Capability::scoped(["urn:cap:cms:nothing"]);
+        assert!(
+            Resolver::issue_as(&kernel, Request::new(Verb::Source, iri()), &restricted).is_err(),
+            "a cap without the source read is denied"
+        );
+    }
 }
