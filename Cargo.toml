@@ -1,0 +1,30 @@
+[package]
+name = "ikigai-cms-web"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The semantic-CMS reading room: a WebTransport-served kernel over the CMS graph, with an htmx + WebGPU browser front-end. Rung 1 = build_cms_kernel composes the bookmark graph (org → Turtle) + SPARQL over it."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ikigai-rs/ikigai-cms-web"
+
+[dependencies]
+# The released kernel, from crates.io — the SAME version the modules link, so the
+# host links exactly one ikigai-core (no duplicate-crate type mismatch).
+ikigai-core = "0.1.46"
+# The CMS transreptors (urn:cms:*) — bookmarks_to_turtle + the space().
+# 0.1.2 = skolemized subjects (urn:cms:bookmark:*), URL as dc:identifier.
+ikigai-cms = "0.1.2"
+# SPARQL over graph=<uri> sources resolved through the kernel (Oxigraph in-memory).
+ikigai-sparql = "0.1.5"
+# Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
+ikigai-fs = "0.1.4"
+# Endpoint::invoke is async (dyn via async-trait) — the assembly endpoint reads its
+# source through the kernel, so it needs the async trait.
+async-trait = "0.1"
+
+[dev-dependencies]
+# Resolver::issue drives a request against the kernel in tests.
+ikigai-resolve = "0.1.9"
+futures = "0.3"
+# A throwaway source jail for the hermetic integration test.
+tempfile = "3"
