@@ -21,10 +21,28 @@ ikigai-fs = "0.1.4"
 # Endpoint::invoke is async (dyn via async-trait) — the assembly endpoint reads its
 # source through the kernel, so it needs the async trait.
 async-trait = "0.1"
+# Resolver::issue drives a request against the kernel (the server bin, the example,
+# and the tests all issue). Small crate, so a normal dep rather than dev-only.
+ikigai-resolve = "0.1.9"
+
+# The WebTransport server (rung 2). Behind the `server` feature so the default build
+# and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
+wtransport = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"], optional = true }
+# The on-wire Call/Reply codec — the SAME bytes ikigai-ipc/quic and the browser speak.
+ikigai-wire = { version = "0.1", optional = true }
+
+[features]
+# The native WebTransport server. Off by default (keeps the wasm/browser build and the
+# fast CI lean); enable for `cms-server`.
+server = ["dep:wtransport", "dep:tokio", "dep:ikigai-wire"]
+
+[[bin]]
+name = "cms-server"
+path = "src/bin/server.rs"
+required-features = ["server"]
 
 [dev-dependencies]
-# Resolver::issue drives a request against the kernel in tests.
-ikigai-resolve = "0.1.9"
 futures = "0.3"
 # A throwaway source jail for the hermetic integration test.
 tempfile = "3"

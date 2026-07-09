@@ -17,7 +17,12 @@ CMS server, the reading-room UI, and a server-verified relying party.
    (`urn:cms:graph`, org → Turtle via the `ikigai-cms` transreptor), and SPARQL over
    it (`urn:sparql:*`). A `SELECT` over `graph=urn:cms:graph` returns the tagged
    bookmarks — proven by the integration tests.
-2. WebTransport server + htmx reading room (XSLT type-renderers over RDF/XML).
+2. **WebTransport server** (`cms-server`) — *this crate, now.* `cargo run --features
+   server --bin cms-server -- [port] [src_dir]` serves `build_cms_kernel` over
+   WebTransport (HTTP/3 over QUIC), speaking the `ikigai-wire` `Call`/`Reply` protocol
+   — the same bytes `ikigai-ipc`/`ikigai-quic` speak. SPARQL over the graph runs
+   server-side; the browser renders the result. *Then:* the htmx reading room (XSLT
+   type-renderers over RDF/XML).
 3. Server-verified passkey (relying party) → cap-scoped views; cap-on-entry.
 4. WebGPU view (a `<cms-graph>` web component; view = query, SHACL-shape renderers).
 

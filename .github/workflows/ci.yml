@@ -23,3 +23,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: clippy (server feature)
+        run: cargo clippy --features server --bin cms-server -- -D warnings
