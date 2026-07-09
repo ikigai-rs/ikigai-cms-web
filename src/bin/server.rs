@@ -57,6 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("open the reading room with  #cert={hash_hex}  in the URL");
 
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir));
+    // The session ceiling: the most a client on this connection may hold. Root for now
+    // (the trusted-host posture); rung 3's relying party lowers it, per connection, to
+    // the verified passkey principal's entitlement — after which a carried capability is
+    // clamped to it (a client can attenuate, never exceed).
+    let ceiling = Arc::new(Capability::root());
 
     let config = ServerConfig::builder()
         .with_bind_default(port)
@@ -68,8 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let incoming = server.accept().await;
         let kernel = Arc::clone(&kernel);
+        let ceiling = Arc::clone(&ceiling);
         tokio::spawn(async move {
-            if let Err(e) = serve(incoming, kernel).await {
+            if let Err(e) = serve(incoming, kernel, ceiling).await {
                 eprintln!("session ended: {e}");
             }
         });
@@ -81,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve(
     incoming: IncomingSession,
     kernel: Arc<Kernel>,
+    ceiling: Arc<Capability>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = incoming.await?.accept().await?;
     loop {
@@ -90,7 +97,7 @@ async fn serve(
         };
         let mut bytes = Vec::new();
         recv.take(MAX_CALL as u64).read_to_end(&mut bytes).await?;
-        let reply = dispatch(&kernel, &bytes);
+        let reply = dispatch(&kernel, &ceiling, &bytes);
         send.write_all(&reply).await?;
         send.finish().await?;
     }
@@ -98,19 +105,21 @@ async fn serve(
 
 /// Decode a `Call`, resolve it against the kernel (SPARQL over the CMS graph runs
 /// here), and encode the `Reply`. The stream boundary frames the message.
-fn dispatch(kernel: &Kernel, bytes: &[u8]) -> Vec<u8> {
+fn dispatch(kernel: &Kernel, ceiling: &Capability, bytes: &[u8]) -> Vec<u8> {
     let reply = match decode::<Call>(bytes) {
         Ok(Call::Issue(request)) => match Resolver::issue(kernel, request) {
             Ok((representation, status)) => Reply::Resolved(representation, status),
             Err(e) => Reply::Error(e),
         },
-        // Capability-on-the-wire. Like web-demo, this server authenticates no client
-        // principal yet (self-signed cert, no client auth), so its effective entitlement
-        // is root and the carried capability is already ≤ root — resolving under it *is*
-        // the clamp. Rung 3 (a passkey relying party) replaces this with the verified
-        // principal's `entitlement.clamp(carried)`.
-        Ok(Call::IssueAs(request, capability)) => {
-            match Resolver::issue_as(kernel, request, &capability) {
+        // Capability-on-the-wire: clamp the client's carried capability to this session's
+        // ceiling before resolving, so it can only *attenuate*, never exceed. The ceiling
+        // is root today (a no-op clamp — the trusted-host posture); rung 3's relying party
+        // sets it to the verified principal's entitlement, at which point this line is the
+        // enforcement boundary. The CMS view chain already honors it (an fs read down the
+        // chain is denied without the grant).
+        Ok(Call::IssueAs(request, carried)) => {
+            let effective = ceiling.clamp(&carried);
+            match Resolver::issue_as(kernel, request, &effective) {
                 Ok((representation, status)) => Reply::Resolved(representation, status),
                 Err(e) => Reply::Error(e),
             }
