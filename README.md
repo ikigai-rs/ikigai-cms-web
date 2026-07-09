@@ -21,8 +21,30 @@ CMS server, the reading-room UI, and a server-verified relying party.
    server --bin cms-server -- [port] [src_dir]` serves `build_cms_kernel` over
    WebTransport (HTTP/3 over QUIC), speaking the `ikigai-wire` `Call`/`Reply` protocol
    — the same bytes `ikigai-ipc`/`ikigai-quic` speak. SPARQL over the graph runs
-   server-side; the browser renders the result. *Then:* the htmx reading room (XSLT
-   type-renderers over RDF/XML).
+   server-side; the browser renders the result. Plus **`urn:cms:view:{tag}`** — a view
+   renders to an htmx HTML fragment of cards (a view is a query). Plus the **browser
+   shell** (`dist/index.html`): a WASM wire codec (`encodeIssue`/`decodeReply`) + the
+   WebTransport transport + a minimal htmx, restylable with three stylesheets. *Then:*
+   swap the Rust render template for XSLT stylesheet resources (`urn:cms:style:*`).
+
+## Run the reading room
+
+```sh
+# 1. build the browser wire codec (once, or after changing src/wire_client.rs)
+./build-wasm.sh
+
+# 2. start the kernel server over WebTransport (prints a cert sha-256)
+cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files
+
+# 3. serve dist/ (any static server) and open index.html with the printed hash:
+#    file: python3 -m http.server --directory dist 8080
+#    then: http://localhost:8080/#cert=<the printed sha-256>
+```
+
+The page opens a WebTransport connection to `cms-server`, resolves
+`urn:cms:view:quic` over the wire, and swaps the returned HTML in; clicking a tag chip
+re-queries the graph. Needs a WebTransport-capable browser (Chrome/Edge). Auth is
+deferred to rung 3 — the server resolves under root, so run it on a trusted host.
 3. Server-verified passkey (relying party) → cap-scoped views; cap-on-entry.
 4. WebGPU view (a `<cms-graph>` web component; view = query, SHACL-shape renderers).
 
