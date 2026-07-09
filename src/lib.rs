@@ -19,5 +19,10 @@ mod native;
 #[cfg(not(target_family = "wasm"))]
 pub use native::build_cms_kernel;
 
+// The server-side WebAuthn relying party (rung 3b) — behind the `server` feature with
+// the rest of the native server stack.
+#[cfg(feature = "server")]
+pub mod session;
+
 #[cfg(target_family = "wasm")]
 mod wire_client;

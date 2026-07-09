@@ -43,15 +43,21 @@ ikigai-resolve = "0.1.9"
 # and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
 wtransport = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"], optional = true }
+# Rung 3b: the server-side WebAuthn relying party. Verifies a passkey assertion and maps
+# the credential to its granted capability scopes (the connection's ceiling).
+webauthn-rs = { version = "0.5.5", optional = true }
+url = { version = "2", optional = true }                                   # rp_origin
+uuid = { version = "1", features = ["v4"], optional = true }               # user handle
+serde = { version = "1", features = ["derive"], optional = true }          # the {Passkey → scopes} store
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen = "=0.2.108"
 
 [features]
-# The native WebTransport server. Off by default (keeps the wasm/browser build and the
-# fast CI lean); enable for `cms-server`.
-server = ["dep:wtransport", "dep:tokio"]
+# The native WebTransport server + WebAuthn relying party. Off by default (keeps the
+# wasm/browser build and the fast CI lean); enable for `cms-server`.
+server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde"]
 
 [[bin]]
 name = "cms-server"
