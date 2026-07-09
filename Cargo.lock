@@ -967,6 +967,7 @@ dependencies = [
  "ikigai-core",
  "ikigai-fs",
  "ikigai-resolve",
+ "ikigai-secret",
  "ikigai-sparql",
  "ikigai-wire",
  "ikigai-xslt",
@@ -1015,6 +1016,17 @@ dependencies = [
  "futures",
  "ikigai-core",
  "serde",
+]
+
+[[package]]
+name = "ikigai-secret"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cfa30f5d4dced926690ccfb2d247b285488736a8ff7e3f977245ff4fe7684af"
+dependencies = [
+ "async-trait",
+ "ikigai-core",
+ "security-framework",
 ]
 
 [[package]]

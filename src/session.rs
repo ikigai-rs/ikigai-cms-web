@@ -11,12 +11,15 @@
 //! `Passkey{Authentication,Registration}` state is held per-connection (never persisted),
 //! so no `danger-allow-state-serialisation`; only the enrolled `Passkey`s persist.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ikigai_core::Capability;
+use ikigai_secret::Backend;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
+
+/// The keystore item name the passkey store lives under (on macOS, a Keychain item).
+const STORE_NAME: &str = "cms-passkeys";
 
 /// One enrolled credential and the capability scopes it grants.
 #[derive(Serialize, Deserialize)]
@@ -31,26 +34,29 @@ struct Store {
     credentials: Vec<Enrolled>,
 }
 
-/// The relying party: the WebAuthn verifier + the enrolled-credential store.
+/// The relying party: the WebAuthn verifier + the enrolled-credential store, persisted
+/// through the OS keystore (macOS Keychain) rather than a plaintext file.
 pub struct Rp {
     webauthn: Webauthn,
     store: Mutex<Store>,
-    store_path: PathBuf,
+    backend: Arc<dyn Backend>,
 }
 
 impl Rp {
     /// Build the RP. `rp_id` is the registrable domain (e.g. `localhost`); `rp_origin` is
-    /// the page origin where the ceremony runs (e.g. `http://localhost:8080`).
-    pub fn new(rp_id: &str, rp_origin: &str, store_path: PathBuf) -> Result<Self, String> {
+    /// the page origin where the ceremony runs (e.g. `http://localhost:8080`); `backend`
+    /// is the secret store the `{Passkey → scopes}` table persists to.
+    pub fn new(rp_id: &str, rp_origin: &str, backend: Arc<dyn Backend>) -> Result<Self, String> {
         let origin = Url::parse(rp_origin).map_err(|e| format!("bad rp_origin: {e}"))?;
         let webauthn = WebauthnBuilder::new(rp_id, &origin)
             .map_err(|e| format!("webauthn builder: {e}"))?
             .build()
             .map_err(|e| format!("webauthn build: {e}"))?;
+        let store = load_store(backend.as_ref())?;
         Ok(Rp {
             webauthn,
-            store: Mutex::new(load_store(&store_path)),
-            store_path,
+            store: Mutex::new(store),
+            backend,
         })
     }
 
@@ -138,7 +144,7 @@ impl Rp {
             .map_err(|e| format!("register finish: {e}"))?;
         let mut store = self.store.lock().unwrap();
         store.credentials.push(Enrolled { passkey, scopes });
-        save_store(&self.store_path, &store)
+        save_store(self.backend.as_ref(), &store)
     }
 }
 
@@ -147,31 +153,39 @@ fn json<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|e| format!("serialize challenge: {e}"))
 }
 
-fn load_store(path: &Path) -> Store {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+/// Load the passkey store from the secret backend (empty if absent).
+fn load_store(backend: &dyn Backend) -> Result<Store, String> {
+    match backend
+        .get(STORE_NAME)
+        .map_err(|e| format!("read passkey store: {e}"))?
+    {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse passkey store: {e}"))
+        }
+        None => Ok(Store::default()),
+    }
 }
 
-fn save_store(path: &Path, store: &Store) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| format!("save store: {e}"))
+/// Persist the passkey store to the secret backend.
+fn save_store(backend: &dyn Backend, store: &Store) -> Result<(), String> {
+    let bytes = serde_json::to_vec(store).map_err(|e| e.to_string())?;
+    backend
+        .set(STORE_NAME, &bytes)
+        .map_err(|e| format!("save passkey store: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn backend(dir: &tempfile::TempDir) -> Arc<dyn Backend> {
+        Arc::new(ikigai_secret::FileBackend::new(dir.path()))
+    }
+
     #[test]
     fn rp_builds_and_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = Rp::new(
-            "localhost",
-            "http://localhost:8080",
-            dir.path().join("passkeys.json"),
-        )
-        .expect("rp builds");
+        let rp = Rp::new("localhost", "http://localhost:8080", backend(&dir)).expect("rp builds");
         assert!(!rp.is_enrolled(), "no credentials enrolled yet");
         // With nothing enrolled, a login can't start — the room stays gated.
         assert!(rp.login_start().is_err(), "no passkeys ⇒ no login");
@@ -180,6 +194,6 @@ mod tests {
     #[test]
     fn a_bad_origin_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Rp::new("localhost", "not a url", dir.path().join("s.json")).is_err());
+        assert!(Rp::new("localhost", "not a url", backend(&dir)).is_err());
     }
 }
