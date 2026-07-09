@@ -18,9 +18,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
-    ReprType, Representation, Result, Space, UriTemplate, Verb,
+    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
+    ReprType, Representation, Request, Result, Space, UriTemplate, Verb,
 };
+
+mod render;
 
 /// The bookmarks file, addressed within the CMS source jail (`urn:cms:src:*`). The
 /// jail root is supplied to [`build_cms_kernel`]; the path below is relative to it.
@@ -45,10 +47,17 @@ pub fn build_cms_kernel(src_dir: PathBuf) -> Kernel {
     );
     // The assembled graph resource SPARQL points `graph=` at.
     let graph = EndpointSpace::new().bind(Exact::new("urn:cms:graph"), BookmarkGraph);
+    // The reading-room views: `urn:cms:view:{tag}` → an htmx HTML fragment of every
+    // resource tagged `{tag}`, rendered as cards. A view IS a query.
+    let views = EndpointSpace::new().bind(
+        UriTemplate::parse("urn:cms:view:{tag}").expect("valid template"),
+        TagView,
+    );
 
     let spaces: Vec<Arc<dyn Space>> = vec![
         Arc::new(src) as Arc<dyn Space>,
         Arc::new(graph) as Arc<dyn Space>,
+        Arc::new(views) as Arc<dyn Space>,
         Arc::new(ikigai_cms::space()) as Arc<dyn Space>,
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
     ];
@@ -91,10 +100,62 @@ impl Endpoint for BookmarkGraph {
     }
 }
 
+/// `urn:cms:view:{tag}` — the reading room for a tag. Runs a SPARQL SELECT for every
+/// resource carrying `dc:subject "{tag}"` (title, URL, and its full tag set) and
+/// renders an htmx HTML fragment of cards. Cacheable and golden-threaded through the
+/// query it issues, so an edit to the graph refreshes the view.
+///
+/// The render is a Rust template for now; it moves to swappable XSLT stylesheet
+/// resources (`urn:cms:style:*`) next, so the room can be restyled without a rebuild.
+struct TagView;
+
+#[async_trait]
+impl Endpoint for TagView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let tag = inv
+            .bindings
+            .get("tag")
+            .ok_or_else(|| Error::MissingArgument("tag".to_string()))?;
+        // The tag rides into a SPARQL string literal — escape the two chars that could
+        // break out of it (a tag comes from a URI suffix, but stay safe by construction).
+        let safe = tag.replace('\\', "\\\\").replace('"', "\\\"");
+        let query = format!(
+            "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             SELECT ?url ?title (GROUP_CONCAT(DISTINCT ?t; separator=\" \") AS ?tags) \
+             WHERE {{ ?s dc:subject \"{safe}\" ; dc:identifier ?url ; dc:title ?title ; \
+             dc:subject ?t }} GROUP BY ?url ?title ORDER BY ?title"
+        );
+        let sparql = Iri::parse("urn:sparql:select").expect("urn:sparql:select is a valid IRI");
+        let request = Request::new(Verb::Source, sparql)
+            .with_arg("query", ArgRef::Inline(query.into_bytes()))
+            .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+        let results = inv.issue(request).await?;
+        let rows = render::parse_rows(&results.bytes)
+            .map_err(|e| Error::Endpoint(format!("bad SPARQL results: {e}")))?;
+        Ok(Representation::new(
+            ReprType::new("text/html").with_param("charset", "utf-8"),
+            render::cards_html(tag, &rows).into_bytes(),
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "cms-view"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:view")
+            .summary(
+                "The reading room for a tag: an htmx HTML fragment of every resource \
+                 carrying `dc:subject {tag}`, rendered as cards. A view is a query.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ikigai_core::{ArgRef, Request};
     use ikigai_resolve::Resolver;
 
     /// Write a tiny bookmarks fixture at the exact path the kernel expects, then
@@ -128,6 +189,13 @@ mod tests {
         String::from_utf8(repr.bytes).unwrap()
     }
 
+    fn view(kernel: &Kernel, tag: &str) -> String {
+        let iri = Iri::parse(format!("urn:cms:view:{tag}")).unwrap();
+        let (repr, _status) =
+            Resolver::issue(kernel, Request::new(Verb::Source, iri)).expect("view resolves");
+        String::from_utf8(repr.bytes).unwrap()
+    }
+
     #[test]
     fn a_select_over_the_cms_graph_finds_a_tagged_bookmark() {
         let (_dir, kernel) = kernel_over_fixture();
@@ -145,6 +213,19 @@ mod tests {
         assert!(
             !json.contains("webassembly.org"),
             "the wasm bookmark should not match a quic query, got: {json}"
+        );
+    }
+
+    #[test]
+    fn a_tag_view_renders_html_cards_over_the_graph() {
+        let (_dir, kernel) = kernel_over_fixture();
+        let html = view(&kernel, "quic");
+        assert!(html.contains("class=\"cms-card\""), "{html}");
+        assert!(html.contains(">#quic</h2>"), "{html}");
+        assert!(html.contains("https://quicwg.org"), "{html}");
+        assert!(
+            !html.contains("webassembly.org"),
+            "only quic-tagged resources: {html}"
         );
     }
 

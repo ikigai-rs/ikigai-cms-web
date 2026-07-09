@@ -24,6 +24,9 @@ async-trait = "0.1"
 # Resolver::issue drives a request against the kernel (the server bin, the example,
 # and the tests all issue). Small crate, so a normal dep rather than dev-only.
 ikigai-resolve = "0.1.9"
+# Parse the SPARQL results JSON when rendering a view to HTML cards. (Interim: the
+# render is a Rust template; it moves to swappable XSLT stylesheet resources next.)
+serde_json = "1"
 
 # The WebTransport server (rung 2). Behind the `server` feature so the default build
 # and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
