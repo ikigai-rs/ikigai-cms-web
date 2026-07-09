@@ -1,2 +1,5 @@
 /target
 .cargo/config.toml
+/dist/ikigai_cms_web.js
+/dist/ikigai_cms_web*.d.ts
+/dist/ikigai_cms_web_bg.wasm
