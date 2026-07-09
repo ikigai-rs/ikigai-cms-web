@@ -70,28 +70,32 @@ impl Rp {
         !self.store.lock().unwrap().credentials.is_empty()
     }
 
-    /// Begin a login: the challenge options to send to the browser + the in-progress
-    /// state to hold on the connection until `login_finish`.
-    pub fn login_start(&self) -> Result<(RequestChallengeResponse, PasskeyAuthentication), String> {
+    /// Begin a login: the challenge options as JSON (for `navigator.credentials.get`) +
+    /// the in-progress state to hold on the connection until `login_finish`.
+    pub fn login_start(&self) -> Result<(String, PasskeyAuthentication), String> {
         let keys = self.passkeys();
         if keys.is_empty() {
             return Err("no enrolled passkeys".into());
         }
-        self.webauthn
+        let (challenge, state) = self
+            .webauthn
             .start_passkey_authentication(&keys)
-            .map_err(|e| format!("login start: {e}"))
+            .map_err(|e| format!("login start: {e}"))?;
+        Ok((json(&challenge)?, state))
     }
 
-    /// Finish a login: verify the browser's assertion against the held state, then map the
-    /// authenticated credential to its granted capability.
+    /// Finish a login: verify the browser's assertion (JSON) against the held state, then
+    /// map the authenticated credential to its granted capability.
     pub fn login_finish(
         &self,
-        cred: &PublicKeyCredential,
+        credential_json: &[u8],
         state: &PasskeyAuthentication,
     ) -> Result<Capability, String> {
+        let cred: PublicKeyCredential =
+            serde_json::from_slice(credential_json).map_err(|e| format!("bad credential: {e}"))?;
         let auth = self
             .webauthn
-            .finish_passkey_authentication(cred, state)
+            .finish_passkey_authentication(&cred, state)
             .map_err(|e| format!("login finish: {e}"))?;
         let store = self.store.lock().unwrap();
         let scopes = store
@@ -103,36 +107,44 @@ impl Rp {
         Ok(Capability::scoped(scopes))
     }
 
-    /// Begin registration — enroll a new passkey.
-    pub fn register_start(
-        &self,
-        user_name: &str,
-    ) -> Result<(CreationChallengeResponse, PasskeyRegistration), String> {
+    /// Begin registration — the challenge options as JSON (for `navigator.credentials.create`)
+    /// + the in-progress state to hold until `register_finish`.
+    pub fn register_start(&self, user_name: &str) -> Result<(String, PasskeyRegistration), String> {
         let exclude = self
             .passkeys()
             .iter()
             .map(|k| k.cred_id().clone())
             .collect();
-        self.webauthn
+        let (challenge, state) = self
+            .webauthn
             .start_passkey_registration(Uuid::new_v4(), user_name, user_name, Some(exclude))
-            .map_err(|e| format!("register start: {e}"))
+            .map_err(|e| format!("register start: {e}"))?;
+        Ok((json(&challenge)?, state))
     }
 
-    /// Finish registration: verify + persist the new credential with its granted scopes.
+    /// Finish registration: verify the browser's response (JSON) + persist the new
+    /// credential with its granted scopes (its entitlement).
     pub fn register_finish(
         &self,
-        cred: &RegisterPublicKeyCredential,
+        credential_json: &[u8],
         state: &PasskeyRegistration,
         scopes: Vec<String>,
     ) -> Result<(), String> {
+        let cred: RegisterPublicKeyCredential =
+            serde_json::from_slice(credential_json).map_err(|e| format!("bad credential: {e}"))?;
         let passkey = self
             .webauthn
-            .finish_passkey_registration(cred, state)
+            .finish_passkey_registration(&cred, state)
             .map_err(|e| format!("register finish: {e}"))?;
         let mut store = self.store.lock().unwrap();
         store.credentials.push(Enrolled { passkey, scopes });
         save_store(&self.store_path, &store)
     }
+}
+
+/// Serialize a WebAuthn challenge to the JSON the browser's WebAuthn API consumes.
+fn json<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|e| format!("serialize challenge: {e}"))
 }
 
 fn load_store(path: &Path) -> Store {
