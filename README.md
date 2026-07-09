@@ -43,8 +43,12 @@ cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files
 
 The page opens a WebTransport connection to `cms-server`, resolves
 `urn:cms:view:quic` over the wire, and swaps the returned HTML in; clicking a tag chip
-re-queries the graph. Needs a WebTransport-capable browser (Chrome/Edge). Auth is
-deferred to rung 3 — the server resolves under root, so run it on a trusted host.
+re-queries the graph. Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any
+browser once WebTransport went Baseline in March 2026 — but the local page uses
+`serverCertificateHashes` to trust the self-signed cert, and Firefox's support for
+that self-signed path lags, so it may not connect locally; with a real CA cert in
+production, drop `serverCertificateHashes` and all of them work). Auth is deferred to
+rung 3 — the server resolves under root, so run it on a trusted host.
 3. Server-verified passkey (relying party) → cap-scoped views; cap-on-entry.
 4. WebGPU view (a `<cms-graph>` web component; view = query, SHACL-shape renderers).
 

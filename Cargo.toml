@@ -29,6 +29,9 @@ serde_json = "1"
 ikigai-cms = "0.1.2"
 # SPARQL over graph=<uri> sources resolved through the kernel (Oxigraph in-memory).
 ikigai-sparql = "0.1.5"
+# XSLT transform (urn:xslt:transform, xrust) — the view pipes its CONSTRUCT'd RDF/XML
+# through a `urn:cms:style:*` stylesheet to render cards. Native/server-side only.
+ikigai-xslt = "0.1.0"
 # Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
 ikigai-fs = "0.1.4"
 # Endpoint::invoke is async (dyn via async-trait) — the assembly + view endpoints read
