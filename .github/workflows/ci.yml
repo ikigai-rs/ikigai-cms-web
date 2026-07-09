@@ -26,5 +26,7 @@ jobs:
         run: cargo test
       - name: clippy (server feature)
         run: cargo clippy --features server --bin cms-server -- -D warnings
+      - name: test (server feature)
+        run: cargo test --features server
       - name: clippy (wasm wire codec)
         run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
