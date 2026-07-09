@@ -23,41 +23,6 @@
   .connect input { width:100%; margin-top:10px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px ui-monospace, monospace; }
   #room { margin-top:16px; }
   .cms-error { color:#c0392b; font-size:14px; }
-
-  /* Shared card structure (matches urn:cms:view:{tag}'s emitted classes) */
-  .cms-head { display:flex; align-items:baseline; gap:10px; margin:0 0 14px; }
-  .cms-view-title { margin:0; font-size:20px; }
-  .cms-count { font-size:13px; color:var(--mut); }
-  .cms-title { display:block; color:var(--fg); text-decoration:none; }
-  .cms-title:hover { text-decoration:underline; }
-  .cms-host { color:var(--mut); }
-  .cms-tags { display:flex; flex-wrap:wrap; gap:6px; }
-  .cms-tag { text-decoration:none; cursor:pointer; }
-
-  /* Stylesheet: card catalog */
-  .style-catalog .cms-room { display:flex; flex-direction:column; gap:10px; }
-  .style-catalog .cms-view-title { font-family: Georgia, 'Times New Roman', serif; }
-  .style-catalog .cms-card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 16px; font-family: Georgia, serif; }
-  .style-catalog .cms-title { font-size:16px; margin-bottom:3px; }
-  .style-catalog .cms-host { font-size:13px; }
-  .style-catalog .cms-tags { margin-top:8px; }
-  .style-catalog .cms-tag { font:12px ui-monospace, monospace; color:var(--mut); }
-  .style-catalog .cms-tag::before { content:"#"; }
-
-  /* Stylesheet: mosaic */
-  .style-mosaic .cms-room { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; }
-  .style-mosaic .cms-card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
-  .style-mosaic .cms-title { font-size:14px; font-weight:500; line-height:1.4; margin-bottom:4px; }
-  .style-mosaic .cms-host { font-size:12px; margin-bottom:10px; }
-  .style-mosaic .cms-tag { font-size:11px; padding:2px 9px; border-radius:20px; background:var(--accent-bg); color:var(--accent); }
-
-  /* Stylesheet: agenda */
-  .style-agenda .cms-card { display:flex; align-items:baseline; gap:10px; font-family: ui-monospace, monospace; padding:7px 2px; border-bottom:1px solid var(--line); }
-  .style-agenda .cms-title { font-size:13px; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .style-agenda .cms-tags { order:2; }
-  .style-agenda .cms-host { order:3; font-size:12px; white-space:nowrap; }
-  .style-agenda .cms-tag { font-size:12px; color:var(--mut); }
-  .style-agenda .cms-tag::before { content:"#"; }
 </style>
 </head>
 <body>
@@ -79,7 +44,7 @@
     <input id="cert" placeholder="cert sha-256 hex" autocomplete="off" spellcheck="false" />
   </div>
 
-  <div id="room" class="style-catalog"></div>
+  <div id="room"></div>
 </div>
 
 <script type="module">
@@ -93,6 +58,8 @@ const params = new URLSearchParams(location.hash.slice(1));
 const START_VIEW = 'urn:cms:view:quic';
 
 let wt = null;
+let currentStyle = 'catalog';   // the named urn:cms:style:* the view renders through
+let currentView = START_VIEW;   // the current urn:cms:view:{tag}, re-rendered on restyle
 
 async function readAll(readable) {
   const reader = readable.getReader(), chunks = [];
@@ -111,33 +78,37 @@ async function wireCall(bytes) {
   return decodeReply(await readAll(stream.readable));
 }
 
-// Resolve an ikigai IRI over the wire and swap the HTML into `target`.
-async function loadInto(iri, target) {
-  const bytes = encodeIssue(iri, '{}');
-  if (!bytes.length) { target.innerHTML = '<p class="cms-error">bad iri: ' + iri + '</p>'; return; }
-  target.innerHTML = await wireCall(bytes);
+// Resolve a view over the wire, rendered through the current stylesheet, and swap it
+// into #room. The style rides as an arg — urn:cms:view:{tag} runs the CONSTRUCT and
+// pipes it through urn:cms:style:{style} server-side; the browser just swaps the HTML.
+async function loadView(iri) {
+  currentView = iri;
+  const bytes = encodeIssue(iri, JSON.stringify({ style: currentStyle }));
+  if (!bytes.length) { room.innerHTML = '<p class="cms-error">bad iri: ' + iri + '</p>'; return; }
+  room.innerHTML = await wireCall(bytes);
 }
 
-// A minimal htmx: any click on an [hx-get] resolves it over the wire and swaps it into
-// [hx-target] (default #room). The view fragment's tag chips carry these attributes, so
-// real htmx is a drop-in later — same markup, its beforeRequest routed to the wire.
+// A minimal htmx: a click on a tag chip ([hx-get]) re-queries the graph for that tag.
+// The markup is htmx-native, so real htmx is a drop-in (its request routed to the wire).
 room.addEventListener('click', (e) => {
   const el = e.target.closest('[hx-get]');
   if (!el) return;
   e.preventDefault();
-  const target = document.querySelector(el.getAttribute('hx-target') || '#room') || room;
-  loadInto(el.getAttribute('hx-get'), target);
+  loadView(el.getAttribute('hx-get'));
 });
 
+// Restyle = re-fetch the current view naming a different stylesheet resource. The look
+// is data: the server renders the same graph through a different XSLT.
 document.querySelectorAll('.seg button').forEach((b) =>
   b.addEventListener('click', () => {
     document.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-pressed', x === b));
-    room.className = 'style-' + b.dataset.style;
+    currentStyle = b.dataset.style;
+    if (wt) loadView(currentView);
   })
 );
 
 async function connectAndLoad(certHex) {
-  if (typeof WebTransport === 'undefined') { setStatus('no WebTransport — use Chrome/Edge', true); return; }
+  if (typeof WebTransport === 'undefined') { setStatus('no WebTransport — use Chrome/Edge or Safari 26.4+', true); return; }
   const port = params.get('port') || '4433';
   const url = 'https://127.0.0.1:' + port + '/';
   try {
@@ -146,7 +117,7 @@ async function connectAndLoad(certHex) {
     await wt.ready;
     connect.style.display = 'none';
     setStatus('connected · ' + url);
-    await loadInto(START_VIEW, room);
+    await loadView(START_VIEW);
   } catch (err) {
     setStatus('connect failed: ' + err, true);
   }
