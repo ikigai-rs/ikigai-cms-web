@@ -49,6 +49,8 @@ webauthn-rs = { version = "0.5.5", optional = true }
 url = { version = "2", optional = true }                                   # rp_origin
 uuid = { version = "1", features = ["v4"], optional = true }               # user handle
 serde = { version = "1", features = ["derive"], optional = true }          # the {Passkey → scopes} store
+# rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext.
+ikigai-secret = { version = "0.1.0", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -57,7 +59,7 @@ wasm-bindgen = "=0.2.108"
 [features]
 # The native WebTransport server + WebAuthn relying party. Off by default (keeps the
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
-server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde"]
+server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret"]
 
 [[bin]]
 name = "cms-server"

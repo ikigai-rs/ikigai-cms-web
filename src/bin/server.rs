@@ -9,8 +9,8 @@
 //! The WebAuthn ceremony rides over the same wire as `urn:auth:*` resources, intercepted
 //! here by the session layer (not the kernel). It binds to the *page* origin (where
 //! `navigator.credentials` runs, default `http://localhost:8080`), configurable via
-//! `CMS_RP_ID` / `CMS_RP_ORIGIN`; the `{Passkey → scopes}` store persists at
-//! `CMS_PASSKEYS` (default `<src_dir>/.cms-passkeys.json`).
+//! `CMS_RP_ID` / `CMS_RP_ORIGIN`; the `{Passkey → scopes}` store persists through the OS
+//! keystore (macOS Keychain via `ikigai-secret`), not a plaintext file.
 //!
 //! Run: `cargo run --features server --bin cms-server -- [port] [src_dir]`
 
@@ -50,14 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entitlement = Arc::new(vec![format!("urn:cap:fs:read:{}", src_dir.display())]);
 
     // The relying party. rp_id + page origin default to local dev; the passkey store
-    // persists beside the sources.
+    // persists through the OS keystore (macOS Keychain), not a plaintext file.
     let rp_id = std::env::var("CMS_RP_ID").unwrap_or_else(|_| "localhost".to_string());
     let rp_origin =
         std::env::var("CMS_RP_ORIGIN").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    let store_path = std::env::var_os("CMS_PASSKEYS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| src_dir.join(".cms-passkeys.json"));
-    let rp = Arc::new(Rp::new(&rp_id, &rp_origin, store_path)?);
+    let rp = Arc::new(Rp::new(
+        &rp_id,
+        &rp_origin,
+        ikigai_secret::default_backend(),
+    )?);
 
     let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
     let cert_hash = identity.certificate_chain().as_slice()[0].hash();

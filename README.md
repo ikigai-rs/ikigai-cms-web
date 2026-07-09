@@ -50,8 +50,9 @@ raises it, so on first run click **register passkey** (Touch ID) to enrol, then 
 in** — the WebAuthn ceremony rides over the wire as `urn:auth:*`, the server (a
 `webauthn-rs` relying party) verifies it and mints the connection's capability. After
 sign-in the reading room loads; clicking a tag chip re-queries the graph. The passkey
-store persists at `<src_dir>/.cms-passkeys.json` (override with `CMS_PASSKEYS`); the RP
-origin defaults to `http://localhost:8080` (override with `CMS_RP_ORIGIN`/`CMS_RP_ID`).
+store persists through the OS keystore — the **macOS Keychain** (via `ikigai-secret`), a
+dev file store elsewhere — not a plaintext file. The RP origin defaults to
+`http://localhost:8080` (override with `CMS_RP_ORIGIN`/`CMS_RP_ID`).
 
 Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any browser once WebTransport
 went Baseline in March 2026 — but the local page uses `serverCertificateHashes` to trust
