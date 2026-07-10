@@ -17,7 +17,9 @@
 #[cfg(not(target_family = "wasm"))]
 mod native;
 #[cfg(not(target_family = "wasm"))]
-pub use native::{build_cms_kernel, cms_spaces};
+mod presentations;
+#[cfg(not(target_family = "wasm"))]
+pub use native::{build_cms_kernel, build_cms_kernel_with, cms_spaces};
 
 // Graph maintenance (the link-checker) — behind the `maintenance` feature, which adds
 // outbound HTTP. `urn:cms:linkcheck` caches each check for a week.

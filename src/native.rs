@@ -30,12 +30,35 @@ const BOOKMARKS_SRC: &str = "urn:cms:src:old-org/pinboard-bookmarks.org";
 /// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
 pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
-    Kernel::new(Arc::new(Fallback::new(cms_spaces(src_dir, zotero))))
+    build_cms_kernel_with(src_dir, zotero, None)
+}
+
+/// [`build_cms_kernel`] plus a lectern presentations root (`urn:cms:graph:presentations`):
+/// the decks under it join the graph as `cms:Presentation` resources. `None` = no decks.
+pub fn build_cms_kernel_with(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+    presentations: Option<PathBuf>,
+) -> Kernel {
+    Kernel::new(Arc::new(Fallback::new(cms_spaces_with(
+        src_dir,
+        zotero,
+        presentations,
+    ))))
 }
 
 /// The spaces the CMS kernel is composed of, exposed so a maintenance kernel can add HTTP
 /// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings.
 pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Space>> {
+    cms_spaces_with(src_dir, zotero, None)
+}
+
+/// [`cms_spaces`] plus the presentations root bound to `urn:cms:graph:presentations`.
+pub fn cms_spaces_with(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+    presentations: Option<PathBuf>,
+) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
     let src = EndpointSpace::new().bind(
@@ -52,6 +75,12 @@ pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Spac
     let graph = EndpointSpace::new()
         .bind(Exact::new("urn:cms:graph:bookmarks"), BookmarkGraph)
         .bind(Exact::new("urn:cms:graph:books"), BooksGraph)
+        .bind(
+            Exact::new("urn:cms:graph:presentations"),
+            crate::presentations::PresentationsGraph {
+                root: presentations,
+            },
+        )
         .bind(Exact::new("urn:cms:graph"), CmsGraph);
     // The reading-room views — each IS a query, rendered as an htmx HTML fragment:
     // `urn:cms:view:{tag}` (cards for a tag), `urn:cms:search` (cards whose title
@@ -297,11 +326,21 @@ impl Endpoint for CmsGraph {
                 Iri::parse("urn:cms:graph:books").expect("valid IRI"),
             ))
             .await?;
+        // Presentations already carry `a cms:Presentation` (typed at the source), so unlike
+        // bookmarks they need no separate type-construct. Empty when no root is configured.
+        let presentations = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:presentations").expect("valid IRI"),
+            ))
+            .await?;
         let mut turtle = bookmarks.bytes;
         turtle.push(b'\n');
         turtle.extend_from_slice(&bookmark_types.bytes);
         turtle.push(b'\n');
         turtle.extend_from_slice(&books.bytes);
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&presentations.bytes);
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             turtle,
@@ -627,6 +666,7 @@ impl Endpoint for TypeView {
         let class = match ty.as_str() {
             "book" => "Book",
             "bookmark" => "Bookmark",
+            "presentation" => "Presentation",
             _ => return Err(Error::Endpoint(format!("no type `{ty}`"))),
         };
         let offset = page_offset(inv);
@@ -960,6 +1000,58 @@ mod tests {
         assert!(
             desc.find("Zulu").unwrap() < desc.find("Alpha").unwrap(),
             "desc puts Zulu before Alpha"
+        );
+    }
+
+    #[test]
+    fn presentations_are_browsable_by_type_and_venue_tag() {
+        // A minimal bookmarks source so the union graph assembles.
+        let src = tempfile::tempdir().unwrap();
+        let bm = src.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bm,
+            "* Bookmarks\n** [[https://x][X]]\n   :PROPERTIES:\n   :TAGS: misc\n   :END:\n",
+        )
+        .unwrap();
+        // A deck under a venue path → a free `#uberconf` tag, plus an authored topic tag.
+        let pres = tempfile::tempdir().unwrap();
+        let deck = pres.path().join("conferences/nfjs/uberconf/2026/quant-bio");
+        std::fs::create_dir_all(deck.join("slides")).unwrap();
+        std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").unwrap();
+        std::fs::write(
+            deck.join("slides/00-title.md"),
+            "# Quantitative Biology\n\n<span class=\"tag ink\">genomics</span>\n",
+        )
+        .unwrap();
+
+        let kernel = build_cms_kernel_with(
+            src.path().to_path_buf(),
+            None,
+            Some(pres.path().to_path_buf()),
+        );
+
+        // The type facet lists the deck as a Presentation.
+        let by_type = resolve_html(
+            &kernel,
+            "urn:cms:type:presentation",
+            &[("style", "catalog")],
+        );
+        assert!(
+            by_type.contains("Quantitative Biology"),
+            "deck in the presentations type view: {by_type}"
+        );
+        // The venue tag reaches it — the Uberconf navigation path, free from the directory.
+        let by_venue = resolve_html(&kernel, "urn:cms:view:uberconf", &[("style", "catalog")]);
+        assert!(
+            by_venue.contains("Quantitative Biology"),
+            "deck reachable by #uberconf: {by_venue}"
+        );
+        // And an authored topic tag works too.
+        let by_tag = resolve_html(&kernel, "urn:cms:view:genomics", &[("style", "catalog")]);
+        assert!(
+            by_tag.contains("Quantitative Biology"),
+            "deck reachable by an authored tag: {by_tag}"
         );
     }
 
