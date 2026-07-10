@@ -36,6 +36,12 @@
   /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
   #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
   .cms-error { color:#c0392b; font-size:14px; }
+  .cms-pager { display:flex; align-items:center; justify-content:center; gap:14px; flex-wrap:wrap; padding:20px 0 6px; }
+  .cms-page { font:14px system-ui; padding:7px 15px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); cursor:pointer; }
+  .cms-page:hover { border-color:var(--accent); color:var(--accent); }
+  .cms-page-off { opacity:.38; cursor:default; }
+  .cms-page-off:hover { border-color:var(--line); color:var(--fg); }
+  .cms-page-info { color:var(--mut); font-size:13px; }
 </style>
 </head>
 <body>
@@ -168,6 +174,14 @@ window.addEventListener('popstate', (e) => {
 // A minimal htmx: a click on a tag chip ([hx-get]) re-queries the graph for that tag.
 // The markup is htmx-native, so real htmx is a drop-in (its request routed to the wire).
 room.addEventListener('click', (e) => {
+  // A pager button re-issues the CURRENT view (tag/type/search + its scope preserved) at
+  // a new offset; the server carries the target offset on the button.
+  const pager = e.target.closest('.cms-page[data-offset]');
+  if (pager) {
+    e.preventDefault();
+    navigate(currentView, Object.assign({}, currentArgs, { offset: pager.dataset.offset }));
+    return;
+  }
   const el = e.target.closest('[hx-get]');
   if (!el) return;
   e.preventDefault();
