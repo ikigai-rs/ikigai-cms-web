@@ -30,6 +30,12 @@ const BOOKMARKS_SRC: &str = "urn:cms:src:old-org/pinboard-bookmarks.org";
 /// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
 pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
+    Kernel::new(Arc::new(Fallback::new(cms_spaces(src_dir, zotero))))
+}
+
+/// The spaces the CMS kernel is composed of, exposed so a maintenance kernel can add HTTP
+/// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings.
+pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
     let src = EndpointSpace::new().bind(
@@ -71,7 +77,7 @@ pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
         FnEndpoint::new("cms-style", stylesheet),
     );
 
-    let spaces: Vec<Arc<dyn Space>> = vec![
+    vec![
         // Before `src`: the exact `urn:cms:src:zotero` must win over the `urn:cms:src:{path}`
         // template (which would otherwise match it with path=`zotero`).
         Arc::new(zotero_space) as Arc<dyn Space>,
@@ -83,8 +89,7 @@ pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         // urn:xslt:transform — the view pipes its CONSTRUCT'd RDF/XML through a stylesheet.
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
-    ];
-    Kernel::new(Arc::new(Fallback::new(spaces)))
+    ]
 }
 
 /// `urn:cms:style:{name}` — a reading-room stylesheet (XSLT), keyed on the confirmed

@@ -17,7 +17,12 @@
 #[cfg(not(target_family = "wasm"))]
 mod native;
 #[cfg(not(target_family = "wasm"))]
-pub use native::build_cms_kernel;
+pub use native::{build_cms_kernel, cms_spaces};
+
+// Graph maintenance (the link-checker) — behind the `maintenance` feature, which adds
+// outbound HTTP. `urn:cms:linkcheck` caches each check for a week.
+#[cfg(feature = "maintenance")]
+pub mod maintenance;
 
 // The server-side WebAuthn relying party (rung 3b) — behind the `server` feature with
 // the rest of the native server stack.
