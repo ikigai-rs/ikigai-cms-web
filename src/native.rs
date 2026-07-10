@@ -167,7 +167,7 @@ CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creato
 WHERE {
   ?book a bib:Book ; dc:title ?title .
   BIND(IRI(CONCAT("urn:cms:book:", SHA256(STR(?book)))) AS ?id)
-  BIND(IRI(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title))) AS ?lookup)
+  BIND(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title)) AS ?lookup)
   OPTIONAL {
     ?book bib:authors ?seq . ?seq ?ap ?person .
     FILTER(STRSTARTS(STR(?ap), "http://www.w3.org/1999/02/22-rdf-syntax-ns#_"))
@@ -851,6 +851,12 @@ mod tests {
             "author rendered: {html}"
         );
         assert!(html.contains("McNamara"), "author name shown: {html}");
+        // The lookup rides as a string literal (like a bookmark URL), so it lands in the
+        // href — an empty href would reload the room and drop the session.
+        assert!(
+            html.contains("href='https://openlibrary.org/search"),
+            "book title has a real lookup href, not empty: {html}"
+        );
         // Its Zotero tag (Rust → slug `rust`) joins the shared tag axis, so the book
         // shows up under a tag view alongside any bookmarks.
         let tagview = view(&kernel, "rust", "catalog");
