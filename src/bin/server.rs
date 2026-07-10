@@ -97,7 +97,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir));
+    // The Zotero library (books): CMS_ZOTERO overrides; else the default location. Only
+    // used if the file exists — otherwise the graph is bookmarks-only.
+    let zotero: Option<PathBuf> = std::env::var_os("CMS_ZOTERO")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Dropbox/Documents/Zotero/My Library.rdf"))
+        })
+        .filter(|p| p.exists());
+    println!(
+        "zotero library: {}",
+        zotero
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none — bookmarks only)".to_string())
+    );
+
+    let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir, zotero));
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 
