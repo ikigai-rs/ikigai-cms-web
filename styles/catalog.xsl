@@ -11,6 +11,7 @@
 .cms-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
 .cms-title{display:block;color:var(--fg);text-decoration:none;font-size:16px}
 .cms-title:hover{text-decoration:underline}
+.cms-author{display:inline-block;color:var(--mut);font-size:13px;font-style:italic;margin:2px 8px 0 0}
 .cms-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .cms-tag{font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);text-decoration:none;cursor:pointer}</style>
     <section class="cms-room">
@@ -25,6 +26,7 @@
         <xsl:attribute name="href"><xsl:value-of select="dc:identifier"/></xsl:attribute>
         <xsl:value-of select="dc:title"/>
       </a>
+      <div class="cms-byline"><xsl:apply-templates select="dc:creator"/></div>
       <div class="cms-tags">
         <xsl:for-each select="dc:subject">
           <a class="cms-tag" hx-target="#room">
@@ -34,5 +36,10 @@
         </xsl:for-each>
       </div>
     </article>
+  </xsl:template>
+
+  <!-- Authors (books carry dc:creator; bookmarks don't, so this renders nothing there). -->
+  <xsl:template match="dc:creator">
+    <span class="cms-author"><xsl:value-of select="."/></span>
   </xsl:template>
 </xsl:stylesheet>

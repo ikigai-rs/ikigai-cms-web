@@ -16,7 +16,15 @@ fn main() {
     let dir = args.next().expect("usage: view <src_dir> <tag>");
     let tag = args.next().expect("usage: view <src_dir> <tag>");
 
-    let kernel = ikigai_cms_web::build_cms_kernel(dir.into());
+    let zotero = std::env::var_os("CMS_ZOTERO")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h).join("Dropbox/Documents/Zotero/My Library.rdf")
+            })
+        })
+        .filter(|p| p.exists());
+    let kernel = ikigai_cms_web::build_cms_kernel(dir.into(), zotero);
     let iri = Iri::parse(format!("urn:cms:view:{tag}")).expect("valid IRI");
     match Resolver::issue(&kernel, Request::new(Verb::Source, iri)) {
         Ok((repr, status)) => {

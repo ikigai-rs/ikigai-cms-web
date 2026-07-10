@@ -16,7 +16,15 @@ fn main() {
     let dir = args.next().expect("usage: query <src_dir> <sparql>");
     let query = args.next().expect("usage: query <src_dir> <sparql>");
 
-    let kernel = ikigai_cms_web::build_cms_kernel(dir.into());
+    let zotero = std::env::var_os("CMS_ZOTERO")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h).join("Dropbox/Documents/Zotero/My Library.rdf")
+            })
+        })
+        .filter(|p| p.exists());
+    let kernel = ikigai_cms_web::build_cms_kernel(dir.into(), zotero);
     let request = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
         .with_arg("query", ArgRef::Inline(query.into_bytes()))
         .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));

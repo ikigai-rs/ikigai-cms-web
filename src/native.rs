@@ -15,25 +15,38 @@ use ikigai_core::{
 /// jail root is supplied to [`build_cms_kernel`]; the path below is relative to it.
 const BOOKMARKS_SRC: &str = "urn:cms:src:old-org/pinboard-bookmarks.org";
 
-/// Compose the CMS kernel over `src_dir` (the jail root for `urn:cms:src:*`).
+/// Compose the CMS kernel over `src_dir` (the jail root for `urn:cms:src:*`) and an
+/// optional Zotero library (`My Library.rdf`) whose books join the same graph.
 ///
 /// Binds:
 /// - `urn:cms:src:{path}` — CMS source files, jailed to `src_dir`, cacheable +
 ///   golden-threaded (a change to a source file invalidates everything derived).
-/// - `urn:cms:graph` — the assembled bookmark graph as Turtle (reads the org file
-///   through the kernel, transrepts via [`ikigai_cms::bookmarks_to_turtle`]).
-/// - `urn:cms:bookmarks` — the raw pipe-face transreptor, from ikigai-cms.
-/// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`
-///   sources resolved through the kernel; point `graph=urn:cms:graph` at the above.
-pub fn build_cms_kernel(src_dir: PathBuf) -> Kernel {
+/// - `urn:cms:src:zotero` — the Zotero RDF library (if configured), served as
+///   RDF/XML with an injected base so its relative IRIs resolve.
+/// - `urn:cms:graph:bookmarks` — bookmarks as Turtle (org → [`ikigai_cms`]).
+/// - `urn:cms:graph:books` — Zotero books normalized onto the CMS axis (a SPARQL
+///   CONSTRUCT: `cms:Book`, `dc:title`, `dc:creator`, slugged `dc:subject`, and an
+///   Open Library lookup as `dc:identifier` so a book renders like a bookmark).
+/// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
+/// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
+pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
     let src = EndpointSpace::new().bind(
         UriTemplate::parse("urn:cms:src:{path}").expect("valid template"),
         ikigai_fs::FileEndpoint::new(src_dir).cacheable(),
     );
-    // The assembled graph resource SPARQL points `graph=` at.
-    let graph = EndpointSpace::new().bind(Exact::new("urn:cms:graph"), BookmarkGraph);
+    // The Zotero library source (its filename has a space, so it can't ride the
+    // `urn:cms:src:{path}` template — a dedicated binding, present only if configured).
+    let mut zotero_space = EndpointSpace::new();
+    if let Some(path) = zotero {
+        zotero_space = zotero_space.bind(Exact::new("urn:cms:src:zotero"), ZoteroSource(path));
+    }
+    // The graph resources: bookmarks, books, and their union (what SPARQL points at).
+    let graph = EndpointSpace::new()
+        .bind(Exact::new("urn:cms:graph:bookmarks"), BookmarkGraph)
+        .bind(Exact::new("urn:cms:graph:books"), BooksGraph)
+        .bind(Exact::new("urn:cms:graph"), CmsGraph);
     // The reading-room views — each IS a query, rendered as an htmx HTML fragment:
     // `urn:cms:view:{tag}` (cards for a tag), `urn:cms:search` (cards whose title
     // matches `q`), `urn:cms:tags` (the clickable tag index).
@@ -54,6 +67,9 @@ pub fn build_cms_kernel(src_dir: PathBuf) -> Kernel {
     );
 
     let spaces: Vec<Arc<dyn Space>> = vec![
+        // Before `src`: the exact `urn:cms:src:zotero` must win over the `urn:cms:src:{path}`
+        // template (which would otherwise match it with path=`zotero`).
+        Arc::new(zotero_space) as Arc<dyn Space>,
         Arc::new(src) as Arc<dyn Space>,
         Arc::new(graph) as Arc<dyn Space>,
         Arc::new(views) as Arc<dyn Space>,
@@ -121,11 +137,150 @@ impl Endpoint for BookmarkGraph {
     }
 
     fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:bookmarks")
+            .summary(
+                "Bookmarks as RDF/Turtle: the org bookmarks file read through the kernel \
+                 and transrepted onto the dc:subject tag axis.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// The CONSTRUCT that normalizes Zotero's RDF onto the CMS axis: each `bib:Book` becomes
+/// a skolemized `cms:Book` with `dc:title`, `dc:creator` ("Surname, Given" per author),
+/// slugged `dc:subject` tags (letter-bearing only — drops call-number noise), and an
+/// Open Library title-search as `dc:identifier` so a book renders like a bookmark card.
+const BOOK_CONSTRUCT: &str = r#"PREFIX bib: <http://purl.org/net/biblio#>
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX z: <http://www.zotero.org/namespaces/export#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX cms: <https://ikigai-rs.dev/ns/cms#>
+CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug }
+WHERE {
+  ?book a bib:Book ; dc:title ?title .
+  BIND(IRI(CONCAT("urn:cms:book:", SHA256(STR(?book)))) AS ?id)
+  BIND(IRI(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title))) AS ?lookup)
+  OPTIONAL {
+    ?book bib:authors ?seq . ?seq ?ap ?person .
+    FILTER(STRSTARTS(STR(?ap), "http://www.w3.org/1999/02/22-rdf-syntax-ns#_"))
+    ?person foaf:surname ?sn . OPTIONAL { ?person foaf:givenName ?gn }
+    BIND(IF(BOUND(?gn), CONCAT(?sn, ", ", ?gn), ?sn) AS ?author)
+  }
+  OPTIONAL {
+    ?book dc:subject ?tn . ?tn rdf:value ?tag .
+    BIND(LCASE(REPLACE(REPLACE(?tag, "[^a-zA-Z0-9]+", "-"), "(^-+|-+$)", "")) AS ?slug0)
+    FILTER(REGEX(?slug0, "[a-z]"))
+    BIND(?slug0 AS ?slug)
+  }
+}"#;
+
+/// `urn:cms:src:zotero` — the Zotero `My Library.rdf`, served as RDF/XML with an injected
+/// `xml:base` so its relative IRIs (`#item_N`) resolve when SPARQL parses it. A dedicated
+/// source (not a `FileEndpoint`) because the filename has a space and the file needs the
+/// base-injection preprocessing.
+struct ZoteroSource(PathBuf);
+
+#[async_trait]
+impl Endpoint for ZoteroSource {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        let text = std::fs::read_to_string(&self.0)
+            .map_err(|e| Error::Endpoint(format!("read zotero library: {e}")))?;
+        let based = text.replacen("<rdf:RDF", "<rdf:RDF xml:base=\"http://zotero.local/\"", 1);
+        Ok(Representation::new(
+            ReprType::new("application/rdf+xml").with_param("charset", "utf-8"),
+            based.into_bytes(),
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "cms-src-zotero"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:src:zotero")
+            .summary("The Zotero RDF library (My Library.rdf), base-injected for parsing.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:books` — Zotero books normalized onto the CMS axis via [`BOOK_CONSTRUCT`].
+/// Tolerant of no library configured (or a parse failure): yields empty Turtle so the
+/// whole graph degrades to bookmarks-only rather than failing.
+struct BooksGraph;
+
+#[async_trait]
+impl Endpoint for BooksGraph {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let construct = Iri::parse("urn:sparql:construct").expect("valid IRI");
+        let req = Request::new(Verb::Source, construct)
+            .with_arg("query", ArgRef::Inline(BOOK_CONSTRUCT.as_bytes().to_vec()))
+            .with_arg("graph", ArgRef::Inline(b"urn:cms:src:zotero".to_vec()))
+            .with_arg("as", ArgRef::Inline(b"turtle".to_vec()));
+        let turtle = match inv.issue(req).await {
+            Ok(repr) => repr.bytes,
+            Err(_) => Vec::new(), // no library / unparseable → no books
+        };
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            turtle,
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "cms-graph-books"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:books")
+            .summary(
+                "Zotero books normalized onto the CMS axis (cms:Book, dc:title/creator/subject).",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, as one Turtle document (both are
+/// Turtle; concatenation is valid and needs no extra dependency). Cacheable and
+/// golden-threaded through the two sub-graphs it issues.
+struct CmsGraph;
+
+#[async_trait]
+impl Endpoint for CmsGraph {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let bookmarks = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:bookmarks").expect("valid IRI"),
+            ))
+            .await?;
+        let books = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:books").expect("valid IRI"),
+            ))
+            .await?;
+        let mut turtle = bookmarks.bytes;
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&books.bytes);
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            turtle,
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "cms-graph"
+    }
+
+    fn describe(&self) -> Description {
         Description::new("urn:cms:graph")
             .summary(
-                "The assembled bookmark graph as RDF/Turtle: the org bookmarks file read \
-                 through the kernel and transrepted onto the dc:subject tag axis. Point \
-                 `urn:sparql:* graph=urn:cms:graph` at it.",
+                "The whole CMS graph as RDF/Turtle — bookmarks ⊕ Zotero books on one \
+                 dc:subject/dc:title axis. Point `urn:sparql:* graph=urn:cms:graph` at it.",
             )
             .verb(Verb::Source)
     }
@@ -200,8 +355,9 @@ impl Endpoint for TagView {
         let safe = sparql_lit(tag);
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }} \
-             WHERE {{ ?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }}"
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
+             WHERE {{ ?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . \
+                      OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render(
             inv,
@@ -245,11 +401,12 @@ impl Endpoint for SearchView {
         // tags — LIMIT lives in the subquery so it caps *resources*, not triples.
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }} \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s dc:title ?t ; dc:identifier ?u . \
                  FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
-             }} ORDER BY ?t LIMIT 60 }} ?s dc:subject ?tag }}"
+             }} ORDER BY ?t LIMIT 60 }} \
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render(
             inv,
@@ -309,9 +466,28 @@ mod tests {
     use super::*;
     use ikigai_resolve::Resolver;
 
-    /// Write a tiny bookmarks fixture at the exact path the kernel expects, then
-    /// prove the full spine: fs read → transrept → `urn:cms:graph` → SPARQL SELECT.
-    fn kernel_over_fixture() -> (tempfile::TempDir, Kernel) {
+    /// A minimal Zotero RDF library: one book with an author and a tag, in the exact
+    /// shape the real export uses (relative `#item` IRI, Seq of foaf:Person, AutomaticTag).
+    const ZOTERO_FIXTURE: &str = r##"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:bib="http://purl.org/net/biblio#"
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:z="http://www.zotero.org/namespaces/export#"
+  xmlns:foaf="http://xmlns.com/foaf/0.1/">
+  <bib:Book rdf:about="#item_1">
+    <z:itemType>book</z:itemType>
+    <dc:title>Rust in Action</dc:title>
+    <bib:authors><rdf:Seq><rdf:li><foaf:Person>
+      <foaf:surname>McNamara</foaf:surname><foaf:givenName>Tim</foaf:givenName>
+    </foaf:Person></rdf:li></rdf:Seq></bib:authors>
+    <dc:subject><z:AutomaticTag><rdf:value>Rust</rdf:value></z:AutomaticTag></dc:subject>
+  </bib:Book>
+</rdf:RDF>"##;
+
+    /// Write a tiny bookmarks fixture (and optionally a Zotero library) at the exact paths
+    /// the kernel expects, then prove the full spine: fs read → transrept →
+    /// `urn:cms:graph` → SPARQL.
+    fn fixture_kernel(with_books: bool) -> (tempfile::TempDir, Kernel) {
         let dir = tempfile::tempdir().unwrap();
         let bm = dir.path().join("old-org/pinboard-bookmarks.org");
         std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
@@ -328,8 +504,17 @@ mod tests {
              \x20  :END:\n",
         )
         .unwrap();
-        let kernel = build_cms_kernel(dir.path().to_path_buf());
+        let zotero = with_books.then(|| {
+            let z = dir.path().join("zotero.rdf");
+            std::fs::write(&z, ZOTERO_FIXTURE).unwrap();
+            z
+        });
+        let kernel = build_cms_kernel(dir.path().to_path_buf(), zotero);
         (dir, kernel)
+    }
+
+    fn kernel_over_fixture() -> (tempfile::TempDir, Kernel) {
+        fixture_kernel(false)
     }
 
     fn select(kernel: &Kernel, query: &str) -> String {
@@ -520,5 +705,52 @@ mod tests {
             html.contains("class='cms-tag'"),
             "rendered as chips: {html}"
         );
+    }
+
+    #[test]
+    fn books_join_the_graph_typed_and_render_with_authors() {
+        let (_dir, kernel) = fixture_kernel(true);
+        // Zotero → normalized into the unified graph as cms:Book with title + creator.
+        let json = select(
+            &kernel,
+            "SELECT ?t ?c WHERE { \
+               ?b a <https://ikigai-rs.dev/ns/cms#Book> ; \
+                  <http://purl.org/dc/elements/1.1/title> ?t ; \
+                  <http://purl.org/dc/elements/1.1/creator> ?c }",
+        );
+        assert!(
+            json.contains("Rust in Action"),
+            "book title in graph: {json}"
+        );
+        assert!(json.contains("McNamara"), "author in graph: {json}");
+        // Found by title search and rendered with the author line (books have a lookup
+        // dc:identifier, so they ride the same card path as bookmarks).
+        let html = resolve_html(&kernel, "urn:cms:search", &[("q", "rust in action")]);
+        assert!(
+            html.contains("Rust in Action"),
+            "book found by search: {html}"
+        );
+        assert!(
+            html.contains("class='cms-author'"),
+            "author rendered: {html}"
+        );
+        assert!(html.contains("McNamara"), "author name shown: {html}");
+        // Its Zotero tag (Rust → slug `rust`) joins the shared tag axis, so the book
+        // shows up under a tag view alongside any bookmarks.
+        let tagview = view(&kernel, "rust", "catalog");
+        assert!(
+            tagview.contains("Rust in Action"),
+            "book under its slug tag: {tagview}"
+        );
+    }
+
+    #[test]
+    fn without_a_library_the_graph_is_bookmarks_only() {
+        let (_dir, kernel) = fixture_kernel(false);
+        let json = select(
+            &kernel,
+            "SELECT (COUNT(?b) AS ?n) WHERE { ?b a <https://ikigai-rs.dev/ns/cms#Book> }",
+        );
+        assert!(json.contains("\"0\""), "no books without a library: {json}");
     }
 }
