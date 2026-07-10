@@ -23,7 +23,15 @@
   .connect { border:1px solid var(--line); border-radius:12px; padding:16px 18px; background:var(--card); margin-top:12px; }
   .connect code { background:var(--accent-bg); color:var(--accent); padding:1px 6px; border-radius:5px; font-size:13px; }
   .connect input { width:100%; margin-top:10px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px ui-monospace, monospace; }
+  nav.nav { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0 0; }
+  nav.nav[hidden] { display:none; }
+  nav.nav button { border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--fg); padding:5px 12px; font:13px system-ui; cursor:pointer; }
+  nav.nav button:hover { background:var(--card); }
+  nav.nav form { margin-left:auto; display:flex; }
+  nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
   #room { margin-top:16px; }
+  /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
+  #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
   .cms-error { color:#c0392b; font-size:14px; }
 </style>
 </head>
@@ -42,6 +50,14 @@
     </div>
     <span class="status" id="status">not connected</span>
   </header>
+
+  <nav class="nav" id="nav" hidden>
+    <button data-view="urn:cms:view:quic">home</button>
+    <button data-view="urn:cms:tags">tags</button>
+    <form id="search">
+      <input id="q" type="search" placeholder="search titles…" autocomplete="off" spellcheck="false" />
+    </form>
+  </nav>
 
   <div class="connect" id="connect">
     <p style="margin:0">Start the server and connect. In the repo:</p>
@@ -65,7 +81,8 @@ const START_VIEW = 'urn:cms:view:quic';
 
 let wt = null;
 let currentStyle = 'catalog';   // the named urn:cms:style:* the view renders through
-let currentView = START_VIEW;   // the current urn:cms:view:{tag}, re-rendered on restyle
+let currentView = START_VIEW;   // the current view resource, re-rendered on restyle
+let currentArgs = {};           // its extra args (e.g. a search `q`), preserved on restyle
 let signedIn = false;           // a verified passkey has raised the server ceiling
 
 async function readAll(readable) {
@@ -88,9 +105,11 @@ async function wireCall(bytes) {
 // Resolve a view over the wire, rendered through the current stylesheet, and swap it
 // into #room. The style rides as an arg — urn:cms:view:{tag} runs the CONSTRUCT and
 // pipes it through urn:cms:style:{style} server-side; the browser just swaps the HTML.
-async function loadView(iri) {
+async function loadView(iri, extra) {
   currentView = iri;
-  const bytes = encodeIssue(iri, JSON.stringify({ style: currentStyle }));
+  currentArgs = extra || {};
+  const args = Object.assign({ style: currentStyle }, currentArgs);
+  const bytes = encodeIssue(iri, JSON.stringify(args));
   if (!bytes.length) { room.innerHTML = '<p class="cms-error">bad iri: ' + iri + '</p>'; return; }
   room.innerHTML = await wireCall(bytes);
 }
@@ -110,9 +129,20 @@ document.querySelectorAll('.seg button').forEach((b) =>
   b.addEventListener('click', () => {
     document.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-pressed', x === b));
     currentStyle = b.dataset.style;
-    if (wt) loadView(currentView);
+    if (wt) loadView(currentView, currentArgs);
   })
 );
+
+// Navigation: home + the tag index are view resources; the search form issues
+// urn:cms:search with the typed term. All go through loadView → the wire → a stylesheet.
+$('#nav').querySelectorAll('button[data-view]').forEach((b) =>
+  b.addEventListener('click', () => { if (wt) loadView(b.dataset.view); })
+);
+$('#search').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const term = $('#q').value.trim();
+  if (wt && term) loadView('urn:cms:search', { q: term });
+});
 
 // --- passkey identity (rung 3b) ---------------------------------------------
 // The room is gated: the server resolves under a public ceiling until a verified passkey
@@ -136,7 +166,8 @@ async function passkeyLogin() {
     signedIn = true;
     setStatus('signed in');
     document.querySelector('.auth').style.display = 'none';
-    await loadView(currentView);
+    $('#nav').hidden = false;
+    await loadView(currentView, currentArgs);
   } catch (e) { setStatus('sign-in failed: ' + e.message, true); }
 }
 

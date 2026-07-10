@@ -34,12 +34,16 @@ pub fn build_cms_kernel(src_dir: PathBuf) -> Kernel {
     );
     // The assembled graph resource SPARQL points `graph=` at.
     let graph = EndpointSpace::new().bind(Exact::new("urn:cms:graph"), BookmarkGraph);
-    // The reading-room views: `urn:cms:view:{tag}` → an htmx HTML fragment of every
-    // resource tagged `{tag}`, rendered as cards. A view IS a query.
-    let views = EndpointSpace::new().bind(
-        UriTemplate::parse("urn:cms:view:{tag}").expect("valid template"),
-        TagView,
-    );
+    // The reading-room views — each IS a query, rendered as an htmx HTML fragment:
+    // `urn:cms:view:{tag}` (cards for a tag), `urn:cms:search` (cards whose title
+    // matches `q`), `urn:cms:tags` (the clickable tag index).
+    let views = EndpointSpace::new()
+        .bind(
+            UriTemplate::parse("urn:cms:view:{tag}").expect("valid template"),
+            TagView,
+        )
+        .bind(Exact::new("urn:cms:search"), SearchView)
+        .bind(Exact::new("urn:cms:tags"), TagsIndex);
     // The reading-room stylesheets: `urn:cms:style:{name}` → an XSLT resource. The view
     // resolves one to render the graph, so the room restyles by naming a different one
     // (renderers are resources). Three ship embedded; a deployment can layer an fs
@@ -76,6 +80,9 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         "catalog" => include_str!("../styles/catalog.xsl"),
         "mosaic" => include_str!("../styles/mosaic.xsl"),
         "agenda" => include_str!("../styles/agenda.xsl"),
+        // The tag index renders SPARQL-results XML (not the card RDF/XML), so it's a
+        // distinct stylesheet not offered as a card theme.
+        "tags" => include_str!("../styles/tags.xsl"),
         _ => return Err(Error::Endpoint(format!("no stylesheet `{name}`"))),
     };
     Ok(Representation::new(
@@ -121,12 +128,63 @@ impl Endpoint for BookmarkGraph {
     }
 }
 
-/// `urn:cms:view:{tag}` — the reading room for a tag. CONSTRUCTs a per-card graph of
-/// every resource carrying `dc:subject "{tag}"` (title, URL, and each tag as a separate
-/// triple), serializes it as RDF/XML, and pipes it through the chosen stylesheet
-/// (`urn:cms:style:{style}`, default `catalog`) via `urn:xslt:transform` — so the room's
-/// look is *data*, restyled by naming a different stylesheet. Cacheable and
-/// golden-threaded through the queries it issues, so an edit to the graph refreshes it.
+/// Escape a value riding into a SPARQL double-quoted string literal.
+fn sparql_lit(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The validated card stylesheet from the `style` arg — only shipped card themes are
+/// honored (never resolve an arbitrary `urn:cms:style:*` off a client string).
+fn card_style<'a>(inv: &'a Invocation<'_>) -> &'a str {
+    match inv.inline_str("style").unwrap_or("catalog") {
+        s @ ("catalog" | "mosaic" | "agenda") => s,
+        _ => "catalog",
+    }
+}
+
+/// Run a SPARQL query through the kernel (`as` format) and pipe the result through a
+/// stylesheet resource (`urn:cms:style:{style}`) via `urn:xslt:transform` — the shared
+/// spine of every view: **a view is a query, rendered by a stylesheet resource.** The
+/// result is cacheable and golden-threaded through the queries it issues, so an edit to
+/// the graph refreshes it.
+async fn render(
+    inv: &Invocation<'_>,
+    sparql: &str,
+    query: String,
+    as_fmt: &str,
+    style: &str,
+) -> Result<Representation> {
+    let q = Iri::parse(sparql).expect("valid sparql IRI");
+    let out = inv
+        .issue(
+            Request::new(Verb::Source, q)
+                .with_arg("query", ArgRef::Inline(query.into_bytes()))
+                .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()))
+                .with_arg("as", ArgRef::Inline(as_fmt.as_bytes().to_vec())),
+        )
+        .await?;
+    let xslt = Iri::parse("urn:xslt:transform").expect("valid IRI");
+    let html = inv
+        .issue(
+            Request::new(Verb::Source, xslt)
+                .with_arg("content", ArgRef::Inline(out.bytes))
+                .with_arg(
+                    "stylesheet",
+                    ArgRef::Inline(format!("urn:cms:style:{style}").into_bytes()),
+                ),
+        )
+        .await?;
+    Ok(Representation::new(
+        ReprType::new("text/html").with_param("charset", "utf-8"),
+        html.bytes,
+    )
+    .cacheable())
+}
+
+/// `urn:cms:view:{tag}` — the reading room for a tag: cards for every resource carrying
+/// `dc:subject "{tag}"`, rendered through the chosen card stylesheet. Multi-valued
+/// `dc:subject` stays as repeated RDF/XML elements so the stylesheet renders tag chips
+/// with no string ops (xrust lacks them).
 struct TagView;
 
 #[async_trait]
@@ -136,49 +194,20 @@ impl Endpoint for TagView {
             .bindings
             .get("tag")
             .ok_or_else(|| Error::MissingArgument("tag".to_string()))?;
-        // Pick the stylesheet; only the shipped names are honored (never resolve an
-        // arbitrary `urn:cms:style:*` off a client-supplied string).
-        let style = match inv.inline_str("style").unwrap_or("catalog") {
-            s @ ("catalog" | "mosaic" | "agenda") => s,
-            _ => "catalog",
-        };
-        // The tag rides into a SPARQL string literal — escape the two chars that could
-        // break out of it (a tag comes from a URI suffix, but stay safe by construction).
-        let safe = tag.replace('\\', "\\\\").replace('"', "\\\"");
-        // CONSTRUCT the per-card graph: multi-valued `dc:subject` stays as repeated
-        // elements in the RDF/XML, so the stylesheet renders tag chips with no string
-        // ops (xrust lacks them).
+        let safe = sparql_lit(tag);
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }} \
              WHERE {{ ?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }}"
         );
-        let construct = Iri::parse("urn:sparql:construct").expect("valid IRI");
-        let rdfxml = inv
-            .issue(
-                Request::new(Verb::Source, construct)
-                    .with_arg("query", ArgRef::Inline(query.into_bytes()))
-                    .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()))
-                    .with_arg("as", ArgRef::Inline(b"rdfxml".to_vec())),
-            )
-            .await?;
-        // Render it through the chosen stylesheet resource.
-        let xslt = Iri::parse("urn:xslt:transform").expect("valid IRI");
-        let html = inv
-            .issue(
-                Request::new(Verb::Source, xslt)
-                    .with_arg("content", ArgRef::Inline(rdfxml.bytes))
-                    .with_arg(
-                        "stylesheet",
-                        ArgRef::Inline(format!("urn:cms:style:{style}").into_bytes()),
-                    ),
-            )
-            .await?;
-        Ok(Representation::new(
-            ReprType::new("text/html").with_param("charset", "utf-8"),
-            html.bytes,
+        render(
+            inv,
+            "urn:sparql:construct",
+            query,
+            "rdfxml",
+            card_style(inv),
         )
-        .cacheable())
+        .await
     }
 
     fn name(&self) -> &str {
@@ -191,6 +220,82 @@ impl Endpoint for TagView {
                 "The reading room for a tag: an htmx HTML fragment of every resource \
                  carrying `dc:subject {tag}`, rendered as cards through a stylesheet \
                  resource. A view is a query.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:search` — cards for resources whose `dc:title` contains the `q` term
+/// (case-insensitive), capped so a common term can't return the whole graph. Renders
+/// through the same card stylesheets as a tag view.
+struct SearchView;
+
+#[async_trait]
+impl Endpoint for SearchView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let q = inv.inline_str("q").unwrap_or("").trim();
+        if q.is_empty() {
+            return Err(Error::MissingArgument("q".to_string()));
+        }
+        let safe = sparql_lit(q);
+        // Select up to 60 matching resources (title contains the term), then join their
+        // tags — LIMIT lives in the subquery so it caps *resources*, not triples.
+        let query = format!(
+            "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag }} \
+             WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
+                 ?s dc:title ?t ; dc:identifier ?u . \
+                 FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
+             }} ORDER BY ?t LIMIT 60 }} ?s dc:subject ?tag }}"
+        );
+        render(
+            inv,
+            "urn:sparql:construct",
+            query,
+            "rdfxml",
+            card_style(inv),
+        )
+        .await
+    }
+
+    fn name(&self) -> &str {
+        "cms-search"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:search")
+            .summary(
+                "Search the room: cards for resources whose dc:title contains the `q` \
+                 term (case-insensitive, capped). A view is a query.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:tags` — the tag index: the room's top tags by frequency, each a clickable
+/// chip that opens its view. Renders SPARQL-results XML (a SELECT with counts) through
+/// the `tags` stylesheet, so navigation itself is a query.
+struct TagsIndex;
+
+#[async_trait]
+impl Endpoint for TagsIndex {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let query = "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             SELECT ?tag (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s dc:subject ?tag } \
+             GROUP BY ?tag ORDER BY DESC(?n) LIMIT 200"
+            .to_string();
+        render(inv, "urn:sparql:select", query, "xml", "tags").await
+    }
+
+    fn name(&self) -> &str {
+        "cms-tags"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:tags")
+            .summary(
+                "The tag index: the room's top tags by frequency, each a clickable chip \
+                 that opens its view. A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -237,6 +342,15 @@ mod tests {
         let request = Request::new(Verb::Source, iri)
             .with_arg("style", ArgRef::Inline(style.as_bytes().to_vec()));
         let (repr, _status) = Resolver::issue(kernel, request).expect("view resolves");
+        String::from_utf8(repr.bytes).unwrap()
+    }
+
+    fn resolve_html(kernel: &Kernel, iri: &str, args: &[(&str, &str)]) -> String {
+        let mut request = Request::new(Verb::Source, Iri::parse(iri.to_string()).unwrap());
+        for (k, v) in args {
+            request = request.with_arg(*k, ArgRef::Inline(v.as_bytes().to_vec()));
+        }
+        let (repr, _status) = Resolver::issue(kernel, request).expect("resolves");
         String::from_utf8(repr.bytes).unwrap()
     }
 
@@ -329,6 +443,42 @@ mod tests {
         assert!(
             Resolver::issue_as(&kernel, Request::new(Verb::Source, iri()), &restricted).is_err(),
             "a cap without the source read is denied"
+        );
+    }
+
+    #[test]
+    fn search_matches_titles_case_insensitively_and_renders_cards() {
+        let (_dir, kernel) = kernel_over_fixture();
+        let html = resolve_html(&kernel, "urn:cms:search", &[("q", "quic")]);
+        assert!(html.contains("https://quicwg.org"), "title match: {html}");
+        assert!(
+            !html.contains("webassembly.org"),
+            "non-matching title excluded: {html}"
+        );
+        // Case-insensitive: "ASSEMBLY" finds "WebAssembly".
+        let html2 = resolve_html(&kernel, "urn:cms:search", &[("q", "ASSEMBLY")]);
+        assert!(
+            html2.contains("https://webassembly.org"),
+            "case-insensitive: {html2}"
+        );
+    }
+
+    #[test]
+    fn the_tag_index_renders_clickable_chips_with_counts() {
+        let (_dir, kernel) = kernel_over_fixture();
+        // SPARQL-results XML (SELECT with counts) → the `tags` stylesheet → chips.
+        let html = resolve_html(&kernel, "urn:cms:tags", &[]);
+        assert!(
+            html.contains("urn:cms:view:quic"),
+            "quic chip links: {html}"
+        );
+        assert!(
+            html.contains("urn:cms:view:wasm"),
+            "wasm chip links: {html}"
+        );
+        assert!(
+            html.contains("class='cms-tag'"),
+            "rendered as chips: {html}"
         );
     }
 }
