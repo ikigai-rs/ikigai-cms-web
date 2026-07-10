@@ -91,12 +91,13 @@ impl Rp {
     }
 
     /// Finish a login: verify the browser's assertion (JSON) against the held state, then
-    /// map the authenticated credential to its granted capability.
+    /// map the authenticated credential to its granted capability **and** a stable
+    /// principal id (the credential id) — the key the recency trail is scoped to.
     pub fn login_finish(
         &self,
         credential_json: &[u8],
         state: &PasskeyAuthentication,
-    ) -> Result<Capability, String> {
+    ) -> Result<(Capability, String), String> {
         let cred: PublicKeyCredential =
             serde_json::from_slice(credential_json).map_err(|e| format!("bad credential: {e}"))?;
         let auth = self
@@ -104,13 +105,13 @@ impl Rp {
             .finish_passkey_authentication(&cred, state)
             .map_err(|e| format!("login finish: {e}"))?;
         let store = self.store.lock().unwrap();
-        let scopes = store
+        let entry = store
             .credentials
             .iter()
             .find(|e| e.passkey.cred_id() == auth.cred_id())
-            .map(|e| e.scopes.clone())
             .ok_or_else(|| "authenticated credential is not enrolled".to_string())?;
-        Ok(Capability::scoped(scopes))
+        let principal = hex(entry.passkey.cred_id().as_ref());
+        Ok((Capability::scoped(entry.scopes.clone()), principal))
     }
 
     /// Begin registration — the challenge options as JSON (for `navigator.credentials.create`)
@@ -156,6 +157,55 @@ impl Rp {
         store.credentials.push(Enrolled { passkey, scopes });
         save_store(self.backend.as_ref(), &store)
     }
+}
+
+/// One recently-viewed CMS resource: its IRI (re-openable) and a display label.
+#[derive(Clone)]
+pub struct Recent {
+    pub iri: String,
+    pub label: String,
+}
+
+/// The most recently-viewed resources kept per principal.
+const RECENT_CAP: usize = 24;
+
+/// A per-identity trail of recently-viewed CMS resources, shared across connections so the
+/// same passkey identity sees one trail (on a laptop and a phone alike). In-memory — it
+/// resets on restart; a persistent backing is a later slice.
+#[derive(Default)]
+pub struct RecentLog {
+    by_principal: Mutex<std::collections::HashMap<String, std::collections::VecDeque<Recent>>>,
+}
+
+impl RecentLog {
+    /// Record a view under `principal`, most-recent-first, de-duplicated by IRI (a repeat
+    /// visit moves it to the front), capped at [`RECENT_CAP`].
+    pub fn record(&self, principal: &str, entry: Recent) {
+        let mut map = self.by_principal.lock().unwrap();
+        let trail = map.entry(principal.to_string()).or_default();
+        trail.retain(|e| e.iri != entry.iri);
+        trail.push_front(entry);
+        trail.truncate(RECENT_CAP);
+    }
+
+    /// The principal's trail, most-recent-first (empty if none).
+    pub fn list(&self, principal: &str) -> Vec<Recent> {
+        self.by_principal
+            .lock()
+            .unwrap()
+            .get(principal)
+            .map(|t| t.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Lowercase-hex a byte slice (used to turn a credential id into a stable principal id).
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Serialize a WebAuthn challenge to the JSON the browser's WebAuthn API consumes.
@@ -205,5 +255,47 @@ mod tests {
     fn a_bad_origin_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Rp::new("localhost", "not a url", backend(&dir)).is_err());
+    }
+
+    #[test]
+    fn recency_is_most_recent_first_deduped_and_per_principal() {
+        let log = RecentLog::default();
+        let e = |iri: &str| Recent {
+            iri: iri.to_string(),
+            label: iri.to_string(),
+        };
+        log.record("alice", e("urn:cms:view:rust"));
+        log.record("alice", e("urn:cms:view:quic"));
+        log.record("alice", e("urn:cms:view:rust")); // repeat → moves to front, no dup
+
+        let alice: Vec<String> = log.list("alice").into_iter().map(|r| r.iri).collect();
+        assert_eq!(
+            alice,
+            vec!["urn:cms:view:rust", "urn:cms:view:quic"],
+            "most-recent-first, deduped"
+        );
+        // Trails are per principal.
+        assert!(log.list("bob").is_empty(), "bob has his own (empty) trail");
+    }
+
+    #[test]
+    fn recency_is_capped() {
+        let log = RecentLog::default();
+        for i in 0..(RECENT_CAP + 10) {
+            log.record(
+                "alice",
+                Recent {
+                    iri: format!("urn:cms:view:t{i}"),
+                    label: format!("#t{i}"),
+                },
+            );
+        }
+        let list = log.list("alice");
+        assert_eq!(list.len(), RECENT_CAP, "trail is capped");
+        assert_eq!(
+            list[0].iri,
+            format!("urn:cms:view:t{}", RECENT_CAP + 9),
+            "newest at the front"
+        );
     }
 }

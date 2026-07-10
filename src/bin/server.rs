@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ikigai_core::{ArgRef, Capability, Kernel, ReprType, Representation, Request};
+use ikigai_core::{ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, Verb};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
 use tokio::io::AsyncReadExt;
@@ -26,7 +26,7 @@ use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
-use ikigai_cms_web::session::Rp;
+use ikigai_cms_web::session::{Recent, RecentLog, Rp};
 
 /// Largest `Call` we'll read off a stream — a guard against a runaway client.
 const MAX_CALL: usize = 8 * 1024 * 1024;
@@ -98,6 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir));
+    // The recency trail, shared across connections and keyed per passkey identity.
+    let recent = Arc::new(RecentLog::default());
 
     let config = ServerConfig::builder()
         .with_bind_default(port)
@@ -111,20 +113,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let kernel = Arc::clone(&kernel);
         let rp = Arc::clone(&rp);
         let entitlement = Arc::clone(&entitlement);
+        let recent = Arc::clone(&recent);
         tokio::spawn(async move {
-            if let Err(e) = serve(incoming, kernel, rp, entitlement).await {
+            if let Err(e) = serve(incoming, kernel, rp, entitlement, recent).await {
                 eprintln!("session ended: {e}");
             }
         });
     }
 }
 
-/// Per-connection session state: the current ceiling (raised by a verified login) and
-/// the in-progress WebAuthn ceremony state (held here, never persisted).
+/// Per-connection session state: the current ceiling (raised by a verified login), the
+/// in-progress WebAuthn ceremony state (held here, never persisted), and the signed-in
+/// principal id (the recency trail's key; `None` until login).
 struct Session {
     ceiling: Capability,
     auth_state: Option<PasskeyAuthentication>,
     reg_state: Option<PasskeyRegistration>,
+    principal: Option<String>,
 }
 
 /// Accept one WebTransport session and answer `Call`s on its bidi streams until the
@@ -134,6 +139,7 @@ async fn serve(
     kernel: Arc<Kernel>,
     rp: Arc<Rp>,
     entitlement: Arc<Vec<String>>,
+    recent: Arc<RecentLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = incoming.await?.accept().await?;
     // Public until a verified passkey raises the ceiling.
@@ -141,6 +147,7 @@ async fn serve(
         ceiling: Capability::scoped(Vec::<String>::new()),
         auth_state: None,
         reg_state: None,
+        principal: None,
     };
     loop {
         let (mut send, recv) = match connection.accept_bi().await {
@@ -149,7 +156,7 @@ async fn serve(
         };
         let mut bytes = Vec::new();
         recv.take(MAX_CALL as u64).read_to_end(&mut bytes).await?;
-        let reply = handle(&kernel, &rp, &entitlement, &mut session, &bytes);
+        let reply = handle(&kernel, &rp, &entitlement, &recent, &mut session, &bytes);
         send.write_all(&reply).await?;
         send.finish().await?;
     }
@@ -162,6 +169,7 @@ fn handle(
     kernel: &Kernel,
     rp: &Rp,
     entitlement: &[String],
+    recent: &RecentLog,
     session: &mut Session,
     bytes: &[u8],
 ) -> Vec<u8> {
@@ -169,9 +177,24 @@ fn handle(
         Ok(Call::Issue(req)) if req.target.as_str().starts_with("urn:auth:") => {
             handle_auth(rp, entitlement, session, &req)
         }
-        Ok(Call::Issue(req)) => resolve(kernel, &session.ceiling, req),
+        // The recency trail is a session resource, not a kernel one: rendered from what
+        // this identity has viewed, through the `recent` stylesheet.
+        Ok(Call::Issue(req)) if req.target.as_str() == "urn:cms:recent" => {
+            render_recent(kernel, recent, session)
+        }
+        Ok(Call::Issue(req)) => {
+            let iri = req.target.as_str().to_string();
+            let reply = resolve(kernel, &session.ceiling, req);
+            note_recent(recent, session, &iri, &reply);
+            reply
+        }
         // A client may carry a capability to attenuate below the ceiling; clamp it.
-        Ok(Call::IssueAs(req, carried)) => resolve(kernel, &session.ceiling.clamp(&carried), req),
+        Ok(Call::IssueAs(req, carried)) => {
+            let iri = req.target.as_str().to_string();
+            let reply = resolve(kernel, &session.ceiling.clamp(&carried), req);
+            note_recent(recent, session, &iri, &reply);
+            reply
+        }
         Ok(Call::IsCached(req)) => {
             Reply::Cached(Resolver::is_cached(kernel, &req, &session.ceiling))
         }
@@ -186,6 +209,89 @@ fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
     match Resolver::issue_as(kernel, request, cap) {
         Ok((representation, status)) => Reply::Resolved(representation, status),
         Err(e) => Reply::Error(e),
+    }
+}
+
+/// The display label for a recordable view, or `None` if this IRI isn't something the
+/// recency trail tracks. Only pure-URI, re-openable views count (a tag view today; type
+/// and item views later) — search is excluded since re-opening it needs its `q` arg.
+fn recordable_label(iri: &str) -> Option<String> {
+    iri.strip_prefix("urn:cms:view:")
+        .map(|tag| format!("#{tag}"))
+}
+
+/// If a signed-in principal just successfully opened a recordable view, add it to the
+/// trail (a repeat visit moves it to the front).
+fn note_recent(recent: &RecentLog, session: &Session, iri: &str, reply: &Reply) {
+    if !matches!(reply, Reply::Resolved(..)) {
+        return;
+    }
+    let (Some(principal), Some(label)) = (session.principal.as_deref(), recordable_label(iri))
+    else {
+        return;
+    };
+    recent.record(
+        principal,
+        Recent {
+            iri: iri.to_string(),
+            label,
+        },
+    );
+}
+
+/// Render this identity's recency trail as an htmx fragment, through the `recent`
+/// stylesheet resource — a view is a query; here the "query" is the session's trail.
+fn render_recent(kernel: &Kernel, recent: &RecentLog, session: &Session) -> Reply {
+    let items = session
+        .principal
+        .as_deref()
+        .map(|p| recent.list(p))
+        .unwrap_or_default();
+    let xml = recent_xml(&items);
+    let req = Request::new(
+        Verb::Source,
+        Iri::parse("urn:xslt:transform").expect("valid IRI"),
+    )
+    .with_arg("content", ArgRef::Inline(xml.into_bytes()))
+    .with_arg(
+        "stylesheet",
+        ArgRef::Inline(b"urn:cms:style:recent".to_vec()),
+    );
+    match Resolver::issue_as(kernel, req, &session.ceiling) {
+        Ok((repr, _)) => Reply::Resolved(repr, CacheStatus::Uncacheable),
+        Err(e) => Reply::Error(e),
+    }
+}
+
+/// A tiny XML doc of the trail for the `recent` stylesheet to render. An empty trail is
+/// its own element (so the stylesheet needs no conditionals — just a template match).
+fn recent_xml(items: &[Recent]) -> String {
+    let mut s = String::from("<recent xmlns=\"urn:cms:recent#\">");
+    if items.is_empty() {
+        s.push_str("<empty/>");
+    } else {
+        for it in items {
+            s.push_str("<item iri=\"");
+            xml_escape_into(&mut s, &it.iri);
+            s.push_str("\">");
+            xml_escape_into(&mut s, &it.label);
+            s.push_str("</item>");
+        }
+    }
+    s.push_str("</recent>");
+    s
+}
+
+/// Escape a value into XML text / attribute context.
+fn xml_escape_into(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
     }
 }
 
@@ -209,8 +315,9 @@ fn handle_auth(rp: &Rp, entitlement: &[String], session: &mut Session, req: &Req
                 return error_reply("login:finish needs a `credential`");
             };
             match rp.login_finish(cred, &state) {
-                Ok(cap) => {
+                Ok((cap, principal)) => {
                     session.ceiling = cap; // raise the connection to the verified entitlement
+                    session.principal = Some(principal); // scope the recency trail to them
                     json_reply(br#"{"ok":true}"#.to_vec())
                 }
                 Err(e) => Reply::Error(e),
@@ -252,6 +359,7 @@ fn handle_auth(rp: &Rp, entitlement: &[String], session: &mut Session, req: &Req
             session.ceiling = Capability::scoped(Vec::<String>::new());
             session.auth_state = None;
             session.reg_state = None;
+            session.principal = None; // stop recording; the stored trail persists for next login
             json_reply(br#"{"ok":true}"#.to_vec())
         }
         other => Reply::Error(format!("unknown auth resource `{other}`")),
