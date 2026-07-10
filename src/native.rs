@@ -384,6 +384,12 @@ mod tests {
         let html = view(&kernel, "quic", "catalog");
         assert!(html.contains("class='cms-card'"), "{html}");
         assert!(html.contains("https://quicwg.org"), "{html}");
+        // External bookmark links open in a new tab so the reading room (and its session)
+        // is never left — clicking a bookmark must not blow away the passkey login.
+        assert!(
+            html.contains("target='_blank'"),
+            "title opens a new tab: {html}"
+        );
         assert!(
             html.contains("urn:cms:view:networking"),
             "tag chips link to co-tags: {html}"

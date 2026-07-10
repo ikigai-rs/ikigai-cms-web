@@ -21,7 +21,7 @@
 
   <xsl:template match="rdf:Description">
     <article class="cms-card">
-      <a class="cms-title">
+      <a class="cms-title" target="_blank" rel="noopener noreferrer">
         <xsl:attribute name="href"><xsl:value-of select="dc:identifier"/></xsl:attribute>
         <xsl:value-of select="dc:title"/>
       </a>
