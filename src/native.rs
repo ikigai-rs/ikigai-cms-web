@@ -376,6 +376,100 @@ async fn render(
     .cacheable())
 }
 
+/// How many resources a card view shows per page. A big tag (`#webassembly` has 200+)
+/// or a broad type would otherwise render every card in one fragment.
+const PAGE_SIZE: usize = 60;
+
+/// The page start from the `offset` arg (0 = first page). Anything unparseable → 0, so a
+/// missing/garbage offset just shows page one rather than erroring.
+fn page_offset(inv: &Invocation<'_>) -> usize {
+    inv.inline_str("offset")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Count the resources a view's pattern matches (its `SELECT (COUNT(DISTINCT ?s) AS ?n)`),
+/// so the pager knows the total and whether a next page exists. Golden-threaded like the
+/// page query, so a graph edit refreshes it.
+async fn count_resources(inv: &Invocation<'_>, query: String) -> Result<usize> {
+    let sel = Iri::parse("urn:sparql:select").expect("valid sparql IRI");
+    let out = inv
+        .issue(
+            Request::new(Verb::Source, sel)
+                .with_arg("query", ArgRef::Inline(query.into_bytes()))
+                .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec())),
+        )
+        .await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.bytes).unwrap_or(serde_json::Value::Null);
+    Ok(json["results"]["bindings"][0]["n"]["value"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
+/// The prev/next pager appended under a page of cards. Buttons carry the target `offset`
+/// (the browser re-issues the same view with it); the edge that doesn't exist renders as a
+/// dimmed span so the row stays put. Empty when it all fits on one page.
+fn pager_html(offset: usize, total: usize) -> String {
+    if total <= PAGE_SIZE {
+        return String::new();
+    }
+    let start = offset + 1;
+    let end = (offset + PAGE_SIZE).min(total);
+    let mut nav = String::from("<nav class=\"cms-pager\">");
+    if offset > 0 {
+        let prev = offset.saturating_sub(PAGE_SIZE);
+        nav.push_str(&format!(
+            "<button class=\"cms-page\" data-offset=\"{prev}\">‹ prev</button>"
+        ));
+    } else {
+        nav.push_str("<span class=\"cms-page cms-page-off\">‹ prev</span>");
+    }
+    nav.push_str(&format!(
+        "<span class=\"cms-page-info\">{start}–{end} of {total}</span>"
+    ));
+    if end < total {
+        let next = offset + PAGE_SIZE;
+        nav.push_str(&format!(
+            "<button class=\"cms-page\" data-offset=\"{next}\">next ›</button>"
+        ));
+    } else {
+        nav.push_str("<span class=\"cms-page cms-page-off\">next ›</span>");
+    }
+    nav.push_str("</nav>");
+    nav
+}
+
+/// Render one page of a card view: the page's CONSTRUCT through the stylesheet, then a
+/// pager sized from `count_query`. Shared by the tag, search, and type views — the
+/// pagination is uniform, the query differs.
+async fn render_page(
+    inv: &Invocation<'_>,
+    count_query: String,
+    construct_query: String,
+    style: &str,
+    offset: usize,
+) -> Result<Representation> {
+    let total = count_resources(inv, count_query).await?;
+    let cards = render(
+        inv,
+        "urn:sparql:construct",
+        construct_query,
+        "rdfxml",
+        style,
+    )
+    .await?;
+    let mut html = cards.bytes;
+    html.extend_from_slice(pager_html(offset, total).as_bytes());
+    Ok(Representation::new(
+        ReprType::new("text/html").with_param("charset", "utf-8"),
+        html,
+    )
+    .cacheable())
+}
+
 /// `urn:cms:view:{tag}` — the reading room for a tag: cards for every resource carrying
 /// `dc:subject "{tag}"`, rendered through the chosen card stylesheet. Multi-valued
 /// `dc:subject` stays as repeated RDF/XML elements so the stylesheet renders tag chips
@@ -396,20 +490,21 @@ impl Endpoint for TagView {
             Ok("bookmark") => "?s a <https://ikigai-rs.dev/ns/cms#Bookmark> . ",
             _ => "",
         };
+        let offset = page_offset(inv);
+        let count_query = format!(
+            "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {type_filter}?s dc:subject \"{safe}\" }}"
+        );
+        // Page the *resources* (title-ordered, stable) in a subquery, then join each one's
+        // full data — LIMIT/OFFSET on triples would slice a card in half.
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
-             WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . \
-                      OPTIONAL {{ ?s dc:creator ?c }} }}"
+             WHERE {{ {{ SELECT DISTINCT ?s ?st WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?st }} \
+                         ORDER BY ?st LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
-        render(
-            inv,
-            "urn:sparql:construct",
-            query,
-            "rdfxml",
-            card_style(inv),
-        )
-        .await
+        render_page(inv, count_query, query, card_style(inv), offset).await
     }
 
     fn name(&self) -> &str {
@@ -441,25 +536,24 @@ impl Endpoint for SearchView {
             return Err(Error::MissingArgument("q".to_string()));
         }
         let safe = sparql_lit(q);
-        // Select up to 60 matching resources (title contains the term), then join their
-        // tags — LIMIT lives in the subquery so it caps *resources*, not triples.
+        let offset = page_offset(inv);
+        // Match on title-contains; page the resources in a subquery so LIMIT/OFFSET slice
+        // *resources*, then join each one's tags for its chips.
+        let count_query = format!(
+            "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ \
+                 ?s dc:title ?t . FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) }}"
+        );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s dc:title ?t ; dc:identifier ?u . \
                  FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
-             }} ORDER BY ?t LIMIT 60 }} \
+             }} ORDER BY ?t LIMIT {PAGE_SIZE} OFFSET {offset} }} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
-        render(
-            inv,
-            "urn:sparql:construct",
-            query,
-            "rdfxml",
-            card_style(inv),
-        )
-        .await
+        render_page(inv, count_query, query, card_style(inv), offset).await
     }
 
     fn name(&self) -> &str {
@@ -470,7 +564,7 @@ impl Endpoint for SearchView {
         Description::new("urn:cms:search")
             .summary(
                 "Search the room: cards for resources whose dc:title contains the `q` \
-                 term (case-insensitive, capped). A view is a query.",
+                 term (case-insensitive), paged. A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -523,23 +617,21 @@ impl Endpoint for TypeView {
             "bookmark" => "Bookmark",
             _ => return Err(Error::Endpoint(format!("no type `{ty}`"))),
         };
+        let offset = page_offset(inv);
+        let count_query = format!(
+            "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+             SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s a cms:{class} }}"
+        );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s a cms:{class} ; dc:title ?t ; dc:identifier ?u . \
-             }} ORDER BY ?t LIMIT 100 }} \
+             }} ORDER BY ?t LIMIT {PAGE_SIZE} OFFSET {offset} }} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
-        render(
-            inv,
-            "urn:sparql:construct",
-            query,
-            "rdfxml",
-            card_style(inv),
-        )
-        .await
+        render_page(inv, count_query, query, card_style(inv), offset).await
     }
 
     fn name(&self) -> &str {
@@ -549,8 +641,8 @@ impl Endpoint for TypeView {
     fn describe(&self) -> Description {
         Description::new("urn:cms:type")
             .summary(
-                "Cards for resources of a kind (book | bookmark), capped at a browse \
-                 sample. A view is a query.",
+                "Cards for resources of a kind (book | bookmark), paged. Narrow further by \
+                 tag or search. A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -724,6 +816,100 @@ mod tests {
         assert!(
             view(&kernel, "quic", "mosaic").contains("display:grid"),
             "mosaic grids"
+        );
+    }
+
+    #[test]
+    fn the_pager_reflects_position_in_the_result_set() {
+        // Fits on one page → no pager at all.
+        assert_eq!(pager_html(0, PAGE_SIZE), "");
+        assert_eq!(pager_html(0, 5), "");
+        // First page of many: prev dimmed, next live, range shown.
+        let first = pager_html(0, 200);
+        assert!(
+            first.contains("cms-page cms-page-off\">‹ prev"),
+            "prev disabled on page 1: {first}"
+        );
+        assert!(
+            first.contains(&format!("data-offset=\"{PAGE_SIZE}\">next")),
+            "next jumps a page: {first}"
+        );
+        assert!(first.contains(&format!("1–{PAGE_SIZE} of 200")), "{first}");
+        // A middle page: both edges live.
+        let mid = pager_html(PAGE_SIZE, 200);
+        assert!(mid.contains("data-offset=\"0\">‹ prev"), "{mid}");
+        assert!(
+            mid.contains(&format!("data-offset=\"{}\">next", PAGE_SIZE * 2)),
+            "{mid}"
+        );
+        // The last page: next dimmed.
+        let last = pager_html(180, 200);
+        assert!(
+            last.contains("cms-page cms-page-off\">next"),
+            "next disabled on the last page: {last}"
+        );
+        assert!(last.contains("181–200 of 200"), "{last}");
+    }
+
+    #[test]
+    fn a_large_tag_view_pages_through_its_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        let n = PAGE_SIZE + 5; // 65 → two pages, a short second one
+        let mut org = String::from("* Bookmarks\n");
+        for i in 0..n {
+            org.push_str(&format!(
+                "** [[https://ex.com/{i:03}][Item {i:03}]]\n   :PROPERTIES:\n   :TAGS: paged\n   :END:\n"
+            ));
+        }
+        std::fs::write(&bm, org).unwrap();
+        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+
+        // Page 1: a full page of cards; the pager offers next but not prev.
+        let p1 = resolve_html(&kernel, "urn:cms:view:paged", &[("style", "catalog")]);
+        assert_eq!(
+            p1.matches("class='cms-card'").count(),
+            PAGE_SIZE,
+            "page 1 is a full page"
+        );
+        assert!(
+            p1.contains(&format!("1–{PAGE_SIZE} of {n}")),
+            "range on page 1: {p1}"
+        );
+        assert!(
+            p1.contains(&format!("data-offset=\"{PAGE_SIZE}\">next")),
+            "next offered"
+        );
+        assert!(
+            p1.contains("cms-page cms-page-off\">‹ prev"),
+            "no prev on page 1"
+        );
+
+        // Page 2: the remainder; a prev, no next.
+        let off = PAGE_SIZE.to_string();
+        let p2 = resolve_html(
+            &kernel,
+            "urn:cms:view:paged",
+            &[("style", "catalog"), ("offset", &off)],
+        );
+        assert_eq!(
+            p2.matches("class='cms-card'").count(),
+            n - PAGE_SIZE,
+            "page 2 is the remainder"
+        );
+        assert!(
+            p2.contains("data-offset=\"0\">‹ prev"),
+            "prev back to page 1: {p2}"
+        );
+        assert!(
+            p2.contains("cms-page cms-page-off\">next"),
+            "no next on the last page"
+        );
+        // Title-ordered, non-overlapping: the first item is only on page 1.
+        assert!(
+            p1.contains("Item 000") && !p2.contains("Item 000"),
+            "pages must not overlap"
         );
     }
 
