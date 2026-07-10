@@ -18,17 +18,26 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use ikigai_core::{Description, Endpoint, Invocation, ReprType, Representation, Result, Verb};
 
-/// `urn:cms:graph:presentations` — the decks under `root` as typed `cms:Presentation`
-/// Turtle. Empty when no presentations root is configured (so the union is unconditional).
+/// Configuration for the presentations source: the decks root, and the base URL a static
+/// server exposes that tree at — so a card link opens the built deck (`{base}/{deck}/dist/
+/// index.html`). `base_url = None` falls back to `file://` paths: locatable on the card but
+/// not clickable from an https page.
+pub struct Presentations {
+    pub root: PathBuf,
+    pub base_url: Option<String>,
+}
+
+/// `urn:cms:graph:presentations` — the decks under the configured root as typed
+/// `cms:Presentation` Turtle. Empty when unconfigured (so the union is unconditional).
 pub(crate) struct PresentationsGraph {
-    pub root: Option<PathBuf>,
+    pub config: Option<Presentations>,
 }
 
 #[async_trait]
 impl Endpoint for PresentationsGraph {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
-        let turtle = match &self.root {
-            Some(root) => presentations_turtle(root),
+        let turtle = match &self.config {
+            Some(cfg) => presentations_turtle(&cfg.root, cfg.base_url.as_deref()),
             None => String::new(),
         };
         Ok(Representation::new(
@@ -53,14 +62,15 @@ impl Endpoint for PresentationsGraph {
     }
 }
 
-/// The whole presentations graph: a `cms:Presentation` block per deck under `root`.
-fn presentations_turtle(root: &Path) -> String {
+/// The whole presentations graph: a `cms:Presentation` block per deck under `root`, each
+/// linked at `base_url` (or `file://` when none is configured).
+fn presentations_turtle(root: &Path, base_url: Option<&str>) -> String {
     let mut out = String::from(
         "@prefix dc: <http://purl.org/dc/elements/1.1/> .\n\
          @prefix cms: <https://ikigai-rs.dev/ns/cms#> .\n",
     );
     for deck in decks(root) {
-        if let Some(block) = deck_turtle(&deck, root) {
+        if let Some(block) = deck_turtle(&deck, root, base_url) {
             out.push_str(&block);
         }
     }
@@ -104,7 +114,7 @@ fn collect_decks(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// One deck → a `cms:Presentation` block, or `None` if it has no readable title slide.
-fn deck_turtle(deck: &Path, root: &Path) -> Option<String> {
+fn deck_turtle(deck: &Path, root: &Path, base_url: Option<&str>) -> Option<String> {
     let slide = title_slide(deck)?;
     let text = std::fs::read_to_string(&slide).ok()?;
     let region = title_region(&text);
@@ -115,26 +125,44 @@ fn deck_turtle(deck: &Path, root: &Path) -> Option<String> {
     tags.sort();
     tags.dedup();
 
-    // Browsable-for-now: the built deck's path, shown on the card as a `file://` URL. A
-    // served http URL swaps in here post-Uberconf and the card link just starts working.
-    let built = deck.join("dist/index.html");
-    let link = if built.is_file() {
-        built
-    } else {
-        deck.to_path_buf()
-    };
-
     let iri = deck_iri(deck, root);
     let mut ttl = format!(
         "<{iri}> a cms:Presentation ; dc:title {} ; dc:identifier {}",
         ttl_str(&title),
-        ttl_str(&format!("file://{}", link.display())),
+        ttl_str(&deck_link(deck, root, base_url)),
     );
     for tag in &tags {
         ttl.push_str(&format!(" ; dc:subject {}", ttl_str(tag)));
     }
     ttl.push_str(" .\n");
     Some(ttl)
+}
+
+/// The card link for a deck: its built `dist/index.html` served under `base_url` (so a
+/// click opens the deck to present), or a `file://` path when no server base is configured
+/// (locatable but not clickable from an https page). The served URL is emitted whether or
+/// not the deck is built yet — it resolves once `lectern build` has run.
+fn deck_link(deck: &Path, root: &Path, base_url: Option<&str>) -> String {
+    match base_url {
+        Some(base) => {
+            let rel = deck.strip_prefix(root).unwrap_or(deck);
+            let rel_url = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}/{}/dist/index.html", base.trim_end_matches('/'), rel_url)
+        }
+        None => {
+            let built = deck.join("dist/index.html");
+            let target = if built.is_file() {
+                built
+            } else {
+                deck.to_path_buf()
+            };
+            format!("file://{}", target.display())
+        }
+    }
 }
 
 /// A deck's title slide: `slides/00-title.md` if present, else the lexically-first
@@ -281,7 +309,7 @@ mod tests {
     fn a_deck_becomes_a_typed_presentation_with_title_tags_and_venue() {
         let tmp = tempfile::tempdir().unwrap();
         write_deck(tmp.path(), "conferences/nfjs/fs-crypto", TITLE_MD);
-        let ttl = presentations_turtle(tmp.path());
+        let ttl = presentations_turtle(tmp.path(), None);
 
         assert!(ttl.contains("a cms:Presentation"), "typed: {ttl}");
         assert!(
@@ -297,8 +325,21 @@ mod tests {
         }
         // Venue tag from the path (the Uberconf-style unlock) — nfjs here.
         assert!(ttl.contains("dc:subject \"nfjs\""), "venue tag: {ttl}");
-        // A link the card can show.
+        // With no base URL, the card link is a locatable `file://` path.
         assert!(ttl.contains("dc:identifier \"file://"), "deck link: {ttl}");
+    }
+
+    #[test]
+    fn a_base_url_makes_the_link_a_clickable_served_deck() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_deck(tmp.path(), "conferences/nfjs/fs-crypto", TITLE_MD);
+        let ttl = presentations_turtle(tmp.path(), Some("http://localhost:8000/"));
+        assert!(
+            ttl.contains(
+                "dc:identifier \"http://localhost:8000/conferences/nfjs/fs-crypto/dist/index.html\""
+            ),
+            "served deck URL under the base (trailing slash trimmed): {ttl}"
+        );
     }
 
     #[test]

@@ -33,12 +33,13 @@ pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
     build_cms_kernel_with(src_dir, zotero, None)
 }
 
-/// [`build_cms_kernel`] plus a lectern presentations root (`urn:cms:graph:presentations`):
-/// the decks under it join the graph as `cms:Presentation` resources. `None` = no decks.
+/// [`build_cms_kernel`] plus lectern presentations (`urn:cms:graph:presentations`): the
+/// decks under the configured root join the graph as `cms:Presentation` resources. `None`
+/// = no decks.
 pub fn build_cms_kernel_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
-    presentations: Option<PathBuf>,
+    presentations: Option<crate::presentations::Presentations>,
 ) -> Kernel {
     Kernel::new(Arc::new(Fallback::new(cms_spaces_with(
         src_dir,
@@ -53,11 +54,11 @@ pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Spac
     cms_spaces_with(src_dir, zotero, None)
 }
 
-/// [`cms_spaces`] plus the presentations root bound to `urn:cms:graph:presentations`.
+/// [`cms_spaces`] plus the presentations config bound to `urn:cms:graph:presentations`.
 pub fn cms_spaces_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
-    presentations: Option<PathBuf>,
+    presentations: Option<crate::presentations::Presentations>,
 ) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
@@ -78,7 +79,7 @@ pub fn cms_spaces_with(
         .bind(
             Exact::new("urn:cms:graph:presentations"),
             crate::presentations::PresentationsGraph {
-                root: presentations,
+                config: presentations,
             },
         )
         .bind(Exact::new("urn:cms:graph"), CmsGraph);
@@ -1028,7 +1029,10 @@ mod tests {
         let kernel = build_cms_kernel_with(
             src.path().to_path_buf(),
             None,
-            Some(pres.path().to_path_buf()),
+            Some(crate::presentations::Presentations {
+                root: pres.path().to_path_buf(),
+                base_url: None,
+            }),
         );
 
         // The type facet lists the deck as a Presentation.
