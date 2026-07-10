@@ -115,13 +115,7 @@ impl Rp {
 
     /// Begin registration — the challenge options as JSON (for `navigator.credentials.create`)
     /// + the in-progress state to hold until `register_finish`.
-    ///
-    /// Gated by biometric presence at the **server machine** (Touch ID): enrolling a
-    /// passkey isn't just first-come, it needs someone at the box to approve — so a
-    /// remote first-comer can't claim the room.
     pub fn register_start(&self, user_name: &str) -> Result<(String, PasskeyRegistration), String> {
-        ikigai_secret::require_biometric("Enroll a passkey for the ikigai reading room")
-            .map_err(|e| format!("{e}"))?;
         let exclude = self
             .passkeys()
             .iter()
@@ -136,12 +130,22 @@ impl Rp {
 
     /// Finish registration: verify the browser's response (JSON) + persist the new
     /// credential with its granted scopes (its entitlement).
+    ///
+    /// Gated by biometric presence at the **server machine** (Touch ID): enrolling a
+    /// passkey isn't just first-come, it needs someone at the box to approve — so a
+    /// remote first-comer can't claim the room. The gate is here, not at `start`: the
+    /// browser's `navigator.credentials.create()` must run on the click's transient
+    /// activation, and a native Touch-ID dialog mid-`start` steals focus and voids it
+    /// (the browser then refuses `create()` with `NotAllowedError`). By `finish`,
+    /// `create()` has already succeeded, so the gate is free to prompt.
     pub fn register_finish(
         &self,
         credential_json: &[u8],
         state: &PasskeyRegistration,
         scopes: Vec<String>,
     ) -> Result<(), String> {
+        ikigai_secret::require_biometric("Enroll a passkey for the ikigai reading room")
+            .map_err(|e| format!("{e}"))?;
         let cred: RegisterPublicKeyCredential =
             serde_json::from_slice(credential_json).map_err(|e| format!("bad credential: {e}"))?;
         let passkey = self
