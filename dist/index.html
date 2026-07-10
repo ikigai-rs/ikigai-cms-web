@@ -117,13 +117,28 @@ async function loadView(iri, extra) {
   room.innerHTML = await wireCall(bytes);
 }
 
+// Navigate = render + push a history entry (same URL, just state), so the browser's
+// Back/Forward move between views IN-PAGE. No reload means the WebTransport connection
+// and the passkey session survive — Back doesn't drop you to a re-passkey.
+function navigate(iri, extra) {
+  loadView(iri, extra);
+  history.pushState({ iri, extra: extra || {} }, '');
+}
+
+// Back/Forward: re-render the entry's view in place (never reload). Guarded on being
+// connected + signed in, so a Back past the first view (which leaves the app) is ignored
+// rather than rendering a gated error.
+window.addEventListener('popstate', (e) => {
+  if (e.state && e.state.iri && wt && signedIn) loadView(e.state.iri, e.state.extra || {});
+});
+
 // A minimal htmx: a click on a tag chip ([hx-get]) re-queries the graph for that tag.
 // The markup is htmx-native, so real htmx is a drop-in (its request routed to the wire).
 room.addEventListener('click', (e) => {
   const el = e.target.closest('[hx-get]');
   if (!el) return;
   e.preventDefault();
-  loadView(el.getAttribute('hx-get'));
+  navigate(el.getAttribute('hx-get'));
 });
 
 // Restyle = re-fetch the current view naming a different stylesheet resource. The look
@@ -139,12 +154,12 @@ document.querySelectorAll('.seg button').forEach((b) =>
 // Navigation: home + the tag index are view resources; the search form issues
 // urn:cms:search with the typed term. All go through loadView → the wire → a stylesheet.
 $('#nav').querySelectorAll('button[data-view]').forEach((b) =>
-  b.addEventListener('click', () => { if (wt) loadView(b.dataset.view); })
+  b.addEventListener('click', () => { if (wt) navigate(b.dataset.view); })
 );
 $('#search').addEventListener('submit', (e) => {
   e.preventDefault();
   const term = $('#q').value.trim();
-  if (wt && term) loadView('urn:cms:search', { q: term });
+  if (wt && term) navigate('urn:cms:search', { q: term });
 });
 
 // --- passkey identity (rung 3b) ---------------------------------------------
@@ -171,6 +186,8 @@ async function passkeyLogin() {
     $('#signin').hidden = true; $('#register').hidden = true; $('#signout').hidden = false;
     $('#nav').hidden = false;
     await loadView(currentView, currentArgs);
+    // Seed the first history entry so Back from any later view lands on this one in-page.
+    history.replaceState({ iri: currentView, extra: currentArgs }, '');
   } catch (e) { setStatus('sign-in failed: ' + e.message, true); }
 }
 
