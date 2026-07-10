@@ -233,8 +233,13 @@ fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
 /// recency trail tracks. Only pure-URI, re-openable views count (a tag view today; type
 /// and item views later) — search is excluded since re-opening it needs its `q` arg.
 fn recordable_label(iri: &str) -> Option<String> {
-    iri.strip_prefix("urn:cms:view:")
-        .map(|tag| format!("#{tag}"))
+    if let Some(tag) = iri.strip_prefix("urn:cms:view:") {
+        return Some(format!("#{tag}"));
+    }
+    if let Some(kind) = iri.strip_prefix("urn:cms:type:") {
+        return Some(format!("type: {kind}"));
+    }
+    None
 }
 
 /// If a signed-in principal just successfully opened a recordable view, add it to the

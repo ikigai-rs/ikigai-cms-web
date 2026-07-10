@@ -56,7 +56,12 @@ pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
             TagView,
         )
         .bind(Exact::new("urn:cms:search"), SearchView)
-        .bind(Exact::new("urn:cms:tags"), TagsIndex);
+        .bind(Exact::new("urn:cms:tags"), TagsIndex)
+        .bind(
+            UriTemplate::parse("urn:cms:type:{type}").expect("valid template"),
+            TypeView,
+        )
+        .bind(Exact::new("urn:cms:types"), TypesIndex);
     // The reading-room stylesheets: `urn:cms:style:{name}` → an XSLT resource. The view
     // resolves one to render the graph, so the room restyles by naming a different one
     // (renderers are resources). Three ship embedded; a deployment can layer an fs
@@ -102,6 +107,8 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         // The recency trail renders a small session-supplied doc (urn:cms:recent#), not
         // graph data — also a distinct stylesheet, not a card theme.
         "recent" => include_str!("../styles/recent.xsl"),
+        // The type index renders SPARQL-results XML (kinds + counts) — like tags.
+        "types" => include_str!("../styles/types.xsl"),
         _ => return Err(Error::Endpoint(format!("no stylesheet `{name}`"))),
     };
     Ok(Representation::new(
@@ -256,6 +263,29 @@ impl Endpoint for CmsGraph {
                 Iri::parse("urn:cms:graph:bookmarks").expect("valid IRI"),
             ))
             .await?;
+        // Type the bookmarks `cms:Bookmark` (ikigai-cms doesn't emit a type; books already
+        // carry `cms:Book`). Constructed over the bookmarks graph alone, so it can't touch
+        // books. This makes the type facet honest: every resource declares its kind.
+        let bookmark_types = inv
+            .issue(
+                Request::new(
+                    Verb::Source,
+                    Iri::parse("urn:sparql:construct").expect("valid IRI"),
+                )
+                .with_arg(
+                    "query",
+                    ArgRef::Inline(
+                        "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+                         PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+                         CONSTRUCT { ?s a cms:Bookmark } WHERE { ?s dc:identifier ?u }"
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                )
+                .with_arg("graph", ArgRef::Inline(b"urn:cms:graph:bookmarks".to_vec()))
+                .with_arg("as", ArgRef::Inline(b"turtle".to_vec())),
+            )
+            .await?;
         let books = inv
             .issue(Request::new(
                 Verb::Source,
@@ -263,6 +293,8 @@ impl Endpoint for CmsGraph {
             ))
             .await?;
         let mut turtle = bookmarks.bytes;
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&bookmark_types.bytes);
         turtle.push(b'\n');
         turtle.extend_from_slice(&books.bytes);
         Ok(Representation::new(
@@ -456,6 +488,90 @@ impl Endpoint for TagsIndex {
             .summary(
                 "The tag index: the room's top tags by frequency, each a clickable chip \
                  that opens its view. A view is a query.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:type:{type}` — cards for resources of a kind (`book` | `bookmark`), capped at
+/// a browse sample; narrow further by tag or search. Renders through the card stylesheets.
+struct TypeView;
+
+#[async_trait]
+impl Endpoint for TypeView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let ty = inv
+            .bindings
+            .get("type")
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::MissingArgument("type".to_string()))?;
+        // Only the known kinds (never build an arbitrary `cms:{X}` class off a client string).
+        let class = match ty.as_str() {
+            "book" => "Book",
+            "bookmark" => "Bookmark",
+            _ => return Err(Error::Endpoint(format!("no type `{ty}`"))),
+        };
+        let query = format!(
+            "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+             PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
+             WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
+                 ?s a cms:{class} ; dc:title ?t ; dc:identifier ?u . \
+             }} ORDER BY ?t LIMIT 100 }} \
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
+        );
+        render(
+            inv,
+            "urn:sparql:construct",
+            query,
+            "rdfxml",
+            card_style(inv),
+        )
+        .await
+    }
+
+    fn name(&self) -> &str {
+        "cms-type"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:type")
+            .summary(
+                "Cards for resources of a kind (book | bookmark), capped at a browse \
+                 sample. A view is a query.",
+            )
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:types` — the type index: each kind (`book`, `bookmark`) with a count, a
+/// clickable chip opening its type view. Like the tag index, navigation is a query.
+struct TypesIndex;
+
+#[async_trait]
+impl Endpoint for TypesIndex {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // CMS content kinds only (cms:Book, cms:Bookmark) — a source's schema triples can
+        // leave stray rdf:Property/rdfs:Class/owl:Ontology types in the graph.
+        let query = "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+             SELECT ?label (COUNT(?s) AS ?n) WHERE { \
+               ?s a ?type . \
+               FILTER(STRSTARTS(STR(?type), \"https://ikigai-rs.dev/ns/cms#\")) \
+               BIND(LCASE(REPLACE(STR(?type), \"^.*#\", \"\")) AS ?label) \
+             } GROUP BY ?label ORDER BY DESC(?n)"
+            .to_string();
+        render(inv, "urn:sparql:select", query, "xml", "types").await
+    }
+
+    fn name(&self) -> &str {
+        "cms-types"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:types")
+            .summary(
+                "The type index: each kind (book, bookmark) with a count, a clickable chip \
+                 that opens its type view. A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -752,5 +868,44 @@ mod tests {
             "SELECT (COUNT(?b) AS ?n) WHERE { ?b a <https://ikigai-rs.dev/ns/cms#Book> }",
         );
         assert!(json.contains("\"0\""), "no books without a library: {json}");
+    }
+
+    #[test]
+    fn the_type_facet_indexes_and_browses_kinds() {
+        let (_dir, kernel) = fixture_kernel(true);
+        // Bookmarks are typed now too (books already were), so both kinds are explicit.
+        let json = select(
+            &kernel,
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s a <https://ikigai-rs.dev/ns/cms#Bookmark> }",
+        );
+        assert!(!json.contains("\"0\""), "bookmarks are typed: {json}");
+        // The type index lists both kinds, each linking to its type view.
+        let idx = resolve_html(&kernel, "urn:cms:types", &[]);
+        assert!(idx.contains("urn:cms:type:book"), "book chip: {idx}");
+        assert!(
+            idx.contains("urn:cms:type:bookmark"),
+            "bookmark chip: {idx}"
+        );
+        // A type view renders cards of that kind — the book view shows authors.
+        let books = resolve_html(&kernel, "urn:cms:type:book", &[]);
+        assert!(
+            books.contains("Rust in Action"),
+            "book in book view: {books}"
+        );
+        assert!(
+            books.contains("class='cms-author'"),
+            "book view shows authors: {books}"
+        );
+        let bookmarks = resolve_html(&kernel, "urn:cms:type:bookmark", &[]);
+        assert!(
+            bookmarks.contains("quicwg.org"),
+            "bookmark in bookmark view: {bookmarks}"
+        );
+        // An unknown kind is rejected (no arbitrary cms:{X} class off a client string).
+        let iri = Iri::parse("urn:cms:type:widget").unwrap();
+        assert!(
+            Resolver::issue(&kernel, Request::new(Verb::Source, iri)).is_err(),
+            "unknown type rejected"
+        );
     }
 }
