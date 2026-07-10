@@ -79,7 +79,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     println!("cert sha-256: {hash_hex}");
-    println!("open the reading room with  #cert={hash_hex}  in the URL");
+    // Write the cert hash where the page can fetch it, so no one pastes `#cert=` by hand.
+    // The static server serving `dist/` serves this too; the page reads `cert.json` on
+    // load and connects automatically. `#cert=` in the URL still overrides it.
+    let dist = std::env::var_os("CMS_DIST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("dist"));
+    let cert_json = serde_json::json!({ "cert": hash_hex, "port": port }).to_string();
+    match std::fs::write(dist.join("cert.json"), cert_json) {
+        Ok(()) => println!(
+            "wrote {}/cert.json — open the page (served from dist/) and it connects automatically",
+            dist.display()
+        ),
+        Err(e) => println!(
+            "note: couldn't write {}/cert.json ({e}); open the page with #cert={hash_hex}",
+            dist.display()
+        ),
+    }
 
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir));
 
@@ -229,6 +245,14 @@ fn handle_auth(rp: &Rp, entitlement: &[String], session: &mut Session, req: &Req
                 Ok(()) => json_reply(br#"{"ok":true}"#.to_vec()),
                 Err(e) => Reply::Error(e),
             }
+        }
+        "urn:auth:logout" => {
+            // Drop the connection back to the public ceiling; the enrolled passkey stays,
+            // this session just loses its elevation until it signs in again.
+            session.ceiling = Capability::scoped(Vec::<String>::new());
+            session.auth_state = None;
+            session.reg_state = None;
+            json_reply(br#"{"ok":true}"#.to_vec())
         }
         other => Reply::Error(format!("unknown auth resource `{other}`")),
     }
