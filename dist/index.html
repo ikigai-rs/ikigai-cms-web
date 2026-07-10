@@ -172,8 +172,9 @@ room.addEventListener('click', (e) => {
   if (!el) return;
   e.preventDefault();
   const iri = el.getAttribute('hx-get');
-  // A tag click inside a type stays within that type (the header shows the scope).
-  const scope = viewType(currentView, currentArgs);
+  // A recent chip carries its recorded scope (data-cms-type); a tag chip inside a type
+  // inherits the current view's scope. Either keeps a tag click within its kind.
+  const scope = el.getAttribute('data-cms-type') || viewType(currentView, currentArgs);
   if (iri.startsWith('urn:cms:view:') && scope) navigate(iri, { type: scope });
   else navigate(iri);
 });

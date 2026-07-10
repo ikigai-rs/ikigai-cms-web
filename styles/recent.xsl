@@ -25,6 +25,11 @@
       <xsl:attribute name="hx-get">
         <xsl:value-of select="@iri"/>
       </xsl:attribute>
+      <!-- The recorded type scope (empty = unscoped); the room handler re-opens the tag
+           within this kind, so a recent "book · #rust" reopens scoped to books. -->
+      <xsl:attribute name="data-cms-type">
+        <xsl:value-of select="@scope"/>
+      </xsl:attribute>
       <xsl:value-of select="."/>
     </a>
   </xsl:template>
