@@ -48,10 +48,14 @@
 <div class="wrap">
   <header class="top">
     <h1>ikigai reading room</h1>
-    <div class="seg" role="group" aria-label="stylesheet">
+    <div class="seg" role="group" aria-label="stylesheet" id="styleseg">
       <button data-style="catalog" aria-pressed="true">catalog</button>
       <button data-style="mosaic" aria-pressed="false">mosaic</button>
       <button data-style="agenda" aria-pressed="false">agenda</button>
+    </div>
+    <div class="seg" role="group" aria-label="sort order" id="sortseg">
+      <button data-dir="asc" aria-pressed="true">A→Z</button>
+      <button data-dir="desc" aria-pressed="false">Z→A</button>
     </div>
     <div class="auth">
       <button id="signin">sign in</button>
@@ -95,6 +99,7 @@ const START_VIEW = 'urn:cms:view:quic';
 
 let wt = null;
 let currentStyle = 'catalog';   // the named urn:cms:style:* the view renders through
+let currentSort = 'asc';        // title sort direction (asc|desc), sticky across views like the style
 let currentView = START_VIEW;   // the current view resource, re-rendered on restyle
 let currentArgs = {};           // its extra args (e.g. a search `q`), preserved on restyle
 let signedIn = false;           // a verified passkey has raised the server ceiling
@@ -123,7 +128,7 @@ async function loadView(iri, extra) {
   currentView = iri;
   currentArgs = extra || {};
   updateContext();
-  const args = Object.assign({ style: currentStyle }, currentArgs);
+  const args = Object.assign({ style: currentStyle, dir: currentSort }, currentArgs);
   const bytes = encodeIssue(iri, JSON.stringify(args));
   if (!bytes.length) { room.innerHTML = '<p class="cms-error">bad iri: ' + iri + '</p>'; return; }
   room.innerHTML = await wireCall(bytes);
@@ -195,11 +200,21 @@ room.addEventListener('click', (e) => {
 
 // Restyle = re-fetch the current view naming a different stylesheet resource. The look
 // is data: the server renders the same graph through a different XSLT.
-document.querySelectorAll('.seg button').forEach((b) =>
+document.querySelectorAll('#styleseg button').forEach((b) =>
   b.addEventListener('click', () => {
-    document.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    document.querySelectorAll('#styleseg button').forEach((x) => x.setAttribute('aria-pressed', x === b));
     currentStyle = b.dataset.style;
     if (wt) loadView(currentView, currentArgs);
+  })
+);
+
+// Sort = re-fetch the current view with a title sort direction (the server's ORDER BY).
+// Sticky like the style; changing it drops the page offset so you land on page one.
+document.querySelectorAll('#sortseg button').forEach((b) =>
+  b.addEventListener('click', () => {
+    document.querySelectorAll('#sortseg button').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    currentSort = b.dataset.dir;
+    if (wt) { const a = Object.assign({}, currentArgs); delete a.offset; loadView(currentView, a); }
   })
 );
 

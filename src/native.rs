@@ -389,6 +389,16 @@ fn page_offset(inv: &Invocation<'_>) -> usize {
         .unwrap_or(0)
 }
 
+/// The `ORDER BY` term for the sort variable from the `dir` arg: `DESC(?v)` for
+/// `dir=desc`, else plain `?v` (ascending — the default and every other value). The var is
+/// caller-supplied (never client input), so this only ever wraps a fixed variable.
+fn order_by(inv: &Invocation<'_>, var: &str) -> String {
+    match inv.inline_str("dir") {
+        Ok("desc") => format!("DESC({var})"),
+        _ => var.to_string(),
+    }
+}
+
 /// Count the resources a view's pattern matches (its `SELECT (COUNT(DISTINCT ?s) AS ?n)`),
 /// so the pager knows the total and whether a next page exists. Golden-threaded like the
 /// page query, so a graph edit refreshes it.
@@ -491,6 +501,7 @@ impl Endpoint for TagView {
             _ => "",
         };
         let offset = page_offset(inv);
+        let order = order_by(inv, "?st");
         let count_query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {type_filter}?s dc:subject \"{safe}\" }}"
@@ -501,7 +512,7 @@ impl Endpoint for TagView {
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?st WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?st }} \
-                         ORDER BY ?st LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+                         ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
                       ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -537,6 +548,7 @@ impl Endpoint for SearchView {
         }
         let safe = sparql_lit(q);
         let offset = page_offset(inv);
+        let order = order_by(inv, "?t");
         // Match on title-contains; page the resources in a subquery so LIMIT/OFFSET slice
         // *resources*, then join each one's tags for its chips.
         let count_query = format!(
@@ -550,7 +562,7 @@ impl Endpoint for SearchView {
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s dc:title ?t ; dc:identifier ?u . \
                  FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
-             }} ORDER BY ?t LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+             }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -618,6 +630,7 @@ impl Endpoint for TypeView {
             _ => return Err(Error::Endpoint(format!("no type `{ty}`"))),
         };
         let offset = page_offset(inv);
+        let order = order_by(inv, "?t");
         let count_query = format!(
             "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s a cms:{class} }}"
@@ -628,7 +641,7 @@ impl Endpoint for TypeView {
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s a cms:{class} ; dc:title ?t ; dc:identifier ?u . \
-             }} ORDER BY ?t LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+             }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -910,6 +923,43 @@ mod tests {
         assert!(
             p1.contains("Item 000") && !p2.contains("Item 000"),
             "pages must not overlap"
+        );
+    }
+
+    #[test]
+    fn a_view_sorts_by_title_ascending_or_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bm,
+            "* Bookmarks\n\
+             ** [[https://a.example][Alpha]]\n   :PROPERTIES:\n   :TAGS: sorted\n   :END:\n\
+             ** [[https://z.example][Zulu]]\n   :PROPERTIES:\n   :TAGS: sorted\n   :END:\n\
+             ** [[https://m.example][Mike]]\n   :PROPERTIES:\n   :TAGS: sorted\n   :END:\n",
+        )
+        .unwrap();
+        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+
+        // Ascending (the default): Alpha renders before Zulu.
+        let asc = resolve_html(
+            &kernel,
+            "urn:cms:view:sorted",
+            &[("style", "catalog"), ("dir", "asc")],
+        );
+        assert!(
+            asc.find("Alpha").unwrap() < asc.find("Zulu").unwrap(),
+            "asc puts Alpha before Zulu"
+        );
+        // Descending: the same graph, order flipped.
+        let desc = resolve_html(
+            &kernel,
+            "urn:cms:view:sorted",
+            &[("style", "catalog"), ("dir", "desc")],
+        );
+        assert!(
+            desc.find("Zulu").unwrap() < desc.find("Alpha").unwrap(),
+            "desc puts Zulu before Alpha"
         );
     }
 
