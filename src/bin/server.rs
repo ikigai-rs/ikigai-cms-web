@@ -114,7 +114,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "(none — bookmarks only)".to_string())
     );
 
-    let kernel = Arc::new(ikigai_cms_web::build_cms_kernel(src_dir, zotero));
+    // Lectern presentations (decks): CMS_PRESENTATIONS overrides; else the default repo.
+    // Only used if the directory exists — otherwise the graph carries no presentations.
+    let presentations: Option<PathBuf> = std::env::var_os("CMS_PRESENTATIONS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("git-personal/lectern-presentations"))
+        })
+        .filter(|p| p.is_dir());
+    println!(
+        "presentations: {}",
+        presentations
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+
+    let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
+        src_dir,
+        zotero,
+        presentations,
+    ));
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 

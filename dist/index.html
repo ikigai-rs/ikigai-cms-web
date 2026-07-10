@@ -134,7 +134,7 @@ async function loadView(iri, extra) {
   room.innerHTML = await wireCall(bytes);
 }
 
-const TYPE_LABELS = { book: 'Books', bookmark: 'Bookmarks' };
+const TYPE_LABELS = { book: 'Books', bookmark: 'Bookmarks', presentation: 'Presentations' };
 
 // The active type scope of a view: a type view, or a tag view carrying a type arg. Used
 // to keep tag clicks within a type and to label the context. Null = unscoped (all kinds).
