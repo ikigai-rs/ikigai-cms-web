@@ -201,15 +201,21 @@ fn handle(
         }
         Ok(Call::Issue(req)) => {
             let iri = req.target.as_str().to_string();
+            let scope = inline_arg(&req, "type")
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(str::to_string);
             let reply = resolve(kernel, &session.ceiling, req);
-            note_recent(recent, session, &iri, &reply);
+            note_recent(recent, session, &iri, scope.as_deref(), &reply);
             reply
         }
         // A client may carry a capability to attenuate below the ceiling; clamp it.
         Ok(Call::IssueAs(req, carried)) => {
             let iri = req.target.as_str().to_string();
+            let scope = inline_arg(&req, "type")
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(str::to_string);
             let reply = resolve(kernel, &session.ceiling.clamp(&carried), req);
-            note_recent(recent, session, &iri, &reply);
+            note_recent(recent, session, &iri, scope.as_deref(), &reply);
             reply
         }
         Ok(Call::IsCached(req)) => {
@@ -229,26 +235,40 @@ fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
     }
 }
 
-/// The display label for a recordable view, or `None` if this IRI isn't something the
-/// recency trail tracks. Only pure-URI, re-openable views count (a tag view today; type
-/// and item views later) — search is excluded since re-opening it needs its `q` arg.
-fn recordable_label(iri: &str) -> Option<String> {
+/// The display label and recorded scope for a recordable view, or `None` if this IRI
+/// isn't something the recency trail tracks. Only pure-URI, re-openable views count (a tag
+/// view — optionally scoped to a type; a type view) — search is excluded since re-opening
+/// it needs its `q` arg. `scope` is the request's `type` arg (a tag opened inside a kind).
+fn recordable(iri: &str, scope: Option<&str>) -> Option<(String, Option<String>)> {
     if let Some(tag) = iri.strip_prefix("urn:cms:view:") {
-        return Some(format!("#{tag}"));
+        return Some(match scope {
+            Some(kind @ ("book" | "bookmark")) => {
+                (format!("{kind} · #{tag}"), Some(kind.to_string()))
+            }
+            _ => (format!("#{tag}"), None),
+        });
     }
     if let Some(kind) = iri.strip_prefix("urn:cms:type:") {
-        return Some(format!("type: {kind}"));
+        return Some((format!("type: {kind}"), None));
     }
     None
 }
 
 /// If a signed-in principal just successfully opened a recordable view, add it to the
-/// trail (a repeat visit moves it to the front).
-fn note_recent(recent: &RecentLog, session: &Session, iri: &str, reply: &Reply) {
+/// trail (a repeat visit moves it to the front). `scope` = the view's `type` arg, so a
+/// tag opened inside a kind is recorded and re-opened within that kind.
+fn note_recent(
+    recent: &RecentLog,
+    session: &Session,
+    iri: &str,
+    scope: Option<&str>,
+    reply: &Reply,
+) {
     if !matches!(reply, Reply::Resolved(..)) {
         return;
     }
-    let (Some(principal), Some(label)) = (session.principal.as_deref(), recordable_label(iri))
+    let (Some(principal), Some((label, scope))) =
+        (session.principal.as_deref(), recordable(iri, scope))
     else {
         return;
     };
@@ -256,6 +276,7 @@ fn note_recent(recent: &RecentLog, session: &Session, iri: &str, reply: &Reply) 
         principal,
         Recent {
             iri: iri.to_string(),
+            scope,
             label,
         },
     );
@@ -295,6 +316,9 @@ fn recent_xml(items: &[Recent]) -> String {
         for it in items {
             s.push_str("<item iri=\"");
             xml_escape_into(&mut s, &it.iri);
+            // Always emit scope (empty = unscoped) so the stylesheet can render it flatly.
+            s.push_str("\" scope=\"");
+            xml_escape_into(&mut s, it.scope.as_deref().unwrap_or(""));
             s.push_str("\">");
             xml_escape_into(&mut s, &it.label);
             s.push_str("</item>");

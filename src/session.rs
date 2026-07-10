@@ -159,10 +159,13 @@ impl Rp {
     }
 }
 
-/// One recently-viewed CMS resource: its IRI (re-openable) and a display label.
+/// One recently-viewed CMS resource: its IRI, an optional type `scope` (a tag opened
+/// inside a kind, e.g. `#rust` in Books), and a display label. IRI + scope together
+/// identify the entry — `#rust` and `#rust in Books` are distinct trail items.
 #[derive(Clone)]
 pub struct Recent {
     pub iri: String,
+    pub scope: Option<String>,
     pub label: String,
 }
 
@@ -178,12 +181,13 @@ pub struct RecentLog {
 }
 
 impl RecentLog {
-    /// Record a view under `principal`, most-recent-first, de-duplicated by IRI (a repeat
-    /// visit moves it to the front), capped at [`RECENT_CAP`].
+    /// Record a view under `principal`, most-recent-first, de-duplicated by IRI **and
+    /// scope** (a repeat visit moves it to the front; a tag and that tag within a type are
+    /// separate entries), capped at [`RECENT_CAP`].
     pub fn record(&self, principal: &str, entry: Recent) {
         let mut map = self.by_principal.lock().unwrap();
         let trail = map.entry(principal.to_string()).or_default();
-        trail.retain(|e| e.iri != entry.iri);
+        trail.retain(|e| !(e.iri == entry.iri && e.scope == entry.scope));
         trail.push_front(entry);
         trail.truncate(RECENT_CAP);
     }
@@ -262,6 +266,7 @@ mod tests {
         let log = RecentLog::default();
         let e = |iri: &str| Recent {
             iri: iri.to_string(),
+            scope: None,
             label: iri.to_string(),
         };
         log.record("alice", e("urn:cms:view:rust"));
@@ -279,6 +284,30 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_tag_is_a_distinct_entry_from_the_plain_tag() {
+        let log = RecentLog::default();
+        let entry = |scope: Option<&str>| Recent {
+            iri: "urn:cms:view:rust".to_string(),
+            scope: scope.map(str::to_string),
+            label: "rust".to_string(),
+        };
+        log.record("alice", entry(None)); // #rust
+        log.record("alice", entry(Some("book"))); // #rust in Books — NOT a dup of #rust
+        assert_eq!(
+            log.list("alice").len(),
+            2,
+            "same tag, different scope = two entries"
+        );
+        // Re-opening the scoped one dedups only against the scoped one.
+        log.record("alice", entry(Some("book")));
+        assert_eq!(
+            log.list("alice").len(),
+            2,
+            "scoped repeat dedups by iri+scope"
+        );
+    }
+
+    #[test]
     fn recency_is_capped() {
         let log = RecentLog::default();
         for i in 0..(RECENT_CAP + 10) {
@@ -286,6 +315,7 @@ mod tests {
                 "alice",
                 Recent {
                     iri: format!("urn:cms:view:t{i}"),
+                    scope: None,
                     label: format!("#t{i}"),
                 },
             );
