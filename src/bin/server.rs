@@ -114,20 +114,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "(none — bookmarks only)".to_string())
     );
 
-    // Lectern presentations (decks): CMS_PRESENTATIONS overrides; else the default repo.
-    // Only used if the directory exists — otherwise the graph carries no presentations.
-    let presentations: Option<PathBuf> = std::env::var_os("CMS_PRESENTATIONS")
+    // Lectern presentations (decks): CMS_PRESENTATIONS overrides the root; else the default
+    // repo. Only used if the directory exists. CMS_DECK_BASE is the base URL a static server
+    // exposes that tree at, so a presentation card's link opens the built deck; default
+    // `http://localhost:8000` (serve the decks with e.g. `python3 -m http.server 8000` in
+    // the presentations dir). Set CMS_DECK_BASE="" for locatable-but-unclickable file:// links.
+    let presentations = std::env::var_os("CMS_PRESENTATIONS")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|h| PathBuf::from(h).join("git-personal/lectern-presentations"))
         })
-        .filter(|p| p.is_dir());
+        .filter(|p| p.is_dir())
+        .map(|root| {
+            let base = std::env::var("CMS_DECK_BASE")
+                .unwrap_or_else(|_| "http://localhost:8000".to_string());
+            ikigai_cms_web::Presentations {
+                root,
+                base_url: (!base.is_empty()).then_some(base),
+            }
+        });
     println!(
         "presentations: {}",
         presentations
-            .as_deref()
-            .map(|p| p.display().to_string())
+            .as_ref()
+            .map(|p| format!(
+                "{} → {}",
+                p.root.display(),
+                p.base_url.as_deref().unwrap_or("file:// links")
+            ))
             .unwrap_or_else(|| "(none)".to_string())
     );
 
