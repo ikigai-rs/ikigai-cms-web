@@ -47,6 +47,7 @@
     <div class="auth">
       <button id="signin">sign in</button>
       <button id="register">register passkey</button>
+      <button id="signout" hidden>sign out</button>
     </div>
     <span class="status" id="status">not connected</span>
   </header>
@@ -60,9 +61,10 @@
   </nav>
 
   <div class="connect" id="connect">
-    <p style="margin:0">Start the server and connect. In the repo:</p>
+    <p style="margin:0">Start the server, then serve <code>dist/</code>:</p>
     <p style="margin:6px 0 0"><code>cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files</code></p>
-    <p style="margin:10px 0 0; font-size:14px; color:var(--mut)">Paste the printed <code>cert sha-256</code> (or open this page with <code>#cert=&lt;hash&gt;</code>), optionally <code>&amp;port=4433</code>:</p>
+    <p style="margin:4px 0 0"><code>python3 -m http.server --directory dist 8080</code></p>
+    <p style="margin:10px 0 0; font-size:14px; color:var(--mut)">The server writes its cert next to the page, so this connects on its own. If it doesn't (server not running from the repo, or a different host), paste the printed <code>cert sha-256</code> — or open with <code>#cert=&lt;hash&gt;</code>:</p>
     <input id="cert" placeholder="cert sha-256 hex" autocomplete="off" spellcheck="false" />
   </div>
 
@@ -165,7 +167,7 @@ async function passkeyLogin() {
     await authCall('urn:auth:login:finish', { credential: JSON.stringify(assertion.toJSON()) });
     signedIn = true;
     setStatus('signed in');
-    document.querySelector('.auth').style.display = 'none';
+    $('#signin').hidden = true; $('#register').hidden = true; $('#signout').hidden = false;
     $('#nav').hidden = false;
     await loadView(currentView, currentArgs);
   } catch (e) { setStatus('sign-in failed: ' + e.message, true); }
@@ -182,9 +184,20 @@ async function passkeyRegister() {
   } catch (e) { setStatus('registration failed: ' + e.message, true); }
 }
 
-async function connectAndLoad(certHex) {
+// Sign out: drop the server ceiling back to public and reset the page to the gated
+// state. The passkey stays enrolled; this just ends the session's elevation.
+async function passkeySignOut() {
+  try { await authCall('urn:auth:logout', {}); } catch (_) { /* drop local state regardless */ }
+  signedIn = false;
+  $('#signin').hidden = false; $('#register').hidden = false; $('#signout').hidden = true;
+  $('#nav').hidden = true;
+  room.innerHTML = '<p style="color:var(--mut)">Signed out. Sign in with your passkey to read the room.</p>';
+  setStatus('signed out');
+}
+
+async function connectAndLoad(certHex, portOverride) {
   if (typeof WebTransport === 'undefined') { setStatus('no WebTransport — use Chrome/Edge or Safari 26.4+', true); return; }
-  const port = params.get('port') || '4433';
+  const port = portOverride || params.get('port') || '4433';
   const url = 'https://127.0.0.1:' + port + '/';
   try {
     setStatus('connecting…');
@@ -200,13 +213,24 @@ async function connectAndLoad(certHex) {
 
 document.getElementById('signin').addEventListener('click', passkeyLogin);
 document.getElementById('register').addEventListener('click', passkeyRegister);
+document.getElementById('signout').addEventListener('click', passkeySignOut);
 
 await init();
+// Connect priority: an explicit #cert= wins (override / other host); otherwise fetch the
+// hash the server wrote next to the page (dist/cert.json) and connect automatically; if
+// neither is present, fall back to pasting the hash by hand.
 const certParam = params.get('cert');
 if (certParam) {
   connectAndLoad(certParam);
 } else {
-  $('#cert').addEventListener('change', (e) => { const v = e.target.value.trim(); if (v) connectAndLoad(v); });
+  let auto = false;
+  try {
+    const r = await fetch('cert.json', { cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); if (j.cert) { auto = true; connectAndLoad(j.cert, j.port ? String(j.port) : undefined); } }
+  } catch (_) { /* no cert.json — server not started from dist/, or not running yet */ }
+  if (!auto) {
+    $('#cert').addEventListener('change', (e) => { const v = e.target.value.trim(); if (v) connectAndLoad(v); });
+  }
 }
 </script>
 </body>
