@@ -83,6 +83,9 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         // The tag index renders SPARQL-results XML (not the card RDF/XML), so it's a
         // distinct stylesheet not offered as a card theme.
         "tags" => include_str!("../styles/tags.xsl"),
+        // The recency trail renders a small session-supplied doc (urn:cms:recent#), not
+        // graph data — also a distinct stylesheet, not a card theme.
+        "recent" => include_str!("../styles/recent.xsl"),
         _ => return Err(Error::Endpoint(format!("no stylesheet `{name}`"))),
     };
     Ok(Representation::new(
@@ -461,6 +464,37 @@ mod tests {
             html2.contains("https://webassembly.org"),
             "case-insensitive: {html2}"
         );
+    }
+
+    fn render_via_xslt(kernel: &Kernel, content: &str, style: &str) -> String {
+        let request = Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
+            .with_arg("content", ArgRef::Inline(content.as_bytes().to_vec()))
+            .with_arg(
+                "stylesheet",
+                ArgRef::Inline(format!("urn:cms:style:{style}").into_bytes()),
+            );
+        let (repr, _status) = Resolver::issue(kernel, request).expect("xslt resolves");
+        String::from_utf8(repr.bytes).unwrap()
+    }
+
+    #[test]
+    fn the_recent_stylesheet_renders_the_trail_and_the_empty_state() {
+        let (_dir, kernel) = kernel_over_fixture();
+        // A trail item (custom urn:cms:recent# namespace) → a clickable row re-opening it.
+        let html = render_via_xslt(
+            &kernel,
+            "<recent xmlns=\"urn:cms:recent#\"><item iri=\"urn:cms:view:quic\">#quic</item></recent>",
+            "recent",
+        );
+        assert!(html.contains("urn:cms:view:quic"), "row links back: {html}");
+        assert!(html.contains("#quic"), "row is labeled: {html}");
+        // The empty trail is its own element → a hint, no conditionals needed.
+        let empty = render_via_xslt(
+            &kernel,
+            "<recent xmlns=\"urn:cms:recent#\"><empty/></recent>",
+            "recent",
+        );
+        assert!(empty.contains("Nothing viewed yet"), "empty hint: {empty}");
     }
 
     #[test]
