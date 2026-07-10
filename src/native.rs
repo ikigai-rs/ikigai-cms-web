@@ -385,10 +385,16 @@ impl Endpoint for TagView {
             .get("tag")
             .ok_or_else(|| Error::MissingArgument("tag".to_string()))?;
         let safe = sparql_lit(tag);
+        // Optional `type` scope: a tag click inside a type view stays within that kind.
+        let type_filter = match inv.inline_str("type") {
+            Ok("book") => "?s a <https://ikigai-rs.dev/ns/cms#Book> . ",
+            Ok("bookmark") => "?s a <https://ikigai-rs.dev/ns/cms#Bookmark> . ",
+            _ => "",
+        };
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
-             WHERE {{ ?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . \
+             WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . \
                       OPTIONAL {{ ?s dc:creator ?c }} }}"
         );
         render(
@@ -410,7 +416,8 @@ impl Endpoint for TagView {
             .summary(
                 "The reading room for a tag: an htmx HTML fragment of every resource \
                  carrying `dc:subject {tag}`, rendered as cards through a stylesheet \
-                 resource. A view is a query.",
+                 resource. Optional `type` arg (book|bookmark) scopes the tag to a kind. \
+                 A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -912,6 +919,22 @@ mod tests {
         assert!(
             Resolver::issue(&kernel, Request::new(Verb::Source, iri)).is_err(),
             "unknown type rejected"
+        );
+    }
+
+    #[test]
+    fn a_tag_view_scopes_to_a_type() {
+        let (_dir, kernel) = fixture_kernel(true);
+        // The fixture book "Rust in Action" is tagged rust; no bookmark is.
+        let in_books = resolve_html(&kernel, "urn:cms:view:rust", &[("type", "book")]);
+        assert!(
+            in_books.contains("Rust in Action"),
+            "rust scoped to books shows the book: {in_books}"
+        );
+        let in_bookmarks = resolve_html(&kernel, "urn:cms:view:rust", &[("type", "bookmark")]);
+        assert!(
+            !in_bookmarks.contains("Rust in Action"),
+            "rust scoped to bookmarks excludes the book: {in_bookmarks}"
         );
     }
 }

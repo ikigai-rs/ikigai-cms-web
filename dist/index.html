@@ -29,6 +29,9 @@
   nav.nav button:hover { background:var(--card); }
   nav.nav form { margin-left:auto; display:flex; }
   nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
+  .context { display:flex; align-items:baseline; gap:8px; margin:14px 0 -2px; font:15px system-ui; font-weight:600; color:var(--fg); }
+  .context[hidden] { display:none; }
+  .context .context-scope { font-weight:500; color:var(--accent); }
   #room { margin-top:16px; }
   /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
   #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
@@ -70,6 +73,7 @@
     <input id="cert" placeholder="cert sha-256 hex" autocomplete="off" spellcheck="false" />
   </div>
 
+  <div class="context" id="context" hidden></div>
   <div id="room"></div>
 </div>
 
@@ -112,10 +116,38 @@ async function wireCall(bytes) {
 async function loadView(iri, extra) {
   currentView = iri;
   currentArgs = extra || {};
+  updateContext();
   const args = Object.assign({ style: currentStyle }, currentArgs);
   const bytes = encodeIssue(iri, JSON.stringify(args));
   if (!bytes.length) { room.innerHTML = '<p class="cms-error">bad iri: ' + iri + '</p>'; return; }
   room.innerHTML = await wireCall(bytes);
+}
+
+const TYPE_LABELS = { book: 'Books', bookmark: 'Bookmarks' };
+
+// The active type scope of a view: a type view, or a tag view carrying a type arg. Used
+// to keep tag clicks within a type and to label the context. Null = unscoped (all kinds).
+function viewType(iri, args) {
+  if (iri.startsWith('urn:cms:type:')) return iri.slice('urn:cms:type:'.length);
+  if (iri.startsWith('urn:cms:view:') && args && args.type) return args.type;
+  return null;
+}
+
+// A header that says what you're looking at — so a tag/type/search view isn't a mystery.
+function updateContext() {
+  const el = $('#context'), iri = currentView, args = currentArgs || {};
+  let label = '';
+  if (iri === 'urn:cms:tags') label = 'All tags';
+  else if (iri === 'urn:cms:types') label = 'Types';
+  else if (iri === 'urn:cms:recent') label = 'Recently viewed';
+  else if (iri === 'urn:cms:search') label = 'Search: ' + (args.q || '');
+  else if (iri.startsWith('urn:cms:type:')) label = TYPE_LABELS[iri.slice(13)] || iri.slice(13);
+  else if (iri.startsWith('urn:cms:view:')) {
+    const tag = iri.slice('urn:cms:view:'.length);
+    label = args.type ? (TYPE_LABELS[args.type] || args.type) + ' tagged #' + tag : 'Tagged #' + tag;
+  }
+  el.textContent = label;
+  el.hidden = !label;
 }
 
 // Navigate = render + push a history entry (same URL, just state), so the browser's
@@ -139,7 +171,11 @@ room.addEventListener('click', (e) => {
   const el = e.target.closest('[hx-get]');
   if (!el) return;
   e.preventDefault();
-  navigate(el.getAttribute('hx-get'));
+  const iri = el.getAttribute('hx-get');
+  // A tag click inside a type stays within that type (the header shows the scope).
+  const scope = viewType(currentView, currentArgs);
+  if (iri.startsWith('urn:cms:view:') && scope) navigate(iri, { type: scope });
+  else navigate(iri);
 });
 
 // Restyle = re-fetch the current view naming a different stylesheet resource. The look
@@ -209,7 +245,7 @@ async function passkeySignOut() {
   try { await authCall('urn:auth:logout', {}); } catch (_) { /* drop local state regardless */ }
   signedIn = false;
   $('#signin').hidden = false; $('#register').hidden = false; $('#signout').hidden = true;
-  $('#nav').hidden = true;
+  $('#nav').hidden = true; $('#context').hidden = true;
   room.innerHTML = '<p style="color:var(--mut)">Signed out. Sign in with your passkey to read the room.</p>';
   setStatus('signed out');
 }
