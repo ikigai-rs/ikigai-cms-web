@@ -115,7 +115,13 @@ impl Rp {
 
     /// Begin registration — the challenge options as JSON (for `navigator.credentials.create`)
     /// + the in-progress state to hold until `register_finish`.
+    ///
+    /// Gated by biometric presence at the **server machine** (Touch ID): enrolling a
+    /// passkey isn't just first-come, it needs someone at the box to approve — so a
+    /// remote first-comer can't claim the room.
     pub fn register_start(&self, user_name: &str) -> Result<(String, PasskeyRegistration), String> {
+        ikigai_secret::require_biometric("Enroll a passkey for the ikigai reading room")
+            .map_err(|e| format!("{e}"))?;
         let exclude = self
             .passkeys()
             .iter()
