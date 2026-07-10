@@ -2,16 +2,17 @@
 //! on the shared CMS axis, so a talk is browsable in the reading room like a bookmark or
 //! a book (type facet, tags, recency, search, pagination, sort — all for free).
 //!
-//! A **deck** is a directory containing `deck.toml`. Its title is the title slide's first
-//! `# H1`; its tags are that slide's `<span class="tag …">` run **plus** the venue
-//! segments of its path — so `conferences/nfjs/uberconf/2026/…` yields `#nfjs` and
-//! `#uberconf` with no hand-tagging. Its link is the built `dist/index.html`.
+//! A **deck** is a directory containing `deck.toml`. Title and tags come from the deck's
+//! authored **JSON-LD** — a `<script type="application/ld+json">` lectern emits into the
+//! built `dist/index.html` using the shared `dc:`/`cms:` vocab (the agreed interface). For
+//! un-migrated or un-built decks it **falls back** to scraping the title slide's first
+//! `# H1` and `<span class="tag …">` run. Either way, the **venue segments of the path** are
+//! added as tags — so `conferences/nfjs/uberconf/2026/…` yields `#nfjs` and `#uberconf` with
+//! no hand-tagging. The link is the built `dist/index.html`, served under the configured base.
 //!
-//! This is the *bootstrap* transreptor: it scrapes the presentation layer once to seed the
-//! graph. The durable end state is the graph as source of truth with lectern rendering
-//! *from* it (title/tags/provenance authored in the graph, not scraped back out of HTML).
-//! Native-only (it walks the filesystem) and not golden-threaded, so a newly-authored deck
-//! appears on the next restart.
+//! Native-only (it walks the filesystem) and not golden-threaded, so a newly-authored or
+//! rebuilt deck appears on the next restart. The durable end state is the graph as source of
+//! truth with lectern rendering *from* it — the JSON-LD interface is the first step there.
 
 use std::path::{Path, PathBuf};
 
@@ -54,9 +55,9 @@ impl Endpoint for PresentationsGraph {
     fn describe(&self) -> Description {
         Description::new("urn:cms:graph:presentations")
             .summary(
-                "Lectern decks as cms:Presentation resources on the CMS axis: title from \
-                 the title slide's H1, tags from its .tag spans + the venue path segments, \
-                 link to the built deck. A view is a query.",
+                "Lectern decks as cms:Presentation resources on the CMS axis: title + tags \
+                 from the deck's authored JSON-LD (scraped title slide as fallback), plus \
+                 venue path segments, linked to the built deck. A view is a query.",
             )
             .verb(Verb::Source)
     }
@@ -113,17 +114,15 @@ fn collect_decks(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// One deck → a `cms:Presentation` block, or `None` if it has no readable title slide.
+/// One deck → a `cms:Presentation` block, or `None` if it carries no metadata at all (no
+/// built JSON-LD and no readable title slide).
 fn deck_turtle(deck: &Path, root: &Path, base_url: Option<&str>) -> Option<String> {
-    let slide = title_slide(deck)?;
-    let text = std::fs::read_to_string(&slide).ok()?;
-    let region = title_region(&text);
-    let title = first_h1(region).unwrap_or_else(|| pretty_slug(deck));
-
-    let mut tags: Vec<String> = tag_spans(region);
+    let (title, mut tags) = deck_metadata(deck)?;
+    // The venue tags come from the path, not the deck — always added, whatever the source.
     tags.extend(venue_tags(deck, root));
     tags.sort();
     tags.dedup();
+    let title = title.unwrap_or_else(|| pretty_slug(deck));
 
     let iri = deck_iri(deck, root);
     let mut ttl = format!(
@@ -136,6 +135,55 @@ fn deck_turtle(deck: &Path, root: &Path, base_url: Option<&str>) -> Option<Strin
     }
     ttl.push_str(" .\n");
     Some(ttl)
+}
+
+/// A deck's authored `(title, tags)`: its built **JSON-LD** if present (the agreed
+/// interface), else a scrape of the title slide for un-migrated/un-built decks. `None` when
+/// the deck has neither. Venue tags are added by the caller, not here.
+fn deck_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
+    jsonld_metadata(deck).or_else(|| scraped_metadata(deck))
+}
+
+/// Authored metadata from the deck's built JSON-LD (`<script type="application/ld+json">` in
+/// `dist/index.html`). The context maps `title`→`dc:title` and `tags`→`dc:subject`, so we
+/// read those compact keys. `None` when the deck isn't built or carries no JSON-LD.
+fn jsonld_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
+    let html = std::fs::read_to_string(deck.join("dist/index.html")).ok()?;
+    let block = extract_ld_json(&html)?;
+    let json: serde_json::Value = serde_json::from_str(&block).ok()?;
+    let title = json["title"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    // `tags` is a `@set` (an array), but tolerate a lone string too.
+    let tags = match &json["tags"] {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .collect(),
+        serde_json::Value::String(s) => vec![s.to_lowercase()],
+        _ => Vec::new(),
+    };
+    Some((title, tags))
+}
+
+/// The body of the first `<script type="application/ld+json">…</script>` in an HTML string.
+fn extract_ld_json(html: &str) -> Option<String> {
+    let open = "<script type=\"application/ld+json\">";
+    let i = html.find(open)?;
+    let after = &html[i + open.len()..];
+    let end = after.find("</script>")?;
+    Some(after[..end].trim().to_string())
+}
+
+/// Fallback metadata for a deck with no JSON-LD: the title slide's first `# H1` and its
+/// `<span class="tag …">` run. `None` when the deck has no readable title slide.
+fn scraped_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
+    let slide = title_slide(deck)?;
+    let text = std::fs::read_to_string(&slide).ok()?;
+    let region = title_region(&text);
+    Some((first_h1(region), tag_spans(region)))
 }
 
 /// The card link for a deck: its built `dist/index.html` served under `base_url` (so a
@@ -327,6 +375,55 @@ mod tests {
         assert!(ttl.contains("dc:subject \"nfjs\""), "venue tag: {ttl}");
         // With no base URL, the card link is a locatable `file://` path.
         assert!(ttl.contains("dc:identifier \"file://"), "deck link: {ttl}");
+    }
+
+    #[test]
+    fn built_json_ld_wins_over_the_scraped_title_slide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deck = tmp.path().join("conferences/nfjs/fs-crypto");
+        std::fs::create_dir_all(deck.join("slides")).unwrap();
+        std::fs::create_dir_all(deck.join("dist")).unwrap();
+        std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").unwrap();
+        // A title slide that says "Encryption" with a "primitives" span — both must be
+        // OVERRIDDEN by the authored JSON-LD (the real fs-crypto case: H1 and metadata diverge).
+        std::fs::write(
+            deck.join("slides/00-title.md"),
+            "# Full Stack Engineering - Encryption\n\n<span class=\"tag ink\">primitives</span>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            deck.join("dist/index.html"),
+            "<head>\n<script type=\"application/ld+json\">\n{\
+             \"@context\":{\"dc\":\"http://purl.org/dc/elements/1.1/\",\
+             \"cms\":\"https://ikigai-rs.dev/ns/cms#\",\"title\":\"dc:title\",\
+             \"tags\":{\"@id\":\"dc:subject\",\"@container\":\"@set\"}},\
+             \"@type\":\"cms:Presentation\",\
+             \"title\":\"Full Stack Engineering - Cryptography\",\
+             \"tags\":[\"cryptography\",\"security\"]}\n</script>\n</head>",
+        )
+        .unwrap();
+
+        let ttl = presentations_turtle(tmp.path(), None);
+        // Authored title wins over the stale H1.
+        assert!(
+            ttl.contains("dc:title \"Full Stack Engineering - Cryptography\""),
+            "authored title from JSON-LD: {ttl}"
+        );
+        assert!(!ttl.contains("Encryption"), "stale H1 not used: {ttl}");
+        // Authored tags, not the scraped span.
+        assert!(
+            ttl.contains("dc:subject \"cryptography\"") && ttl.contains("dc:subject \"security\""),
+            "authored tags: {ttl}"
+        );
+        assert!(
+            !ttl.contains("dc:subject \"primitives\""),
+            "the scraped span is ignored when JSON-LD is present: {ttl}"
+        );
+        // The venue tag is still merged from the path.
+        assert!(
+            ttl.contains("dc:subject \"nfjs\""),
+            "venue tag still added: {ttl}"
+        );
     }
 
     #[test]
