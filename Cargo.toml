@@ -52,6 +52,10 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext;
 # 0.1.1 adds require_biometric (Touch ID) to gate enrollment.
 ikigai-secret = { version = "0.1.1", optional = true }
+# Maintenance: the link-checker resolves urn:httpHead through the kernel; ureq is the
+# blocking transport that backs it (2xx/3xx = reachable, else broken).
+ikigai-http = { version = "0.1", optional = true }
+ureq = { version = "2", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -61,11 +65,18 @@ wasm-bindgen = "=0.2.108"
 # The native WebTransport server + WebAuthn relying party. Off by default (keeps the
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret"]
+# The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
+maintenance = ["dep:ikigai-http", "dep:ureq"]
 
 [[bin]]
 name = "cms-server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "cms-linkcheck"
+path = "src/bin/linkcheck.rs"
+required-features = ["maintenance"]
 
 [dev-dependencies]
 futures = "0.3"
