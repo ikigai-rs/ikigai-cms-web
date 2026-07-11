@@ -91,7 +91,7 @@
   <!-- Navigation: every control is vanilla htmx over the /r/ HTTP routes. hx-target/hx-swap
        set here are inherited by the buttons, the search form, AND everything swapped into
        #room (so a card's tag chips and the pager navigate the same way). Hidden until sign-in. -->
-  <nav class="nav" hx-target="#room" hx-swap="innerHTML" hidden>
+  <nav id="nav" class="nav" hx-target="#room" hx-swap="innerHTML" hidden>
     <button hx-get="/r/urn:cms:tags">tags</button>
     <button hx-get="/r/urn:cms:types">types</button>
     <button hx-get="/r/urn:cms:recent">recent</button>
