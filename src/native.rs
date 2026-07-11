@@ -368,6 +368,20 @@ fn sparql_lit(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The `cms:` class for a content-type slug (`book` | `bookmark` | `presentation`), or
+/// `None` for an unknown kind. **The single source of truth for the type↔class map** — both
+/// the type view and a tag view's `type` scope resolve through it, so they can't disagree.
+/// (They did: a missing `presentation` arm made a scoped tag view silently drop its filter
+/// while the header still said "Presentations".)
+fn cms_class(ty: &str) -> Option<&'static str> {
+    match ty {
+        "book" => Some("Book"),
+        "bookmark" => Some("Bookmark"),
+        "presentation" => Some("Presentation"),
+        _ => None,
+    }
+}
+
 /// The validated card stylesheet from the `style` arg — only shipped card themes are
 /// honored (never resolve an arbitrary `urn:cms:style:*` off a client string).
 fn card_style<'a>(inv: &'a Invocation<'_>) -> &'a str {
@@ -535,10 +549,11 @@ impl Endpoint for TagView {
             .ok_or_else(|| Error::MissingArgument("tag".to_string()))?;
         let safe = sparql_lit(tag);
         // Optional `type` scope: a tag click inside a type view stays within that kind.
-        let type_filter = match inv.inline_str("type") {
-            Ok("book") => "?s a <https://ikigai-rs.dev/ns/cms#Book> . ",
-            Ok("bookmark") => "?s a <https://ikigai-rs.dev/ns/cms#Bookmark> . ",
-            _ => "",
+        // Resolved through `cms_class` (the shared map), so the filter can never disagree
+        // with the header the browser shows. An unknown/absent type → no filter (all kinds).
+        let type_filter = match inv.inline_str("type").ok().and_then(cms_class) {
+            Some(class) => format!("?s a <https://ikigai-rs.dev/ns/cms#{class}> . "),
+            None => String::new(),
         };
         let offset = page_offset(inv);
         let order = order_by(inv, "?st");
@@ -664,12 +679,7 @@ impl Endpoint for TypeView {
             .map(|s| s.to_string())
             .ok_or_else(|| Error::MissingArgument("type".to_string()))?;
         // Only the known kinds (never build an arbitrary `cms:{X}` class off a client string).
-        let class = match ty.as_str() {
-            "book" => "Book",
-            "bookmark" => "Bookmark",
-            "presentation" => "Presentation",
-            _ => return Err(Error::Endpoint(format!("no type `{ty}`"))),
-        };
+        let class = cms_class(&ty).ok_or_else(|| Error::Endpoint(format!("no type `{ty}`")))?;
         let offset = page_offset(inv);
         let order = order_by(inv, "?t");
         let count_query = format!(
@@ -1078,6 +1088,78 @@ mod tests {
         assert!(
             !by_span.contains("Quantitative Biology"),
             "the .tag span must NOT be a browsable tag: {by_span}"
+        );
+    }
+
+    #[test]
+    fn a_tag_view_scoped_to_a_type_filters_to_that_type() {
+        // A bookmark and a presentation share the tag "science". A scoped tag view must
+        // show only the scoped kind — the label↔query bug was `type=presentation` silently
+        // dropping the filter (showing the bookmark too) while the header said "Presentations".
+        let src = tempfile::tempdir().unwrap();
+        let bm = src.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bm,
+            "* Bookmarks\n** [[https://sci.example][Science Bookmark]]\n   \
+             :PROPERTIES:\n   :TAGS: science\n   :END:\n",
+        )
+        .unwrap();
+        let pres = tempfile::tempdir().unwrap();
+        let deck = pres.path().join("conferences/nfjs/sci-talk");
+        std::fs::create_dir_all(deck.join("slides")).unwrap();
+        std::fs::create_dir_all(deck.join("dist")).unwrap();
+        std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").unwrap();
+        std::fs::write(deck.join("slides/00-title.md"), "# Science Talk\n").unwrap();
+        std::fs::write(
+            deck.join("dist/index.html"),
+            "<script type=\"application/ld+json\">{\
+             \"@context\":{\"dc\":\"http://purl.org/dc/elements/1.1/\",\
+             \"cms\":\"https://ikigai-rs.dev/ns/cms#\",\"title\":\"dc:title\",\
+             \"tags\":{\"@id\":\"dc:subject\",\"@container\":\"@set\"}},\
+             \"@type\":\"cms:Presentation\",\"title\":\"Science Talk\",\
+             \"tags\":[\"science\"]}</script>",
+        )
+        .unwrap();
+
+        let kernel = build_cms_kernel_with(
+            src.path().to_path_buf(),
+            None,
+            Some(crate::presentations::Presentations {
+                root: pres.path().to_path_buf(),
+                base_url: None,
+            }),
+        );
+
+        // Unscoped: both the bookmark and the presentation.
+        let all = resolve_html(&kernel, "urn:cms:view:science", &[("style", "catalog")]);
+        assert!(
+            all.contains("Science Bookmark") && all.contains("Science Talk"),
+            "unscoped shows both: {all}"
+        );
+        // Scoped to presentation: ONLY the presentation (the fix).
+        let as_pres = resolve_html(
+            &kernel,
+            "urn:cms:view:science",
+            &[("style", "catalog"), ("type", "presentation")],
+        );
+        assert!(
+            as_pres.contains("Science Talk"),
+            "presentation present: {as_pres}"
+        );
+        assert!(
+            !as_pres.contains("Science Bookmark"),
+            "the bookmark is filtered out when scoped to presentation: {as_pres}"
+        );
+        // Scoped to bookmark: only the bookmark.
+        let as_bm = resolve_html(
+            &kernel,
+            "urn:cms:view:science",
+            &[("style", "catalog"), ("type", "bookmark")],
+        );
+        assert!(
+            as_bm.contains("Science Bookmark") && !as_bm.contains("Science Talk"),
+            "bookmark scope shows only the bookmark: {as_bm}"
         );
     }
 
