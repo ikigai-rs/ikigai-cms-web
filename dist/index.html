@@ -99,10 +99,9 @@
   </nav>
 
   <div class="connect" id="connect">
-    <p style="margin:0">Start the server, then serve <code>dist/</code>:</p>
-    <p style="margin:6px 0 0"><code>cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files</code></p>
-    <p style="margin:4px 0 0"><code>python3 -m http.server --directory dist 8080</code></p>
-    <p style="margin:10px 0 0; font-size:14px; color:var(--mut)">The server writes its cert next to the page, so this connects on its own. If it doesn't (server not running from the repo, or a different host), paste the printed <code>cert sha-256</code> — or open with <code>#cert=&lt;hash&gt;</code>:</p>
+    <p style="margin:0">Start the server (it serves this page too — no separate static server):</p>
+    <p style="margin:6px 0 0"><code>cargo run --features server --bin cms-server</code></p>
+    <p style="margin:6px 0 0; font-size:14px; color:var(--mut)">then open <code>http://localhost:8080</code> (set <code>CMS_PORT</code> to change it). The server writes its cert next to the page, so this connects on its own. If it doesn't, paste the printed <code>cert sha-256</code> — or open with <code>#cert=&lt;hash&gt;</code>:</p>
     <input id="cert" placeholder="cert sha-256 hex" autocomplete="off" spellcheck="false" />
   </div>
 

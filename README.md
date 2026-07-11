@@ -36,13 +36,16 @@ CMS server, the reading-room UI, and a server-verified relying party.
 # 1. build the browser wire codec (once, or after changing src/wire_client.rs)
 ./build-wasm.sh
 
-# 2. start the kernel server over WebTransport (prints a cert sha-256)
+# 2. start the server — it serves the page (dist/) AND the WebTransport wire, one process
 cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files
 
-# 3. serve dist/ (any static server) and open index.html with the printed hash:
-#    file: python3 -m http.server --directory dist 8080
-#    then: http://localhost:8080/#cert=<the printed sha-256>
+# 3. open the reading room (the server prints the URL):
+#    http://localhost:8080          (set CMS_PORT to change the page port)
 ```
+
+The `4433` positional arg is the internal WebTransport port (the page reads it from
+`cert.json`); `CMS_PORT` (default 8080) is the page URL you open. The RP origin defaults
+to that page origin, so the passkey can't drift from the URL you open.
 
 The page opens a WebTransport connection to `cms-server`. **The room is gated by a
 passkey** (rung 3): the server resolves under a public ceiling until a verified passkey
