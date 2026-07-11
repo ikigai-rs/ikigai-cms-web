@@ -497,6 +497,23 @@ fn order_by(inv: &Invocation<'_>, var: &str) -> String {
     }
 }
 
+/// A paginated resource subquery `{ SELECT {vars} … }` yielding the page
+/// `[offset, offset+PAGE_SIZE)` of DISTINCT resources matching `body`, ordered by `order`.
+///
+/// It nests two slices — **OFFSET in the inner query (no LIMIT), LIMIT in the outer (no
+/// OFFSET)** — rather than a single `LIMIT n OFFSET m`. Semantically identical, but it dodges
+/// an oxigraph bug: sparopt 0.3.6's cardinality estimator computes `length - start` for a
+/// `LIMIT/OFFSET` slice and PANICS (`attempt to subtract with overflow`) whenever `m > n` —
+/// i.e. any page past the first at a small page size. Split, each slice has only a start OR
+/// a length, so the subtraction never runs.
+fn paged_subquery(vars: &str, body: &str, order: &str, offset: usize) -> String {
+    format!(
+        "{{ SELECT {vars} WHERE {{ \
+             {{ SELECT DISTINCT {vars} WHERE {{ {body} }} ORDER BY {order} OFFSET {offset} }} \
+         }} ORDER BY {order} LIMIT {PAGE_SIZE} }}"
+    )
+}
+
 /// Count the resources a view's pattern matches (its `SELECT (COUNT(DISTINCT ?s) AS ?n)`),
 /// so the pager knows the total and whether a next page exists. Golden-threaded like the
 /// page query, so a graph edit refreshes it.
@@ -607,12 +624,17 @@ impl Endpoint for TagView {
         );
         // Page the *resources* (title-ordered, stable) in a subquery, then join each one's
         // full data — LIMIT/OFFSET on triples would slice a card in half.
+        let paged = paged_subquery(
+            "?s ?st",
+            &format!("{type_filter}?s dc:subject \"{safe}\" ; dc:title ?st"),
+            &order,
+            offset,
+        );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
-             WHERE {{ {{ SELECT DISTINCT ?s ?st WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?st }} \
-                         ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+             WHERE {{ {paged} \
                       ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -656,14 +678,17 @@ impl Endpoint for SearchView {
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ \
                  ?s dc:title ?t . FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) }}"
         );
+        let paged = paged_subquery(
+            "?s ?t ?u",
+            &format!("?s dc:title ?t ; dc:identifier ?u . FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\")))"),
+            &order,
+            offset,
+        );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
-             WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
-                 ?s dc:title ?t ; dc:identifier ?u . \
-                 FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
-             }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+             WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -732,13 +757,17 @@ impl Endpoint for TypeView {
             "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s a cms:{class} }}"
         );
+        let paged = paged_subquery(
+            "?s ?t ?u",
+            &format!("?s a cms:{class} ; dc:title ?t ; dc:identifier ?u ."),
+            &order,
+            offset,
+        );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
-             WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
-                 ?s a cms:{class} ; dc:title ?t ; dc:identifier ?u . \
-             }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
+             WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
@@ -926,6 +955,45 @@ mod tests {
         assert!(
             view(&kernel, "quic", "mosaic").contains("display:grid"),
             "mosaic grids"
+        );
+    }
+
+    #[test]
+    fn deep_pagination_past_the_page_size_does_not_panic() {
+        // Regression: a single `LIMIT 60 OFFSET 120` panicked oxigraph's sparopt optimizer
+        // (`length - start` underflow) — so page 3+ crashed the connection. paged_subquery
+        // splits OFFSET/LIMIT across two slices to dodge it.
+        let dir = tempfile::tempdir().unwrap();
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        let n = PAGE_SIZE * 2 + 10; // 130 → page 3 (offset 120) holds 10
+        let mut org = String::from("* Bookmarks\n");
+        for i in 0..n {
+            org.push_str(&format!(
+                "** [[https://ex.com/{i:03}][Item {i:03}]]\n   :PROPERTIES:\n   :TAGS: deep\n   :END:\n"
+            ));
+        }
+        std::fs::write(&bm, org).unwrap();
+        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+
+        let off = (PAGE_SIZE * 2).to_string();
+        let p3 = resolve_html(
+            &kernel,
+            "urn:cms:view:deep",
+            &[("style", "catalog"), ("offset", &off)],
+        );
+        assert_eq!(
+            p3.matches("class='cms-card'").count(),
+            n - PAGE_SIZE * 2,
+            "page 3 is the 10-item remainder (and did not panic)"
+        );
+        assert!(
+            p3.contains(&format!("121–{n} of {n}")),
+            "range on page 3: {p3}"
+        );
+        assert!(
+            p3.contains("Item 120") && !p3.contains("Item 119"),
+            "correct slice: {p3}"
         );
     }
 
