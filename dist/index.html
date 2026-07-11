@@ -12,29 +12,24 @@
   .wrap { max-width:760px; margin:0 auto; padding:24px 20px 64px; }
   header.top { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
   header.top h1 { font-size:18px; font-weight:500; margin:0; }
-  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  .seg button { border:none; border-right:1px solid var(--line); background:transparent; color:var(--mut); padding:6px 11px; font:13px system-ui; cursor:pointer; }
-  .seg button:last-child { border-right:none; }
-  .seg button[aria-pressed=true] { background:var(--card); color:var(--fg); font-weight:500; }
-  .auth button { border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--fg); padding:6px 11px; font:13px system-ui; cursor:pointer; margin-left:6px; }
-  .auth button:hover { background:var(--card); }
-  .status { margin-left:auto; font:12px ui-monospace, monospace; color:var(--mut); }
-  .status.err { color:#c0392b; }
-  .connect { border:1px solid var(--line); border-radius:12px; padding:16px 18px; background:var(--card); margin-top:12px; }
-  .connect code { background:var(--accent-bg); color:var(--accent); padding:1px 6px; border-radius:5px; font-size:13px; }
-  .connect input { width:100%; margin-top:10px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px ui-monospace, monospace; }
   nav.nav { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0 0; }
   nav.nav[hidden] { display:none; }
   nav.nav button { border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--fg); padding:5px 12px; font:13px system-ui; cursor:pointer; }
   nav.nav button:hover { background:var(--card); }
   nav.nav form { margin-left:auto; display:flex; }
   nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
-  .context { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:14px 0 -2px; font:14px system-ui; }
-  .context[hidden] { display:none; }
-  .cms-facet { display:inline-flex; align-items:center; gap:2px; padding:3px 5px 3px 12px; border:1px solid var(--line); border-radius:999px; background:var(--card); color:var(--fg); font-weight:500; }
-  .cms-facet.plain { padding:3px 12px; color:var(--mut); }
-  .cms-facet-x { border:none; background:transparent; color:var(--mut); cursor:pointer; font:inherit; font-size:17px; line-height:1; padding:0 5px; border-radius:50%; }
-  .cms-facet-x:hover { color:var(--fg); background:var(--accent-bg); }
+  /* Context header + restyle/sort toolbar — server-rendered above each page of cards. */
+  .cms-facet { display:flex; align-items:center; gap:10px; padding:2px 0 12px; }
+  .cms-facet-label { font-size:19px; font-weight:600; color:var(--fg); }
+  .cms-facet-scope { color:var(--mut); font-size:14px; }
+  .cms-facet-clear { margin-left:auto; width:26px; height:26px; border-radius:50%; border:1px solid var(--line); background:var(--card); color:var(--mut); font:16px/1 system-ui; cursor:pointer; }
+  .cms-facet-clear:hover { border-color:var(--accent); color:var(--accent); }
+  .cms-toolbar { display:flex; gap:10px; flex-wrap:wrap; padding:0 0 16px; }
+  .cms-seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .cms-seg-btn { border:none; border-right:1px solid var(--line); background:var(--card); color:var(--mut); padding:6px 13px; font:13px system-ui; cursor:pointer; }
+  .cms-seg-btn:last-child { border-right:none; }
+  .cms-seg-btn:hover { color:var(--fg); }
+  .cms-seg-btn.is-active { background:var(--accent-bg); color:var(--accent); font-weight:600; cursor:default; }
   #room { margin-top:16px; }
   /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
   #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
@@ -46,24 +41,18 @@
   .cms-page-off:hover { border-color:var(--line); color:var(--fg); }
   .cms-page-info { color:var(--mut); font-size:13px; }
   /* Per-type accent: each card carries data-kind (a cms:kind slug); the kind label + a left
-     rule are tinted by kind. The facet chip for a type is tinted to match its cards.
-     ADDING A TYPE → add a colour pair below (+ its dark variant), plus cms_class and
-     TYPE_LABELS. The rendering is generic, so a new kind with no rule just shows no accent. */
+     rule are tinted by kind. ADDING A TYPE → add a colour pair below (+ its dark variant),
+     plus cms_class in native.rs. The rendering is generic, so a new kind with no rule just
+     shows no accent. */
   .cms-kind { display:block; font-size:10.5px; letter-spacing:.1em; text-transform:capitalize; font-weight:700; color:var(--mut); margin-bottom:1px; }
   .cms-card[data-kind] { border-left-style:solid; border-left-width:3px; }
   .cms-card[data-kind="bookmark"] { border-left-color:#3f6ea8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#3f6ea8; }
   .cms-card[data-kind="book"] { border-left-color:#9e7b33; } .cms-card[data-kind="book"] .cms-kind { color:#9e7b33; }
   .cms-card[data-kind="presentation"] { border-left-color:#b0563f; } .cms-card[data-kind="presentation"] .cms-kind { color:#b0563f; }
-  .cms-facet-type[data-cms-type="bookmark"] { border-color:#3f6ea8; color:#3f6ea8; }
-  .cms-facet-type[data-cms-type="book"] { border-color:#9e7b33; color:#9e7b33; }
-  .cms-facet-type[data-cms-type="presentation"] { border-color:#b0563f; color:#b0563f; }
   @media (prefers-color-scheme: dark) {
     .cms-card[data-kind="bookmark"] { border-left-color:#7ba6d8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#7ba6d8; }
     .cms-card[data-kind="book"] { border-left-color:#c7a35e; } .cms-card[data-kind="book"] .cms-kind { color:#c7a35e; }
     .cms-card[data-kind="presentation"] { border-left-color:#d38a72; } .cms-card[data-kind="presentation"] .cms-kind { color:#d38a72; }
-    .cms-facet-type[data-cms-type="bookmark"] { border-color:#7ba6d8; color:#7ba6d8; }
-    .cms-facet-type[data-cms-type="book"] { border-color:#c7a35e; color:#c7a35e; }
-    .cms-facet-type[data-cms-type="presentation"] { border-color:#d38a72; color:#d38a72; }
   }
 </style>
 <!-- Vendored htmx (self-contained, no CDN). The whole room is htmx attributes over the

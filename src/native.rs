@@ -588,6 +588,16 @@ struct ViewCtx<'a> {
     dir: &'a str,
     type_scope: Option<&'a str>,
     q: Option<&'a str>,
+    facet: Facet<'a>,
+}
+
+/// What the current view is faceted on — drives the context header's label and the target its
+/// "clear" control returns to (a tag/search clears to the tag index; a type clears to the type
+/// index). Kept as data so the header markup stays free of per-view branching.
+enum Facet<'a> {
+    Tag(&'a str),
+    Search(&'a str),
+    Type(&'a str),
 }
 
 /// The view context as an HTML-attribute-escaped JSON object for `hx-vals`.
@@ -607,6 +617,80 @@ fn view_hxvals(ctx: &ViewCtx<'_>) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// The context header: what the view is faceted on, plus a `×` control that clears back to the
+/// relevant index. Server-rendered so it always reflects the live view; the clear button is a
+/// plain htmx `hx-get` (its target inherited from `#room`). A tag opened within a type carries
+/// its scope as a trailing note. Markup-only — no computed state — so it lifts straight into an
+/// external template later.
+fn facet_html(ctx: &ViewCtx<'_>) -> String {
+    let (label, clear_iri) = match ctx.facet {
+        Facet::Tag(t) => (format!("#{}", html_escape(t)), "urn:cms:tags"),
+        Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_escape(q)), "urn:cms:tags"),
+        Facet::Type(t) => (html_escape(t), "urn:cms:types"),
+    };
+    let scope = match ctx.type_scope {
+        Some(s) if !s.is_empty() => format!(
+            "<span class=\"cms-facet-scope\">in {}</span>",
+            html_escape(s)
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "<div class=\"cms-facet\"><span class=\"cms-facet-label\">{label}</span>{scope}\
+         <button class=\"cms-facet-clear\" hx-get=\"/r/{clear_iri}\" title=\"clear\">&times;</button></div>"
+    )
+}
+
+/// The restyle + sort toolbar. Each control overrides exactly ONE axis (style or dir) via its
+/// own `hx-vals` and inherits the rest from the enclosing `.cms-view` wrapper — so restyling
+/// keeps the tag/query and resorting keeps the style, with no context baked into the link.
+/// Overriding only style/dir (never offset) means both actions land back on page one. The
+/// current selection renders inert (a `<span>`), the alternatives as buttons. Markup-only.
+fn toolbar_html(ctx: &ViewCtx<'_>) -> String {
+    let iri = ctx.iri;
+    let seg = |current: bool, overrides: &str, label: &str| -> String {
+        if current {
+            format!("<span class=\"cms-seg-btn is-active\">{label}</span>")
+        } else {
+            format!(
+                "<button class=\"cms-seg-btn\" hx-get=\"/r/{iri}\" hx-vals='{overrides}'>{label}</button>"
+            )
+        }
+    };
+    let mut t = String::from("<div class=\"cms-toolbar\"><div class=\"cms-seg\">");
+    t.push_str(&seg(
+        ctx.style == "catalog",
+        "{\"style\":\"catalog\"}",
+        "Catalog",
+    ));
+    t.push_str(&seg(
+        ctx.style == "mosaic",
+        "{\"style\":\"mosaic\"}",
+        "Mosaic",
+    ));
+    t.push_str(&seg(
+        ctx.style == "agenda",
+        "{\"style\":\"agenda\"}",
+        "Agenda",
+    ));
+    t.push_str("</div><div class=\"cms-seg\">");
+    t.push_str(&seg(ctx.dir == "asc", "{\"dir\":\"asc\"}", "A\u{2192}Z"));
+    t.push_str(&seg(ctx.dir == "desc", "{\"dir\":\"desc\"}", "Z\u{2192}A"));
+    t.push_str("</div></div>");
+    t
+}
+
+/// Minimal HTML-text escaping for the few view-context strings (tag/query/type) that reach the
+/// server-rendered chrome. The card bodies go through XSLT; only these header labels are
+/// interpolated by hand, so they escape the five markup-significant characters here.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Render one page of a card view: a wrapper carrying the view context as `hx-vals`, the
@@ -632,6 +716,8 @@ async fn render_page(
     // tag click or a page step keeps the current style/dir/type/q.
     let mut html =
         format!("<div class=\"cms-view\" hx-vals=\"{}\">", view_hxvals(ctx)).into_bytes();
+    html.extend_from_slice(facet_html(ctx).as_bytes());
+    html.extend_from_slice(toolbar_html(ctx).as_bytes());
     html.extend_from_slice(&cards.bytes);
     html.extend_from_slice(pager_html(ctx.iri, offset, total).as_bytes());
     html.extend_from_slice(b"</div>");
@@ -691,6 +777,7 @@ impl Endpoint for TagView {
             dir: dir_arg(inv),
             type_scope: inv.inline_str("type").ok(),
             q: None,
+            facet: Facet::Tag(tag),
         };
         render_page(inv, &ctx, count_query, query, offset).await
     }
@@ -752,6 +839,7 @@ impl Endpoint for SearchView {
             dir: dir_arg(inv),
             type_scope: None,
             q: Some(q),
+            facet: Facet::Search(q),
         };
         render_page(inv, &ctx, count_query, query, offset).await
     }
@@ -839,6 +927,7 @@ impl Endpoint for TypeView {
             dir: dir_arg(inv),
             type_scope: None,
             q: None,
+            facet: Facet::Type(&ty),
         };
         render_page(inv, &ctx, count_query, query, offset).await
     }
@@ -1011,6 +1100,43 @@ mod tests {
         assert!(
             !html.contains("webassembly.org"),
             "only quic-tagged resources: {html}"
+        );
+    }
+
+    #[test]
+    fn a_card_view_carries_a_context_header_and_a_restyle_sort_toolbar() {
+        let (_dir, kernel) = kernel_over_fixture();
+        let html = resolve_html(&kernel, "urn:cms:view:quic", &[("style", "mosaic")]);
+        // Context header: the tag label + a clear control back to the tag index.
+        assert!(
+            html.contains("class=\"cms-facet-label\">#quic<"),
+            "facet shows the tag: {html}"
+        );
+        assert!(
+            html.contains("class=\"cms-facet-clear\" hx-get=\"/r/urn:cms:tags\""),
+            "clear returns to the tag index: {html}"
+        );
+        // Toolbar: the current style is inert; an alternative overrides only `style` via its own
+        // hx-vals (dir/type/q ride the inherited wrapper), and re-requests the same view IRI.
+        assert!(
+            html.contains("<span class=\"cms-seg-btn is-active\">Mosaic</span>"),
+            "the active style is inert: {html}"
+        );
+        assert!(
+            html.contains(
+                "<button class=\"cms-seg-btn\" hx-get=\"/r/urn:cms:view:quic\" \
+                 hx-vals='{\"style\":\"catalog\"}'>Catalog</button>"
+            ),
+            "restyle overrides only style: {html}"
+        );
+        // Sort: default asc is active; Z→A overrides only `dir`.
+        assert!(
+            html.contains("<span class=\"cms-seg-btn is-active\">A\u{2192}Z</span>"),
+            "ascending is the default active sort: {html}"
+        );
+        assert!(
+            html.contains("hx-vals='{\"dir\":\"desc\"}'>Z\u{2192}A</button>"),
+            "resort overrides only dir: {html}"
         );
     }
 
