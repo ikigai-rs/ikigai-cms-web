@@ -147,18 +147,22 @@ function viewType(iri, args) {
   return null;
 }
 
-// One facet chip: a label, optionally closeable (an × that removes just that facet), and
-// optionally carrying a type slug so it can be coloured by kind.
-function facetChip(text, closeKind, typeSlug) {
+// One facet chip: a label, optionally with a close × that is a real htmx control — its
+// `hx-get` is the view you land on with that facet removed (computed at render time, since
+// the view it reduces to depends on the other active facets). Same markup as a tag chip, so
+// real htmx is a drop-in. `typeSlug` carries the kind for per-type colouring.
+function facetChip(text, closeTarget, typeSlug) {
   const chip = document.createElement('span');
-  chip.className = 'cms-facet' + (closeKind ? '' : ' plain') + (typeSlug ? ' cms-facet-type' : '');
+  chip.className = 'cms-facet' + (closeTarget ? '' : ' plain') + (typeSlug ? ' cms-facet-type' : '');
   if (typeSlug) chip.setAttribute('data-cms-type', typeSlug);
   chip.append(text);
-  if (closeKind) {
+  if (closeTarget) {
     const x = document.createElement('button');
     x.type = 'button';
     x.className = 'cms-facet-x';
-    x.setAttribute('data-close', closeKind);
+    x.setAttribute('hx-get', closeTarget);
+    x.setAttribute('hx-target', '#room');
+    x.setAttribute('hx-swap', 'innerHTML');
     x.setAttribute('aria-label', 'remove ' + text);
     x.textContent = '×';
     chip.append(x);
@@ -167,34 +171,34 @@ function facetChip(text, closeKind, typeSlug) {
 }
 
 // The context header, as facet chips you can peel off. A tag view scoped to a type shows a
-// type chip + a tag chip; closing one keeps the other (Presentations · #science → close
-// #science ⇒ all Presentations; close Presentations ⇒ everything #science).
+// type chip + a tag chip; each × links (hx-get) to the view with *that* facet dropped, the
+// other kept (Presentations · #science → close #science ⇒ all Presentations; close
+// Presentations ⇒ everything #science). Closing the sole facet zooms out to its index.
 function updateContext() {
   const el = $('#context'), iri = currentView, args = currentArgs || {};
   el.innerHTML = '';
   const t = viewType(iri, args);
+  const tag = iri.startsWith('urn:cms:view:') ? iri.slice('urn:cms:view:'.length) : null;
   if (iri === 'urn:cms:tags') el.append(facetChip('All tags'));
   else if (iri === 'urn:cms:types') el.append(facetChip('Types'));
   else if (iri === 'urn:cms:recent') el.append(facetChip('Recently viewed'));
-  else if (iri === 'urn:cms:search') el.append(facetChip('Search: “' + (args.q || '') + '”', 'search'));
+  else if (iri === 'urn:cms:search') el.append(facetChip('Search: “' + (args.q || '') + '”', 'urn:cms:tags'));
   else {
-    if (t) el.append(facetChip(TYPE_LABELS[t] || t, 'type', t));
-    if (iri.startsWith('urn:cms:view:')) el.append(facetChip('#' + iri.slice('urn:cms:view:'.length), 'tag'));
+    // Close the type ⇒ the tag alone (or, with no tag, the types index).
+    if (t) el.append(facetChip(TYPE_LABELS[t] || t, tag ? 'urn:cms:view:' + tag : 'urn:cms:types', t));
+    // Close the tag ⇒ the type alone (or, with no type, the tags index).
+    if (tag) el.append(facetChip('#' + tag, t ? 'urn:cms:type:' + t : 'urn:cms:tags'));
   }
   el.hidden = !el.childElementCount;
 }
 
-// Peel off a facet: remove just the one clicked, keep the rest. Closing the sole facet
-// zooms out to the matching index.
+// The header's htmx handler: a chip's × is an [hx-get] to its reduced view. Verbatim (no
+// tag-scope inheritance — the target already encodes the exact facet set to keep).
 $('#context').addEventListener('click', (e) => {
-  const x = e.target.closest('.cms-facet-x');
-  if (!x) return;
-  const iri = currentView, args = currentArgs || {}, close = x.getAttribute('data-close');
-  const tag = iri.startsWith('urn:cms:view:') ? iri.slice('urn:cms:view:'.length) : null;
-  const type = viewType(iri, args);
-  if (close === 'tag') navigate(type ? 'urn:cms:type:' + type : 'urn:cms:tags');
-  else if (close === 'type') navigate(tag ? 'urn:cms:view:' + tag : 'urn:cms:types');
-  else if (close === 'search') navigate('urn:cms:tags');
+  const el = e.target.closest('[hx-get]');
+  if (!el) return;
+  e.preventDefault();
+  navigate(el.getAttribute('hx-get'));
 });
 
 // Navigate = render + push a history entry (same URL, just state), so the browser's
