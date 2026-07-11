@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>htmx-over-HTTP probe</title>
+<!-- Vendored htmx, same-origin. No CDN, no build. -->
+<script src="htmx.min.js"></script>
+<style>
+  :root { --bg:#faf8f3; --fg:#26241f; --mut:#8a857b; --line:#e6e1d6; --card:#fff; --accent:#185fa5; --accent-bg:#e6f1fb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1a1917; --fg:#e9e5dc; --mut:#9a958a; --line:#2f2c27; --card:#232019; --accent:#7fb2ee; --accent-bg:#12314f; } }
+  body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; max-width:860px; margin:2rem auto; padding:0 1rem; }
+  h1 { font-size:20px; }
+  .note { color:var(--mut); font-size:14px; }
+  nav { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; }
+  nav button { font:14px system-ui; padding:7px 14px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); cursor:pointer; }
+  nav button:hover { border-color:var(--accent); color:var(--accent); }
+  #out { margin-top:14px; --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
+</style>
+</head>
+<body>
+  <h1>htmx-over-HTTP probe</h1>
+  <p class="note">
+    These controls are <strong>vanilla htmx</strong> (attributes only) hitting the
+    <code>/r/{iri}</code> HTTP route — no WebTransport, no custom JavaScript, no build step.
+    Run the server with <code>CMS_DEV_OPEN=1</code> and open this page. If the fragments render
+    and swap on click, the transport is proven and we proceed to the real page.
+  </p>
+  <p class="note">
+    (The tag/type chips <em>inside</em> a rendered fragment still carry <code>urn:</code>
+    <code>hx-get</code>s for the old wire shim, so clicking those won't navigate yet — that's
+    exactly what the rewrite fixes. Use the buttons below to drive it.)
+  </p>
+
+  <!-- hx-target/hx-swap inherited by the buttons below; each just names its resource. -->
+  <nav hx-target="#out" hx-swap="innerHTML">
+    <button hx-get="/r/urn:cms:tags">tags index</button>
+    <button hx-get="/r/urn:cms:types">types</button>
+    <button hx-get="/r/urn:cms:type:presentation?style=catalog">Presentations</button>
+    <button hx-get="/r/urn:cms:type:bookmark?style=mosaic">Bookmarks (mosaic)</button>
+    <button hx-get="/r/urn:cms:view:security?style=catalog">#security</button>
+    <button hx-get="/r/urn:cms:view:security?style=catalog&amp;offset=60">#security p2</button>
+  </nav>
+
+  <!-- Load the tags index on arrival, purely declaratively. -->
+  <div id="out" hx-get="/r/urn:cms:tags" hx-trigger="load">loading…</div>
+</body>
+</html>
