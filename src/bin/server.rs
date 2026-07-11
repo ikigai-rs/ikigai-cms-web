@@ -14,14 +14,15 @@
 //!
 //! Run: `cargo run --features server --bin cms-server -- [port] [src_dir]`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, Verb};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
@@ -45,6 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_default()
         });
 
+    // The reading-room PAGE port — cms-server serves `dist/` here itself (no separate
+    // static server). CMS_PORT overrides; default 8080. This is the URL you open in the
+    // browser. The WebTransport port (positional arg 1, 4433) is internal — the page reads
+    // it from cert.json and connects there.
+    let page_port: u16 = std::env::var("CMS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+
     // The entitlement a verified passkey is granted: read the CMS source jail (the whole
     // room's chain bottoms out in this fs read). The presentations dir is appended once
     // resolved (below), so decks — read through `urn:cms:deck:*` — are cap-gated too.
@@ -53,8 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The relying party. rp_id + page origin default to local dev; the passkey store
     // persists through the OS keystore (macOS Keychain), not a plaintext file.
     let rp_id = std::env::var("CMS_RP_ID").unwrap_or_else(|_| "localhost".to_string());
+    // Default the passkey relying-party origin to the page we serve — same host+port — so it
+    // cannot drift from the URL you actually open (the #1 sign-in failure). Override only for
+    // a non-localhost deployment.
     let rp_origin =
-        std::env::var("CMS_RP_ORIGIN").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        std::env::var("CMS_RP_ORIGIN").unwrap_or_else(|_| format!("http://localhost:{page_port}"));
     let rp = Arc::new(Rp::new(
         &rp_id,
         &rp_origin,
@@ -69,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    println!("ikigai CMS reading-room server  →  https://127.0.0.1:{port}");
+    println!("ikigai reading room  →  http://localhost:{page_port}   (open this in Chrome/Edge)");
+    println!("  (webtransport on https://127.0.0.1:{port} — internal; the page connects there)");
     println!("source jail: {}", src_dir.display());
     println!(
         "relying party: {rp_origin} (rp_id {rp_id}){}",
@@ -171,6 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 
+    // Serve the reading-room page (dist/) ourselves — no separate `python3 -m http.server`.
+    tokio::spawn(serve_static(dist, page_port));
+
     let config = ServerConfig::builder()
         .with_bind_default(port)
         .with_identity(identity)
@@ -189,6 +206,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("session ended: {e}");
             }
         });
+    }
+}
+
+/// Serve the reading-room page directory (`dist/`) over plain HTTP on `port`, localhost only
+/// — replacing the separate `python3 -m http.server`. `http://localhost` is a secure context,
+/// so WebTransport and the passkey ceremony work from it. GET-only, no keep-alive/ranges (a
+/// handful of small static files: index.html + cert.json); path traversal is refused.
+async fn serve_static(dist: PathBuf, port: u16) {
+    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("reading-room page server: cannot bind localhost:{port}: {e}");
+            eprintln!("  (is the port already in use? set CMS_PORT to a free one)");
+            return;
+        }
+    };
+    loop {
+        match listener.accept().await {
+            Ok((sock, _)) => {
+                let dist = dist.clone();
+                tokio::spawn(async move {
+                    let _ = handle_static(sock, &dist).await;
+                });
+            }
+            Err(e) => eprintln!("page server accept: {e}"),
+        }
+    }
+}
+
+/// Answer one HTTP GET from `dist/`: read the request head, resolve the (traversal-checked)
+/// path, and write the file (or 404). One request per connection (`Connection: close`).
+async fn handle_static(mut sock: TcpStream, dist: &Path) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 16 * 1024 {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let request_target = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (status, ctype, body) = match safe_rel(request_target) {
+        Some(rel) => match std::fs::read(dist.join(&rel)) {
+            Ok(bytes) => ("200 OK", content_type(&rel), bytes),
+            Err(_) => (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found".to_vec(),
+            ),
+        },
+        None => (
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            b"bad path".to_vec(),
+        ),
+    };
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(header.as_bytes()).await?;
+    sock.write_all(&body).await?;
+    sock.flush().await
+}
+
+/// Resolve an HTTP request-target to a safe relative path under `dist/`: strip the query,
+/// default `/` to `index.html`, and refuse any `..`/empty component (no traversal). `None`
+/// for a rejected path.
+fn safe_rel(target: &str) -> Option<String> {
+    let path = target
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+        .trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    if path
+        .split('/')
+        .any(|c| c.is_empty() || c == ".." || c == ".")
+    {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Content type by file extension (the few the reading room serves).
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
     }
 }
 
@@ -487,4 +610,74 @@ fn json_reply(bytes: Vec<u8>) -> Reply {
 /// A `{"error": "..."}` JSON reply, for auth-flow errors the page reads as JSON.
 fn error_reply(msg: &str) -> Reply {
     json_reply(serde_json::json!({ "error": msg }).to_string().into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_type, safe_rel, serve_static};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn safe_rel_defaults_root_and_refuses_traversal() {
+        assert_eq!(safe_rel("/").as_deref(), Some("index.html"));
+        assert_eq!(safe_rel("/index.html").as_deref(), Some("index.html"));
+        assert_eq!(safe_rel("/cert.json?v=2").as_deref(), Some("cert.json"));
+        assert_eq!(safe_rel("/styles/a.css").as_deref(), Some("styles/a.css"));
+        assert_eq!(safe_rel("/../etc/passwd"), None);
+        assert_eq!(safe_rel("/a/../../b"), None);
+        assert_eq!(safe_rel("/a//b"), None); // empty component
+        assert_eq!(safe_rel("/./secret"), None);
+    }
+
+    #[test]
+    fn content_type_by_extension() {
+        assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type("cert.json"), "application/json; charset=utf-8");
+        assert_eq!(content_type("x.svg"), "image/svg+xml");
+        assert_eq!(content_type("noext"), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn the_page_server_serves_dist_and_404s_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<h1>reading room</h1>").unwrap();
+        // A free ephemeral port.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        tokio::spawn(serve_static(dir.path().to_path_buf(), port));
+
+        async fn get(port: u16, target: &str) -> String {
+            // retry until the server is listening
+            let mut s = None;
+            for _ in 0..50 {
+                if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                    s = Some(c);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let mut c = s.expect("page server listening");
+            c.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let root = get(port, "/").await;
+        assert!(root.contains("200 OK"), "root serves index.html: {root}");
+        assert!(root.contains("reading room"), "body: {root}");
+        assert!(root.contains("text/html"), "content-type: {root}");
+
+        assert!(
+            get(port, "/nope.html").await.contains("404"),
+            "missing → 404"
+        );
+        assert!(
+            get(port, "/../Cargo.toml").await.contains("400"),
+            "traversal → 400"
+        );
+    }
 }
