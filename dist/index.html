@@ -19,6 +19,8 @@
   nav.nav form { margin-left:auto; display:flex; }
   nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
   nav.nav .nav-signout { margin-left:8px; color:var(--mut); }
+  nav.nav .wire-status { margin-left:8px; font:11px ui-monospace, monospace; color:#2e7d32; letter-spacing:.03em; }
+  @media (prefers-color-scheme: dark) { nav.nav .wire-status { color:#6cc070; } }
   /* Passkey login panel — shown until a session is established (auth.js toggles [hidden]). */
   .auth { max-width:420px; margin:44px auto; border:1px solid var(--line); border-radius:14px; padding:26px 24px; background:var(--card); text-align:center; }
   .auth[hidden] { display:none; }
@@ -71,6 +73,10 @@
 <!-- The one bit of app JS: the standard WebAuthn passkey ceremony (isolated from the room).
      Deferred so the DOM + htmx global are ready when it runs. -->
 <script src="auth.js" defer></script>
+<!-- Optional WebTransport transport: when a signed-in page can reach cms-server over QUIC, the
+     /r/ requests ride the wire instead of HTTP (htmx untouched, HTTP fallback). A module (it
+     imports the wasm wire codec); runs after the DOM, like the deferred scripts. -->
+<script type="module" src="wire.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -98,6 +104,7 @@
     <form hx-get="/r/urn:cms:search">
       <input name="q" type="search" placeholder="search titles…" autocomplete="off" spellcheck="false" />
     </form>
+    <span id="wire-status" class="wire-status" aria-live="polite"></span>
     <button id="auth-logout" class="nav-signout" type="button" hidden>sign out</button>
   </nav>
 
