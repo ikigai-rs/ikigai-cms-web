@@ -384,6 +384,7 @@ mod tests {
                 root: root.to_path_buf(),
                 base_url: base_url.map(str::to_string),
             }),
+            None,
         );
         let (repr, _) = Resolver::issue(
             &kernel,
