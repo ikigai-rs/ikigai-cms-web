@@ -152,10 +152,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let entitlement = Arc::new(entitlement);
 
+    // The bookmarks org file, as a sub-path relative to the source jail (CMS_SRC_DIR).
+    // CMS_BOOKMARKS overrides it; unset uses the built-in default (pinboard-bookmarks.org).
+    let bookmarks = std::env::var("CMS_BOOKMARKS").ok();
+    println!(
+        "bookmarks: {}",
+        bookmarks
+            .as_deref()
+            .unwrap_or("(default: old-org/pinboard-bookmarks.org)")
+    );
+
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
         src_dir,
         zotero,
         presentations,
+        bookmarks,
     ));
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());

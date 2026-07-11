@@ -11,9 +11,9 @@ use ikigai_core::{
     Iri, Kernel, ReprType, Representation, Request, Result, Space, UriTemplate, Verb,
 };
 
-/// The bookmarks file, addressed within the CMS source jail (`urn:cms:src:*`). The
-/// jail root is supplied to [`build_cms_kernel`]; the path below is relative to it.
-const BOOKMARKS_SRC: &str = "urn:cms:src:old-org/pinboard-bookmarks.org";
+/// The default bookmarks file, as a path within the CMS source jail (`urn:cms:src:*`,
+/// relative to the jail root). Overridable via `CMS_BOOKMARKS` (see the `cms-server` bin).
+const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
 
 /// Compose the CMS kernel over `src_dir` (the jail root for `urn:cms:src:*`) and an
 /// optional Zotero library (`My Library.rdf`) whose books join the same graph.
@@ -30,35 +30,39 @@ const BOOKMARKS_SRC: &str = "urn:cms:src:old-org/pinboard-bookmarks.org";
 /// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
 pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
-    build_cms_kernel_with(src_dir, zotero, None)
+    build_cms_kernel_with(src_dir, zotero, None, None)
 }
 
 /// [`build_cms_kernel`] plus lectern presentations (`urn:cms:graph:presentations`): the
 /// decks under the configured root join the graph as `cms:Presentation` resources. `None`
-/// = no decks.
+/// = no decks. `bookmarks` overrides the bookmarks file sub-path (relative to the jail
+/// root); `None` uses [`DEFAULT_BOOKMARKS`].
 pub fn build_cms_kernel_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     presentations: Option<crate::presentations::Presentations>,
+    bookmarks: Option<String>,
 ) -> Kernel {
     Kernel::new(Arc::new(Fallback::new(cms_spaces_with(
         src_dir,
         zotero,
         presentations,
+        bookmarks,
     ))))
 }
 
 /// The spaces the CMS kernel is composed of, exposed so a maintenance kernel can add HTTP
 /// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings.
 pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Space>> {
-    cms_spaces_with(src_dir, zotero, None)
+    cms_spaces_with(src_dir, zotero, None, None)
 }
 
-/// [`cms_spaces`] plus the presentations config bound to `urn:cms:graph:presentations`.
+/// [`cms_spaces`] plus the presentations config and an optional bookmarks sub-path override.
 pub fn cms_spaces_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     presentations: Option<crate::presentations::Presentations>,
+    bookmarks: Option<String>,
 ) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
@@ -83,8 +87,15 @@ pub fn cms_spaces_with(
         );
     }
     // The graph resources: bookmarks, books, and their union (what SPARQL points at).
+    let bookmarks_src = format!(
+        "urn:cms:src:{}",
+        bookmarks.as_deref().unwrap_or(DEFAULT_BOOKMARKS)
+    );
     let graph = EndpointSpace::new()
-        .bind(Exact::new("urn:cms:graph:bookmarks"), BookmarkGraph)
+        .bind(
+            Exact::new("urn:cms:graph:bookmarks"),
+            BookmarkGraph { src: bookmarks_src },
+        )
         .bind(Exact::new("urn:cms:graph:books"), BooksGraph)
         .bind(
             Exact::new("urn:cms:graph:presentations"),
@@ -168,12 +179,17 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
 /// through the kernel and transrepts it to Turtle; cacheable and golden-threaded on
 /// the source (`inv.source` records the dependency, so a write/watch on the file
 /// recomputes the graph — and everything queried from it).
-struct BookmarkGraph;
+struct BookmarkGraph {
+    /// The `urn:cms:src:{path}` IRI of the bookmarks org file (configurable via
+    /// `CMS_BOOKMARKS`; defaults to [`DEFAULT_BOOKMARKS`]).
+    src: String,
+}
 
 #[async_trait]
 impl Endpoint for BookmarkGraph {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let iri = Iri::parse(BOOKMARKS_SRC).expect("BOOKMARKS_SRC is a valid IRI");
+        let iri = Iri::parse(&self.src)
+            .map_err(|e| Error::Endpoint(format!("bad bookmarks IRI: {e}")))?;
         let src = inv.source(&iri).await?;
         let text = std::str::from_utf8(&src.bytes)
             .map_err(|e| Error::Endpoint(format!("bookmark source is not UTF-8: {e}")))?;
@@ -1086,6 +1102,7 @@ mod tests {
                 root: pres.path().to_path_buf(),
                 base_url: None,
             }),
+            None,
         );
 
         // The type facet lists the deck as a Presentation.
@@ -1159,6 +1176,7 @@ mod tests {
                 root: pres.path().to_path_buf(),
                 base_url: None,
             }),
+            None,
         );
 
         // Unscoped: both the bookmark and the presentation.
@@ -1195,6 +1213,32 @@ mod tests {
         assert!(
             as_bm.contains("Science Bookmark") && !as_bm.contains("Science Talk"),
             "bookmark scope shows only the bookmark: {as_bm}"
+        );
+    }
+
+    #[test]
+    fn the_bookmarks_source_path_is_overridable() {
+        // A bookmarks file at a NON-default sub-path (CMS_BOOKMARKS points here).
+        let src = tempfile::tempdir().unwrap();
+        let bm = src.path().join("custom/my-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bm,
+            "* Bookmarks\n** [[https://ovr.example][Override Works]]\n   \
+             :PROPERTIES:\n   :TAGS: overridden\n   :END:\n",
+        )
+        .unwrap();
+        // Nothing at the default `old-org/pinboard-bookmarks.org`; the override supplies it.
+        let kernel = build_cms_kernel_with(
+            src.path().to_path_buf(),
+            None,
+            None,
+            Some("custom/my-bookmarks.org".to_string()),
+        );
+        let html = resolve_html(&kernel, "urn:cms:view:overridden", &[("style", "catalog")]);
+        assert!(
+            html.contains("Override Works"),
+            "reads the overridden bookmarks path: {html}"
         );
     }
 
