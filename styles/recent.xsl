@@ -22,12 +22,12 @@
 
   <xsl:template match="r:item">
     <a class="cms-recent-item" hx-target="#room" hx-swap="innerHTML">
+      <!-- `/r/{iri}?type={scope}` — the recorded type scope reopens the tag within its kind
+           (empty scope = unscoped; the server treats `type=` as no filter). -->
       <xsl:attribute name="hx-get">
+        <xsl:text>/r/</xsl:text>
         <xsl:value-of select="@iri"/>
-      </xsl:attribute>
-      <!-- The recorded type scope (empty = unscoped); the room handler re-opens the tag
-           within this kind, so a recent "book · #rust" reopens scoped to books. -->
-      <xsl:attribute name="data-cms-type">
+        <xsl:text>?type=</xsl:text>
         <xsl:value-of select="@scope"/>
       </xsl:attribute>
       <xsl:value-of select="."/>

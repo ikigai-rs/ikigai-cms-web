@@ -23,7 +23,7 @@
   <xsl:template match="sr:result">
     <a class="cms-tag" hx-target="#room" hx-swap="innerHTML">
       <xsl:attribute name="hx-get">
-        <xsl:text>urn:cms:view:</xsl:text>
+        <xsl:text>/r/urn:cms:view:</xsl:text>
         <xsl:value-of select="sr:binding[@name='tag']/sr:literal"/>
       </xsl:attribute>
       <span class="cms-tag-label">

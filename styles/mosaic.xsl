@@ -32,7 +32,7 @@
       <div class="cms-tags">
         <xsl:for-each select="dc:subject">
           <a class="cms-tag" hx-target="#room">
-            <xsl:attribute name="hx-get">urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
+            <xsl:attribute name="hx-get">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
             <xsl:value-of select="."/>
           </a>
         </xsl:for-each>
