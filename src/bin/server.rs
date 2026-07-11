@@ -537,8 +537,14 @@ fn handle_auth(rp: &Rp, entitlement: &[String], session: &mut Session, req: &Req
                 return error_reply("login:finish needs a `credential`");
             };
             match rp.login_finish(cred, &state) {
-                Ok((cap, principal)) => {
-                    session.ceiling = cap; // raise the connection to the verified entitlement
+                Ok((_stored, principal)) => {
+                    // Grant the CURRENT server entitlement — not the scopes frozen into the
+                    // credential at registration (`_stored`). A single-user reading room's
+                    // room-wide grant grows as sources are added (e.g. the presentations dir);
+                    // freezing it at registration would silently deny newly-added sources
+                    // until you re-registered. (Per-credential scoping is a future
+                    // passkey-workspace concern; today every credential grants the same room.)
+                    session.ceiling = Capability::scoped(entitlement.to_vec());
                     session.principal = Some(principal); // scope the recency trail to them
                     json_reply(br#"{"ok":true}"#.to_vec())
                 }
