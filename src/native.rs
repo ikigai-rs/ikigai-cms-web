@@ -403,7 +403,7 @@ fn sparql_lit(s: &str) -> String {
 ///
 /// ADDING A CONTENT TYPE means updating, in lockstep:
 /// 1. this map, plus a graph source that types the resource `a cms:{Class}`;
-/// 2. `TYPE_LABELS` in `dist/index.html` (the browser's display label + facet chip);
+/// 2. `type_label` below (the plural header a type view shows);
 /// 3. a **colour rule** `.cms-card[data-kind="{slug}"]` (+ dark variant) in `dist/index.html`.
 ///    The card *rendering* is generic — every card carries a `cms:kind` slug (see
 ///    `KIND_CONSTRUCT`) that the stylesheets turn into `data-kind`, so only the colour is
@@ -414,6 +414,19 @@ fn cms_class(ty: &str) -> Option<&'static str> {
         "bookmark" => Some("Bookmark"),
         "presentation" => Some("Presentation"),
         _ => None,
+    }
+}
+
+/// The human display label for a content-type slug — the plural, capitalized header a type view
+/// (or a tag's type scope) shows: `book` → `Books`. Kept beside `cms_class`, in lockstep, so the
+/// header can't drift from the filter. Unknown slugs never reach here — the type view rejects
+/// them before a facet is built — so the fallback is only a total-match formality.
+fn type_label(ty: &str) -> &'static str {
+    match ty {
+        "book" => "Books",
+        "bookmark" => "Bookmarks",
+        "presentation" => "Presentations",
+        _ => "Items",
     }
 }
 
@@ -628,13 +641,15 @@ fn facet_html(ctx: &ViewCtx<'_>) -> String {
     let (label, clear_iri) = match ctx.facet {
         Facet::Tag(t) => (format!("#{}", html_escape(t)), "urn:cms:tags"),
         Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_escape(q)), "urn:cms:tags"),
-        Facet::Type(t) => (html_escape(t), "urn:cms:types"),
+        Facet::Type(t) => (type_label(t).to_string(), "urn:cms:types"),
     };
     let scope = match ctx.type_scope {
-        Some(s) if !s.is_empty() => format!(
-            "<span class=\"cms-facet-scope\">in {}</span>",
-            html_escape(s)
-        ),
+        Some(s) if !s.is_empty() => {
+            format!(
+                "<span class=\"cms-facet-scope\">in {}</span>",
+                type_label(s)
+            )
+        }
         _ => String::new(),
     };
     format!(
@@ -1718,6 +1733,10 @@ mod tests {
         );
         // A type view renders cards of that kind — the book view shows authors.
         let books = resolve_html(&kernel, "urn:cms:type:book", &[]);
+        assert!(
+            books.contains("class=\"cms-facet-label\">Books<"),
+            "type header is the capitalized plural label: {books}"
+        );
         assert!(
             books.contains("Rust in Action"),
             "book in book view: {books}"
