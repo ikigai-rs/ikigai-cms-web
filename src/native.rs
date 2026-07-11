@@ -534,35 +534,34 @@ async fn count_resources(inv: &Invocation<'_>, query: String) -> Result<usize> {
         .unwrap_or(0))
 }
 
-/// The prev/next pager appended under a page of cards. Buttons carry the target `offset`
-/// (the browser re-issues the same view with it); the edge that doesn't exist renders as a
-/// dimmed span so the row stays put. Empty when it all fits on one page.
+/// The first/prev/next/last pager appended under a page of cards. Buttons carry the target
+/// `offset` (the browser re-issues the same view with it); an edge that doesn't exist renders
+/// as a dimmed span so the row stays put. Empty when it all fits on one page.
 fn pager_html(offset: usize, total: usize) -> String {
     if total <= PAGE_SIZE {
         return String::new();
     }
     let start = offset + 1;
     let end = (offset + PAGE_SIZE).min(total);
+    let last = (total - 1) / PAGE_SIZE * PAGE_SIZE; // offset of the final page
+    let at_start = offset == 0;
+    let at_end = end >= total;
+    // One pager control: a live button that jumps to `target`, or a dimmed span at an edge.
+    let ctl = |avail: bool, target: usize, label: &str| {
+        if avail {
+            format!("<button class=\"cms-page\" data-offset=\"{target}\">{label}</button>")
+        } else {
+            format!("<span class=\"cms-page cms-page-off\">{label}</span>")
+        }
+    };
     let mut nav = String::from("<nav class=\"cms-pager\">");
-    if offset > 0 {
-        let prev = offset.saturating_sub(PAGE_SIZE);
-        nav.push_str(&format!(
-            "<button class=\"cms-page\" data-offset=\"{prev}\">‹ prev</button>"
-        ));
-    } else {
-        nav.push_str("<span class=\"cms-page cms-page-off\">‹ prev</span>");
-    }
+    nav.push_str(&ctl(!at_start, 0, "« first"));
+    nav.push_str(&ctl(!at_start, offset.saturating_sub(PAGE_SIZE), "‹ prev"));
     nav.push_str(&format!(
         "<span class=\"cms-page-info\">{start}–{end} of {total}</span>"
     ));
-    if end < total {
-        let next = offset + PAGE_SIZE;
-        nav.push_str(&format!(
-            "<button class=\"cms-page\" data-offset=\"{next}\">next ›</button>"
-        ));
-    } else {
-        nav.push_str("<span class=\"cms-page cms-page-off\">next ›</span>");
-    }
+    nav.push_str(&ctl(!at_end, offset + PAGE_SIZE, "next ›"));
+    nav.push_str(&ctl(!at_end, last, "last »"));
     nav.push_str("</nav>");
     nav
 }
@@ -1002,29 +1001,42 @@ mod tests {
         // Fits on one page → no pager at all.
         assert_eq!(pager_html(0, PAGE_SIZE), "");
         assert_eq!(pager_html(0, 5), "");
-        // First page of many: prev dimmed, next live, range shown.
+        // First page of many: first+prev dimmed, next+last live, range shown.
         let first = pager_html(0, 200);
         assert!(
-            first.contains("cms-page cms-page-off\">‹ prev"),
-            "prev disabled on page 1: {first}"
+            first.contains("cms-page cms-page-off\">« first")
+                && first.contains("cms-page cms-page-off\">‹ prev"),
+            "first + prev disabled on page 1: {first}"
         );
         assert!(
             first.contains(&format!("data-offset=\"{PAGE_SIZE}\">next")),
             "next jumps a page: {first}"
         );
+        // last-page offset for 200 items at size 60 → 180.
+        assert!(
+            first.contains("data-offset=\"180\">last »"),
+            "last jumps to the final page: {first}"
+        );
         assert!(first.contains(&format!("1–{PAGE_SIZE} of 200")), "{first}");
-        // A middle page: both edges live.
+        // A middle page: every edge live (first→0, prev→0, next→120, last→180).
         let mid = pager_html(PAGE_SIZE, 200);
+        assert!(mid.contains("data-offset=\"0\">« first"), "{mid}");
         assert!(mid.contains("data-offset=\"0\">‹ prev"), "{mid}");
         assert!(
             mid.contains(&format!("data-offset=\"{}\">next", PAGE_SIZE * 2)),
             "{mid}"
         );
-        // The last page: next dimmed.
+        assert!(mid.contains("data-offset=\"180\">last »"), "{mid}");
+        // The last page: next+last dimmed, first live.
         let last = pager_html(180, 200);
         assert!(
-            last.contains("cms-page cms-page-off\">next"),
-            "next disabled on the last page: {last}"
+            last.contains("cms-page cms-page-off\">next")
+                && last.contains("cms-page cms-page-off\">last »"),
+            "next + last disabled on the last page: {last}"
+        );
+        assert!(
+            last.contains("data-offset=\"0\">« first"),
+            "first live: {last}"
         );
         assert!(last.contains("181–200 of 200"), "{last}");
     }
