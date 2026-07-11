@@ -108,18 +108,24 @@ impl Endpoint for LinkCheck {
 
 /// A maintenance kernel: the CMS graph spaces + outbound HTTP (via `transport`) +
 /// `urn:cms:linkcheck`, with a system clock so the week-long cache deadline is honored.
-/// `transport` is injectable so a test can count network calls.
-pub fn maintenance_kernel(src_dir: PathBuf, transport: Arc<dyn HttpTransport>) -> Kernel {
-    let mut spaces = crate::cms_spaces(src_dir, None);
+/// `bookmarks` is the org sub-path to check (e.g. `bookmarks-src.org`); `None` uses the
+/// built-in default. `transport` is injectable so a test can count network calls.
+pub fn maintenance_kernel(
+    src_dir: PathBuf,
+    bookmarks: Option<String>,
+    transport: Arc<dyn HttpTransport>,
+) -> Kernel {
+    let mut spaces = crate::cms_spaces_with(src_dir, None, None, bookmarks);
     spaces.push(Arc::new(
         EndpointSpace::new().bind(Exact::new("urn:cms:linkcheck"), LinkCheck { transport }),
     ) as Arc<dyn Space>);
     Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(SystemClock))
 }
 
-/// [`maintenance_kernel`] over the real [`CheckTransport`] (ureq).
-pub fn build_maintenance_kernel(src_dir: PathBuf) -> Kernel {
-    maintenance_kernel(src_dir, Arc::new(CheckTransport))
+/// [`maintenance_kernel`] over the real [`CheckTransport`] (ureq), checking the given
+/// bookmarks org sub-path (`None` = the built-in default).
+pub fn build_maintenance_kernel(src_dir: PathBuf, bookmarks: Option<String>) -> Kernel {
+    maintenance_kernel(src_dir, bookmarks, Arc::new(CheckTransport))
 }
 
 #[cfg(test)]
@@ -159,8 +165,11 @@ mod tests {
         std::fs::write(&bm, "* Bookmarks\n").unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let kernel =
-            maintenance_kernel(dir.path().to_path_buf(), Arc::new(Counting(calls.clone())));
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            None,
+            Arc::new(Counting(calls.clone())),
+        );
 
         assert_eq!(linkcheck(&kernel, "https://example.com/a"), "ok");
         assert_eq!(linkcheck(&kernel, "https://example.com/a"), "ok"); // within the week
