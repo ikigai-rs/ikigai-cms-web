@@ -230,10 +230,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let incoming = server.accept().await;
         let kernel = Arc::clone(&kernel);
         let rp = Arc::clone(&rp);
+        let http_auth = Arc::clone(&http_auth);
         let entitlement = Arc::clone(&entitlement);
         let recent = Arc::clone(&recent);
         tokio::spawn(async move {
-            if let Err(e) = serve(incoming, kernel, rp, entitlement, recent).await {
+            if let Err(e) = serve(incoming, kernel, rp, http_auth, entitlement, recent).await {
                 eprintln!("session ended: {e}");
             }
         });
@@ -250,6 +251,10 @@ struct HttpSession {
     scopes: Option<Vec<String>>,
     principal: Option<String>,
     pending: Option<Pending>,
+    /// A bearer token the page can read (unlike the HttpOnly cookie) and present over the wire
+    /// (`urn:auth:resume`) to raise a WebTransport connection to this session's capability — so
+    /// one HTTP login covers both transports. Minted lazily on `status` once authenticated.
+    wire_token: Option<String>,
 }
 
 /// A WebAuthn ceremony held between its `start` and `finish` HTTP requests (the wire holds the
@@ -370,21 +375,29 @@ fn http_auth(
     };
     // `status` is a GET; every other auth route is a POST.
     if route == "status" {
-        let (authed, principal) = match sid {
+        // Mint the wire token lazily the first time an authenticated session asks its status,
+        // so the page can bring the WebTransport connection up to the same capability.
+        let (authed, principal, wire_token) = match sid {
             Some(sid) => {
-                let sessions = auth.sessions.lock().unwrap();
-                match sessions.get(sid) {
-                    Some(s) if s.scopes.is_some() => (true, s.principal.clone()),
-                    _ => (false, None),
+                let mut sessions = auth.sessions.lock().unwrap();
+                match sessions.get_mut(sid) {
+                    Some(s) if s.scopes.is_some() => {
+                        if s.wire_token.is_none() {
+                            s.wire_token = Some(Uuid::new_v4().to_string());
+                        }
+                        (true, s.principal.clone(), s.wire_token.clone())
+                    }
+                    _ => (false, None, None),
                 }
             }
-            None => (false, None),
+            None => (false, None, None),
         };
         let body = serde_json::json!({
             "authenticated": authed,
             "principal": principal,
             "enrolled": rp.is_enrolled(),
             "dev_open": dev_open,
+            "wire_token": wire_token,
         });
         return ("200 OK", json, body.to_string().into_bytes(), None);
     }
@@ -760,6 +773,7 @@ fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
         Some("css") => "text/css; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
@@ -786,6 +800,7 @@ async fn serve(
     incoming: IncomingSession,
     kernel: Arc<Kernel>,
     rp: Arc<Rp>,
+    http_auth: Arc<HttpAuth>,
     entitlement: Arc<Vec<String>>,
     recent: Arc<RecentLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -804,7 +819,15 @@ async fn serve(
         };
         let mut bytes = Vec::new();
         recv.take(MAX_CALL as u64).read_to_end(&mut bytes).await?;
-        let reply = handle(&kernel, &rp, &entitlement, &recent, &mut session, &bytes);
+        let reply = handle(
+            &kernel,
+            &rp,
+            &http_auth,
+            &entitlement,
+            &recent,
+            &mut session,
+            &bytes,
+        );
         send.write_all(&reply).await?;
         send.finish().await?;
     }
@@ -813,9 +836,11 @@ async fn serve(
 /// Decode a `Call` and answer it. `urn:auth:*` Calls are handled by the session layer
 /// (the passkey ceremony); everything else resolves against the kernel **under the
 /// connection's ceiling** — so the room is gated until a verified passkey raises it.
+#[allow(clippy::too_many_arguments)]
 fn handle(
     kernel: &Kernel,
     rp: &Rp,
+    http_auth: &HttpAuth,
     entitlement: &[String],
     recent: &RecentLog,
     session: &mut Session,
@@ -823,7 +848,7 @@ fn handle(
 ) -> Vec<u8> {
     let reply = match decode::<Call>(bytes) {
         Ok(Call::Issue(req)) if req.target.as_str().starts_with("urn:auth:") => {
-            handle_auth(rp, entitlement, session, &req)
+            handle_auth(rp, entitlement, http_auth, session, &req)
         }
         // The recency trail is a session resource, not a kernel one: rendered from what
         // this identity has viewed, through the `recent` stylesheet.
@@ -989,8 +1014,36 @@ fn xml_escape_into(out: &mut String, s: &str) {
 /// The passkey ceremony, over the wire as `urn:auth:*` resources. Registration is a
 /// trust-on-first-use bootstrap: allowed only while no passkey is enrolled (the first
 /// credential claims the room; further enrollment is a later, cap-gated concern).
-fn handle_auth(rp: &Rp, entitlement: &[String], session: &mut Session, req: &Request) -> Reply {
+fn handle_auth(
+    rp: &Rp,
+    entitlement: &[String],
+    http_auth: &HttpAuth,
+    session: &mut Session,
+    req: &Request,
+) -> Reply {
     match req.target.as_str() {
+        "urn:auth:resume" => {
+            // Bridge an existing HTTP login onto this wire connection: the page presents the
+            // wire token it read from `/auth/status` (a bearer value it can read, unlike the
+            // HttpOnly cookie), and this connection adopts that session's capability + principal.
+            // One login then covers both transports.
+            let Some(token) = inline_arg(req, "token").and_then(|b| std::str::from_utf8(b).ok())
+            else {
+                return error_reply("resume needs a `token`");
+            };
+            let sessions = http_auth.sessions.lock().unwrap();
+            match sessions
+                .values()
+                .find(|s| s.scopes.is_some() && s.wire_token.as_deref() == Some(token))
+            {
+                Some(s) => {
+                    session.ceiling = Capability::scoped(s.scopes.clone().unwrap_or_default());
+                    session.principal = s.principal.clone();
+                    json_reply(br#"{"ok":true}"#.to_vec())
+                }
+                None => error_reply("unknown or unauthenticated wire token"),
+            }
+        }
         "urn:auth:login:start" => match rp.login_start() {
             Ok((challenge, state)) => {
                 session.auth_state = Some(state);
@@ -1090,13 +1143,33 @@ fn error_reply(msg: &str) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type, ensure_session, http_auth, parse_head, resolve_http, safe_rel, serve_http,
-        session_cap, HttpAuth, HttpSession,
+        content_type, ensure_session, handle_auth, http_auth, parse_head, resolve_http, safe_rel,
+        serve_http, session_cap, HttpAuth, HttpSession, Session,
     };
     use ikigai_cms_web::session::{RecentLog, Rp};
-    use ikigai_core::Capability;
+    use ikigai_core::{ArgRef, Capability, Iri, Request, Verb};
+    use ikigai_wire::Reply;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A fresh public (unelevated) wire session.
+    fn public_session() -> Session {
+        Session {
+            ceiling: Capability::scoped(Vec::<String>::new()),
+            auth_state: None,
+            reg_state: None,
+            principal: None,
+        }
+    }
+
+    /// The body text of a `Reply` (auth replies are JSON; errors carry the message).
+    fn reply_body(reply: Reply) -> String {
+        match reply {
+            Reply::Resolved(repr, _) => String::from_utf8_lossy(&repr.bytes).into_owned(),
+            Reply::Error(e) => e,
+            _ => String::new(),
+        }
+    }
 
     /// A CMS kernel over a temp bookmarks fixture, plus its fs-read entitlement.
     fn fixture(dir: &std::path::Path) -> (ikigai_core::Kernel, Vec<String>) {
@@ -1194,6 +1267,7 @@ mod tests {
                 scopes: Some(ent.clone()),
                 principal: Some("p".into()),
                 pending: None,
+                wire_token: None,
             },
         );
         // Its cap resolves the gated view, and the visit is recorded to that principal's trail.
@@ -1273,6 +1347,37 @@ mod tests {
     }
 
     #[test]
+    fn the_wire_resume_bridges_an_authenticated_http_session_by_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = empty_rp(dir.path());
+        let auth = HttpAuth::default();
+        let ent = vec!["urn:cap:fs:read:/x".to_string()];
+        // An authenticated HTTP session that has minted a wire token.
+        auth.sessions.lock().unwrap().insert(
+            "sid".into(),
+            HttpSession {
+                scopes: Some(ent.clone()),
+                principal: Some("p".into()),
+                pending: None,
+                wire_token: Some("tok-123".into()),
+            },
+        );
+        let resume = |tok: &str, session: &mut Session| {
+            let req = Request::new(Verb::Source, Iri::parse("urn:auth:resume").unwrap())
+                .with_arg("token", ArgRef::Inline(tok.as_bytes().to_vec()));
+            handle_auth(&rp, &ent, &auth, session, &req)
+        };
+        // The right token adopts the session's principal (and, with it, its capability).
+        let mut s = public_session();
+        assert!(reply_body(resume("tok-123", &mut s)).contains("\"ok\":true"));
+        assert_eq!(s.principal.as_deref(), Some("p"));
+        // A bogus token is refused and leaves the connection unelevated (still public).
+        let mut fresh = public_session();
+        assert!(reply_body(resume("nope", &mut fresh)).contains("error"));
+        assert_eq!(fresh.principal, None);
+    }
+
+    #[test]
     fn ensure_session_reuses_a_known_id_and_mints_otherwise() {
         let auth = HttpAuth::default();
         let (id1, c1) = ensure_session(&auth, None);
@@ -1304,6 +1409,8 @@ mod tests {
     fn content_type_by_extension() {
         assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
         assert_eq!(content_type("cert.json"), "application/json; charset=utf-8");
+        assert_eq!(content_type("ikigai_cms_web_bg.wasm"), "application/wasm");
+        assert_eq!(content_type("mod.mjs"), "text/javascript; charset=utf-8");
         assert_eq!(content_type("x.svg"), "image/svg+xml");
         assert_eq!(content_type("noext"), "application/octet-stream");
     }

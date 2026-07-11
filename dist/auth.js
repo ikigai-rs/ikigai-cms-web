@@ -62,6 +62,8 @@
       const done = await api("/auth/login/finish", cred.toJSON());
       if (done.error) return fail(done.error);
       show(true, true);
+      // Let the optional WebTransport shim bring the wire up for this new session.
+      document.dispatchEvent(new CustomEvent("ikigai:authed"));
     } catch (e) {
       fail("sign-in failed: " + e.message);
     }
@@ -69,6 +71,7 @@
 
   async function logout() {
     await api("/auth/logout");
+    document.dispatchEvent(new CustomEvent("ikigai:deauthed"));
     show(false, false);
   }
 
