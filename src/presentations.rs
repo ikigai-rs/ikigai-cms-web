@@ -5,10 +5,12 @@
 //! A **deck** is a directory containing `deck.toml`. Title and tags come from the deck's
 //! authored **JSON-LD** — a `<script type="application/ld+json">` lectern emits into the
 //! built `dist/index.html` using the shared `dc:`/`cms:` vocab (the agreed interface). For
-//! un-migrated or un-built decks it **falls back** to scraping the title slide's first
-//! `# H1` and `<span class="tag …">` run. Either way, the **venue segments of the path** are
-//! added as tags — so `conferences/nfjs/uberconf/2026/…` yields `#nfjs` and `#uberconf` with
-//! no hand-tagging. The link is the built `dist/index.html`, served under the configured base.
+//! un-migrated or un-built decks the title **falls back** to the title slide's first `# H1`,
+//! but tags never do: the visual `<span class="tag …">` chips are presentation, not
+//! semantics, so they are never read. Tags come only from authored JSON-LD plus the **venue
+//! segments of the path** — so `conferences/nfjs/uberconf/2026/…` yields `#nfjs`/`#uberconf`
+//! with no hand-tagging, and an un-migrated deck carries just its title and venue tag. The
+//! link is the built `dist/index.html`, served under the configured base.
 //!
 //! Native-only (it walks the filesystem) and not golden-threaded, so a newly-authored or
 //! rebuilt deck appears on the next restart. The durable end state is the graph as source of
@@ -177,13 +179,15 @@ fn extract_ld_json(html: &str) -> Option<String> {
     Some(after[..end].trim().to_string())
 }
 
-/// Fallback metadata for a deck with no JSON-LD: the title slide's first `# H1` and its
-/// `<span class="tag …">` run. `None` when the deck has no readable title slide.
+/// Fallback metadata for a deck with no JSON-LD: only the title slide's first `# H1` for the
+/// title — **no tags**. The visual `<span class="tag …">` chips are presentation, not
+/// semantics, so they never become CMS tags (only authored JSON-LD tags + venue tags do).
+/// So an un-migrated deck shows up with its title and venue tag, and gets real tags once its
+/// `[metadata]` is authored and built. `None` when the deck has no readable title slide.
 fn scraped_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
     let slide = title_slide(deck)?;
     let text = std::fs::read_to_string(&slide).ok()?;
-    let region = title_region(&text);
-    Some((first_h1(region), tag_spans(region)))
+    Some((first_h1(title_region(&text)), Vec::new()))
 }
 
 /// The card link for a deck: its built `dist/index.html` served under `base_url` (so a
@@ -253,27 +257,6 @@ fn first_h1(region: &str) -> Option<String> {
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty())
     })
-}
-
-/// The text of every `<span class="tag …">…</span>` in the region, lowercased. The
-/// `cool`/`warm`/`ink` class is only a colour role, so we read the element text, not it.
-fn tag_spans(region: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let mut rest = region;
-    while let Some(i) = rest.find("<span class=\"tag") {
-        rest = &rest[i..];
-        let Some(gt) = rest.find('>') else { break };
-        let after = &rest[gt + 1..];
-        let Some(end) = after.find("</span>") else {
-            break;
-        };
-        let text = after[..end].trim();
-        if !text.is_empty() {
-            tags.push(text.to_lowercase());
-        }
-        rest = &after[end + "</span>".len()..];
-    }
-    tags
 }
 
 /// Venue tags from a deck's path relative to `root`: each path segment lowercased, dropping
@@ -354,26 +337,26 @@ mod tests {
         <span class=\"tag ink\">post-quantum</span>\n";
 
     #[test]
-    fn a_deck_becomes_a_typed_presentation_with_title_tags_and_venue() {
+    fn an_unmigrated_deck_gets_its_title_and_venue_but_no_span_tags() {
         let tmp = tempfile::tempdir().unwrap();
+        // No dist/ → the scrape fallback: title from the H1, tags from JSON-LD only (none).
         write_deck(tmp.path(), "conferences/nfjs/fs-crypto", TITLE_MD);
         let ttl = presentations_turtle(tmp.path(), None);
 
         assert!(ttl.contains("a cms:Presentation"), "typed: {ttl}");
         assert!(
             ttl.contains("dc:title \"Full Stack Engineering - Encryption\""),
-            "title from the H1, not deck.toml: {ttl}"
+            "title from the H1: {ttl}"
         );
-        // Authored tags from the title slide's .tag spans.
+        // The visual .tag spans are NEVER read as CMS tags — presentation, not semantics.
         for t in ["primitives", "identity", "post-quantum"] {
             assert!(
-                ttl.contains(&format!("dc:subject \"{t}\"")),
-                "tag {t}: {ttl}"
+                !ttl.contains(&format!("dc:subject \"{t}\"")),
+                "span `{t}` must not become a tag: {ttl}"
             );
         }
-        // Venue tag from the path (the Uberconf-style unlock) — nfjs here.
+        // The only tag is the venue, from the path.
         assert!(ttl.contains("dc:subject \"nfjs\""), "venue tag: {ttl}");
-        // With no base URL, the card link is a locatable `file://` path.
         assert!(ttl.contains("dc:identifier \"file://"), "deck link: {ttl}");
     }
 
@@ -458,14 +441,13 @@ mod tests {
 
     #[test]
     fn the_title_region_stops_at_the_first_slide_break() {
-        // A single-file deck: the title slide is the region before the first `---`; a later
-        // `# Agenda` content heading must not become the title.
-        let single = "# Real Title\n\n<span class=\"tag ink\">topic</span>\n\n---\n# Agenda\n";
+        // A single-file deck: the title H1 comes from the region before the first `---`; a
+        // later `# Agenda` content heading must not become the title.
+        let single = "# Real Title\n\n---\n# Agenda\n";
         assert_eq!(
             first_h1(title_region(single)).as_deref(),
             Some("Real Title")
         );
-        assert_eq!(tag_spans(title_region(single)), vec!["topic".to_string()]);
     }
 
     #[test]
