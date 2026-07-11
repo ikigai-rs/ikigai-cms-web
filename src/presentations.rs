@@ -12,14 +12,16 @@
 //! with no hand-tagging, and an un-migrated deck carries just its title and venue tag. The
 //! link is the built `dist/index.html`, served under the configured base.
 //!
-//! Native-only (it walks the filesystem) and not golden-threaded, so a newly-authored or
-//! rebuilt deck appears on the next restart. The durable end state is the graph as source of
-//! truth with lectern rendering *from* it — the JSON-LD interface is the first step there.
+//! Native-only. Deck **contents** are read through the kernel (`urn:cms:deck:*`), so the
+//! graph is **golden-threaded** to them — a `lectern build` that rewrites a deck cuts the
+//! thread and the reading room refreshes. The directory **walk** (which decks exist) is still
+//! `std::fs`, so a brand-new deck *directory* appears on the next restart. The durable end
+//! state is the graph as source of truth with lectern rendering *from* it.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use ikigai_core::{Description, Endpoint, Invocation, ReprType, Representation, Result, Verb};
+use ikigai_core::{Description, Endpoint, Invocation, Iri, ReprType, Representation, Result, Verb};
 
 /// Configuration for the presentations source: the decks root, and the base URL a static
 /// server exposes that tree at — so a card link opens the built deck (`{base}/{deck}/dist/
@@ -38,9 +40,9 @@ pub(crate) struct PresentationsGraph {
 
 #[async_trait]
 impl Endpoint for PresentationsGraph {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let turtle = match &self.config {
-            Some(cfg) => presentations_turtle(&cfg.root, cfg.base_url.as_deref()),
+            Some(cfg) => presentations_turtle(inv, &cfg.root, cfg.base_url.as_deref()).await,
             None => String::new(),
         };
         Ok(Representation::new(
@@ -66,18 +68,37 @@ impl Endpoint for PresentationsGraph {
 }
 
 /// The whole presentations graph: a `cms:Presentation` block per deck under `root`, each
-/// linked at `base_url` (or `file://` when none is configured).
-fn presentations_turtle(root: &Path, base_url: Option<&str>) -> String {
+/// linked at `base_url` (or `file://` when none is configured). Deck *files* are read
+/// through the kernel (`urn:cms:deck:*`, see [`deck_source`]) so the graph is golden-threaded
+/// to them — a `lectern build` that rewrites a deck cuts the thread and this recomputes.
+async fn presentations_turtle(inv: &Invocation<'_>, root: &Path, base_url: Option<&str>) -> String {
     let mut out = String::from(
         "@prefix dc: <http://purl.org/dc/elements/1.1/> .\n\
          @prefix cms: <https://ikigai-rs.dev/ns/cms#> .\n",
     );
+    // The directory *walk* (which decks exist) stays on std::fs — a brand-new deck dir still
+    // needs a restart — but each deck's contents ride a golden thread.
     for deck in decks(root) {
-        if let Some(block) = deck_turtle(&deck, root, base_url) {
+        if let Some(block) = deck_turtle(inv, &deck, root, base_url).await {
             out.push_str(&block);
         }
     }
     out
+}
+
+/// Read a deck file (given its absolute path under `root`) THROUGH the kernel as
+/// `urn:cms:deck:{rel}`, so the read is golden-threaded (and capability-gated) rather than a
+/// raw `std::fs` read. `None` if the file is absent/unreadable or outside `root`.
+async fn deck_source(inv: &Invocation<'_>, root: &Path, abs: &Path) -> Option<String> {
+    let rel = abs.strip_prefix(root).ok()?;
+    let rel_url = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/");
+    let iri = Iri::parse(format!("urn:cms:deck:{rel_url}")).ok()?;
+    let repr = inv.source(&iri).await.ok()?;
+    String::from_utf8(repr.bytes).ok()
 }
 
 /// Every deck (a directory containing `deck.toml`) under `root`, recursively, sorted for a
@@ -118,8 +139,13 @@ fn collect_decks(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// One deck → a `cms:Presentation` block, or `None` if it carries no metadata at all (no
 /// built JSON-LD and no readable title slide).
-fn deck_turtle(deck: &Path, root: &Path, base_url: Option<&str>) -> Option<String> {
-    let (title, mut tags) = deck_metadata(deck)?;
+async fn deck_turtle(
+    inv: &Invocation<'_>,
+    deck: &Path,
+    root: &Path,
+    base_url: Option<&str>,
+) -> Option<String> {
+    let (title, mut tags) = deck_metadata(inv, deck, root).await?;
     // The venue tags come from the path, not the deck — always added, whatever the source.
     tags.extend(venue_tags(deck, root));
     tags.sort();
@@ -142,15 +168,26 @@ fn deck_turtle(deck: &Path, root: &Path, base_url: Option<&str>) -> Option<Strin
 /// A deck's authored `(title, tags)`: its built **JSON-LD** if present (the agreed
 /// interface), else a scrape of the title slide for un-migrated/un-built decks. `None` when
 /// the deck has neither. Venue tags are added by the caller, not here.
-fn deck_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
-    jsonld_metadata(deck).or_else(|| scraped_metadata(deck))
+async fn deck_metadata(
+    inv: &Invocation<'_>,
+    deck: &Path,
+    root: &Path,
+) -> Option<(Option<String>, Vec<String>)> {
+    match jsonld_metadata(inv, deck, root).await {
+        Some(m) => Some(m),
+        None => scraped_metadata(inv, deck, root).await,
+    }
 }
 
 /// Authored metadata from the deck's built JSON-LD (`<script type="application/ld+json">` in
 /// `dist/index.html`). The context maps `title`→`dc:title` and `tags`→`dc:subject`, so we
 /// read those compact keys. `None` when the deck isn't built or carries no JSON-LD.
-fn jsonld_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
-    let html = std::fs::read_to_string(deck.join("dist/index.html")).ok()?;
+async fn jsonld_metadata(
+    inv: &Invocation<'_>,
+    deck: &Path,
+    root: &Path,
+) -> Option<(Option<String>, Vec<String>)> {
+    let html = deck_source(inv, root, &deck.join("dist/index.html")).await?;
     let block = extract_ld_json(&html)?;
     let json: serde_json::Value = serde_json::from_str(&block).ok()?;
     let title = json["title"]
@@ -184,9 +221,13 @@ fn extract_ld_json(html: &str) -> Option<String> {
 /// semantics, so they never become CMS tags (only authored JSON-LD tags + venue tags do).
 /// So an un-migrated deck shows up with its title and venue tag, and gets real tags once its
 /// `[metadata]` is authored and built. `None` when the deck has no readable title slide.
-fn scraped_metadata(deck: &Path) -> Option<(Option<String>, Vec<String>)> {
+async fn scraped_metadata(
+    inv: &Invocation<'_>,
+    deck: &Path,
+    root: &Path,
+) -> Option<(Option<String>, Vec<String>)> {
     let slide = title_slide(deck)?;
-    let text = std::fs::read_to_string(&slide).ok()?;
+    let text = deck_source(inv, root, &slide).await?;
     Some((first_h1(title_region(&text)), Vec::new()))
 }
 
@@ -320,6 +361,8 @@ fn ttl_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ikigai_core::Request;
+    use ikigai_resolve::Resolver;
 
     /// Write a deck (deck.toml + slides/00-title.md) under `dir`, return the deck dir.
     fn write_deck(dir: &Path, rel: &str, title_md: &str) -> PathBuf {
@@ -328,6 +371,29 @@ mod tests {
         std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").unwrap();
         std::fs::write(deck.join("slides/00-title.md"), title_md).unwrap();
         deck
+    }
+
+    /// Resolve `urn:cms:graph:presentations` over a real kernel rooted at `root` — the
+    /// threaded path (deck files read through `urn:cms:deck:*`), returning the Turtle.
+    fn presentations_ttl(root: &Path, base_url: Option<&str>) -> String {
+        let src = tempfile::tempdir().unwrap();
+        let kernel = crate::build_cms_kernel_with(
+            src.path().to_path_buf(),
+            None,
+            Some(Presentations {
+                root: root.to_path_buf(),
+                base_url: base_url.map(str::to_string),
+            }),
+        );
+        let (repr, _) = Resolver::issue(
+            &kernel,
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:presentations").unwrap(),
+            ),
+        )
+        .expect("presentations graph resolves");
+        String::from_utf8(repr.bytes).unwrap()
     }
 
     const TITLE_MD: &str = "<!-- .slide: class=\"slide inverse center middle\" -->\n\n\
@@ -341,7 +407,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No dist/ → the scrape fallback: title from the H1, tags from JSON-LD only (none).
         write_deck(tmp.path(), "conferences/nfjs/fs-crypto", TITLE_MD);
-        let ttl = presentations_turtle(tmp.path(), None);
+        let ttl = presentations_ttl(tmp.path(), None);
 
         assert!(ttl.contains("a cms:Presentation"), "typed: {ttl}");
         assert!(
@@ -386,7 +452,7 @@ mod tests {
         )
         .unwrap();
 
-        let ttl = presentations_turtle(tmp.path(), None);
+        let ttl = presentations_ttl(tmp.path(), None);
         // Authored title wins over the stale H1.
         assert!(
             ttl.contains("dc:title \"Full Stack Engineering - Cryptography\""),
@@ -411,15 +477,15 @@ mod tests {
 
     #[test]
     fn a_base_url_makes_the_link_a_clickable_served_deck() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_deck(tmp.path(), "conferences/nfjs/fs-crypto", TITLE_MD);
-        let ttl = presentations_turtle(tmp.path(), Some("http://localhost:8000/"));
-        assert!(
-            ttl.contains(
-                "dc:identifier \"http://localhost:8000/conferences/nfjs/fs-crypto/dist/index.html\""
-            ),
-            "served deck URL under the base (trailing slash trimmed): {ttl}"
+        // deck_link is pure — a base URL yields the served deck URL (trailing slash trimmed);
+        // no base yields a file:// path.
+        let root = Path::new("/decks");
+        let deck = root.join("conferences/nfjs/fs-crypto");
+        assert_eq!(
+            deck_link(&deck, root, Some("http://localhost:8000/")),
+            "http://localhost:8000/conferences/nfjs/fs-crypto/dist/index.html"
         );
+        assert!(deck_link(&deck, root, None).starts_with("file://"));
     }
 
     #[test]
