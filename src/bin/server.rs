@@ -46,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     // The entitlement a verified passkey is granted: read the CMS source jail (the whole
-    // room's chain bottoms out in this fs read).
-    let entitlement = Arc::new(vec![format!("urn:cap:fs:read:{}", src_dir.display())]);
+    // room's chain bottoms out in this fs read). The presentations dir is appended once
+    // resolved (below), so decks — read through `urn:cms:deck:*` — are cap-gated too.
+    let mut entitlement = vec![format!("urn:cap:fs:read:{}", src_dir.display())];
 
     // The relying party. rp_id + page origin default to local dev; the passkey store
     // persists through the OS keystore (macOS Keychain), not a plaintext file.
@@ -145,6 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
             .unwrap_or_else(|| "(none)".to_string())
     );
+
+    if let Some(cfg) = &presentations {
+        entitlement.push(format!("urn:cap:fs:read:{}", cfg.root.display()));
+    }
+    let entitlement = Arc::new(entitlement);
 
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
         src_dir,

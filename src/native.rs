@@ -72,6 +72,16 @@ pub fn cms_spaces_with(
     if let Some(path) = zotero {
         zotero_space = zotero_space.bind(Exact::new("urn:cms:src:zotero"), ZoteroSource(path));
     }
+    // Deck files, read THROUGH the kernel (`urn:cms:deck:{path}`, rooted at the presentations
+    // dir) so the presentations graph is golden-threaded + capability-gated on them, not a raw
+    // std::fs read. Bound only when a presentations root is configured.
+    let mut deck_space = EndpointSpace::new();
+    if let Some(cfg) = &presentations {
+        deck_space = deck_space.bind(
+            UriTemplate::parse("urn:cms:deck:{path}").expect("valid template"),
+            ikigai_fs::FileEndpoint::new(cfg.root.clone()).cacheable(),
+        );
+    }
     // The graph resources: bookmarks, books, and their union (what SPARQL points at).
     let graph = EndpointSpace::new()
         .bind(Exact::new("urn:cms:graph:bookmarks"), BookmarkGraph)
@@ -111,6 +121,7 @@ pub fn cms_spaces_with(
         // Before `src`: the exact `urn:cms:src:zotero` must win over the `urn:cms:src:{path}`
         // template (which would otherwise match it with path=`zotero`).
         Arc::new(zotero_space) as Arc<dyn Space>,
+        Arc::new(deck_space) as Arc<dyn Space>,
         Arc::new(src) as Arc<dyn Space>,
         Arc::new(graph) as Arc<dyn Space>,
         Arc::new(views) as Arc<dyn Space>,
