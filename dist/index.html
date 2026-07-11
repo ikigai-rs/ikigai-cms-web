@@ -29,9 +29,12 @@
   nav.nav button:hover { background:var(--card); }
   nav.nav form { margin-left:auto; display:flex; }
   nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
-  .context { display:flex; align-items:baseline; gap:8px; margin:14px 0 -2px; font:15px system-ui; font-weight:600; color:var(--fg); }
+  .context { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:14px 0 -2px; font:14px system-ui; }
   .context[hidden] { display:none; }
-  .context .context-scope { font-weight:500; color:var(--accent); }
+  .cms-facet { display:inline-flex; align-items:center; gap:2px; padding:3px 5px 3px 12px; border:1px solid var(--line); border-radius:999px; background:var(--card); color:var(--fg); font-weight:500; }
+  .cms-facet.plain { padding:3px 12px; color:var(--mut); }
+  .cms-facet-x { border:none; background:transparent; color:var(--mut); cursor:pointer; font:inherit; font-size:17px; line-height:1; padding:0 5px; border-radius:50%; }
+  .cms-facet-x:hover { color:var(--fg); background:var(--accent-bg); }
   #room { margin-top:16px; }
   /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
   #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
@@ -144,22 +147,55 @@ function viewType(iri, args) {
   return null;
 }
 
-// A header that says what you're looking at — so a tag/type/search view isn't a mystery.
+// One facet chip: a label, optionally closeable (an × that removes just that facet), and
+// optionally carrying a type slug so it can be coloured by kind.
+function facetChip(text, closeKind, typeSlug) {
+  const chip = document.createElement('span');
+  chip.className = 'cms-facet' + (closeKind ? '' : ' plain') + (typeSlug ? ' cms-facet-type' : '');
+  if (typeSlug) chip.setAttribute('data-cms-type', typeSlug);
+  chip.append(text);
+  if (closeKind) {
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'cms-facet-x';
+    x.setAttribute('data-close', closeKind);
+    x.setAttribute('aria-label', 'remove ' + text);
+    x.textContent = '×';
+    chip.append(x);
+  }
+  return chip;
+}
+
+// The context header, as facet chips you can peel off. A tag view scoped to a type shows a
+// type chip + a tag chip; closing one keeps the other (Presentations · #science → close
+// #science ⇒ all Presentations; close Presentations ⇒ everything #science).
 function updateContext() {
   const el = $('#context'), iri = currentView, args = currentArgs || {};
-  let label = '';
-  if (iri === 'urn:cms:tags') label = 'All tags';
-  else if (iri === 'urn:cms:types') label = 'Types';
-  else if (iri === 'urn:cms:recent') label = 'Recently viewed';
-  else if (iri === 'urn:cms:search') label = 'Search: ' + (args.q || '');
-  else if (iri.startsWith('urn:cms:type:')) label = TYPE_LABELS[iri.slice(13)] || iri.slice(13);
-  else if (iri.startsWith('urn:cms:view:')) {
-    const tag = iri.slice('urn:cms:view:'.length);
-    label = args.type ? (TYPE_LABELS[args.type] || args.type) + ' tagged #' + tag : 'Tagged #' + tag;
+  el.innerHTML = '';
+  const t = viewType(iri, args);
+  if (iri === 'urn:cms:tags') el.append(facetChip('All tags'));
+  else if (iri === 'urn:cms:types') el.append(facetChip('Types'));
+  else if (iri === 'urn:cms:recent') el.append(facetChip('Recently viewed'));
+  else if (iri === 'urn:cms:search') el.append(facetChip('Search: “' + (args.q || '') + '”', 'search'));
+  else {
+    if (t) el.append(facetChip(TYPE_LABELS[t] || t, 'type', t));
+    if (iri.startsWith('urn:cms:view:')) el.append(facetChip('#' + iri.slice('urn:cms:view:'.length), 'tag'));
   }
-  el.textContent = label;
-  el.hidden = !label;
+  el.hidden = !el.childElementCount;
 }
+
+// Peel off a facet: remove just the one clicked, keep the rest. Closing the sole facet
+// zooms out to the matching index.
+$('#context').addEventListener('click', (e) => {
+  const x = e.target.closest('.cms-facet-x');
+  if (!x) return;
+  const iri = currentView, args = currentArgs || {}, close = x.getAttribute('data-close');
+  const tag = iri.startsWith('urn:cms:view:') ? iri.slice('urn:cms:view:'.length) : null;
+  const type = viewType(iri, args);
+  if (close === 'tag') navigate(type ? 'urn:cms:type:' + type : 'urn:cms:tags');
+  else if (close === 'type') navigate(tag ? 'urn:cms:view:' + tag : 'urn:cms:types');
+  else if (close === 'search') navigate('urn:cms:tags');
+});
 
 // Navigate = render + push a history entry (same URL, just state), so the browser's
 // Back/Forward move between views IN-PAGE. No reload means the WebTransport connection
