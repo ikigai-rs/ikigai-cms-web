@@ -185,8 +185,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 
-    // Serve the reading-room page (dist/) ourselves — no separate `python3 -m http.server`.
-    tokio::spawn(serve_static(dist, page_port));
+    // Serve the reading-room page (dist/) AND an HTTP resolve face (`/r/{iri}`) ourselves —
+    // no separate `python3 -m http.server`, and the same resolution the wire does, over plain
+    // HTTP (so vanilla htmx can drive it). CMS_DEV_OPEN=1 runs the HTTP face under the full
+    // entitlement (localhost dev, ungated) until the cookie-session auth lands; the wire stays
+    // passkey-gated regardless. Default off.
+    let dev_open = std::env::var("CMS_DEV_OPEN").as_deref() == Ok("1");
+    if dev_open {
+        println!("HTTP resolve face: /r/{{iri}} — DEV-OPEN (ungated; localhost only)");
+    }
+    tokio::spawn(serve_http(
+        dist,
+        page_port,
+        Arc::clone(&kernel),
+        Arc::clone(&entitlement),
+        dev_open,
+    ));
 
     let config = ServerConfig::builder()
         .with_bind_default(port)
@@ -209,15 +223,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Serve the reading-room page directory (`dist/`) over plain HTTP on `port`, localhost only
-/// — replacing the separate `python3 -m http.server`. `http://localhost` is a secure context,
-/// so WebTransport and the passkey ceremony work from it. GET-only, no keep-alive/ranges (a
-/// handful of small static files: index.html + cert.json); path traversal is refused.
-async fn serve_static(dist: PathBuf, port: u16) {
+/// Serve the reading room over plain HTTP on `port`, localhost only — replacing the separate
+/// `python3 -m http.server`. Two routes: `/r/{iri}?args` resolves a resource to its fragment
+/// (the same `resolve()` the wire does — so vanilla htmx can drive the room over HTTP), and
+/// everything else is a static file from `dist/`. `http://localhost` is a secure context, so
+/// WebTransport + the passkey ceremony work from it. GET-only, `Connection: close`.
+async fn serve_http(
+    dist: PathBuf,
+    port: u16,
+    kernel: Arc<Kernel>,
+    entitlement: Arc<Vec<String>>,
+    dev_open: bool,
+) {
     let listener = match TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("reading-room page server: cannot bind localhost:{port}: {e}");
+            eprintln!("reading-room server: cannot bind localhost:{port}: {e}");
             eprintln!("  (is the port already in use? set CMS_PORT to a free one)");
             return;
         }
@@ -226,18 +247,26 @@ async fn serve_static(dist: PathBuf, port: u16) {
         match listener.accept().await {
             Ok((sock, _)) => {
                 let dist = dist.clone();
+                let kernel = Arc::clone(&kernel);
+                let entitlement = Arc::clone(&entitlement);
                 tokio::spawn(async move {
-                    let _ = handle_static(sock, &dist).await;
+                    let _ = handle_http(sock, &dist, &kernel, &entitlement, dev_open).await;
                 });
             }
-            Err(e) => eprintln!("page server accept: {e}"),
+            Err(e) => eprintln!("http accept: {e}"),
         }
     }
 }
 
-/// Answer one HTTP GET from `dist/`: read the request head, resolve the (traversal-checked)
-/// path, and write the file (or 404). One request per connection (`Connection: close`).
-async fn handle_static(mut sock: TcpStream, dist: &Path) -> std::io::Result<()> {
+/// Answer one HTTP GET: `/r/{iri}?args` → a resolved fragment; anything else → a `dist/` file
+/// (or 404). One request per connection (`Connection: close`).
+async fn handle_http(
+    mut sock: TcpStream,
+    dist: &Path,
+    kernel: &Kernel,
+    entitlement: &[String],
+    dev_open: bool,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -256,21 +285,28 @@ async fn handle_static(mut sock: TcpStream, dist: &Path) -> std::io::Result<()> 
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
-    let (status, ctype, body) = match safe_rel(request_target) {
-        Some(rel) => match std::fs::read(dist.join(&rel)) {
-            Ok(bytes) => ("200 OK", content_type(&rel), bytes),
-            Err(_) => (
-                "404 Not Found",
+
+    let (status, ctype, body) = if let Some(target) = request_target.strip_prefix("/r/") {
+        // The resource face: resolve `{iri}?args` to its fragment, exactly as the wire does.
+        resolve_http(kernel, entitlement, dev_open, target)
+    } else {
+        match safe_rel(request_target) {
+            Some(rel) => match std::fs::read(dist.join(&rel)) {
+                Ok(bytes) => ("200 OK", content_type(&rel), bytes),
+                Err(_) => (
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found".to_vec(),
+                ),
+            },
+            None => (
+                "400 Bad Request",
                 "text/plain; charset=utf-8",
-                b"not found".to_vec(),
+                b"bad path".to_vec(),
             ),
-        },
-        None => (
-            "400 Bad Request",
-            "text/plain; charset=utf-8",
-            b"bad path".to_vec(),
-        ),
+        }
     };
+
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
          Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
@@ -279,6 +315,73 @@ async fn handle_static(mut sock: TcpStream, dist: &Path) -> std::io::Result<()> 
     sock.write_all(header.as_bytes()).await?;
     sock.write_all(&body).await?;
     sock.flush().await
+}
+
+/// Resolve `/r/{iri}?args` to an HTML fragment via the kernel — the same `resolve()` the wire
+/// runs. The ceiling is the full entitlement under `dev_open` (localhost dev, pre-auth) else
+/// public (so the gated graph resolves to nothing). Args ride as query params. A resolve
+/// error becomes an inline error fragment so htmx swaps something visible.
+fn resolve_http(
+    kernel: &Kernel,
+    entitlement: &[String],
+    dev_open: bool,
+    target: &str,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let (iri_enc, query) = target.split_once('?').unwrap_or((target, ""));
+    let Ok(resource) = Iri::parse(percent_decode(iri_enc)) else {
+        return (
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            b"bad iri".to_vec(),
+        );
+    };
+    let mut request = Request::new(Verb::Source, resource);
+    for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
+        request = request.with_arg(k, ArgRef::Inline(percent_decode(v).into_bytes()));
+    }
+    let cap = if dev_open {
+        Capability::scoped(entitlement.to_vec())
+    } else {
+        Capability::scoped(Vec::<String>::new())
+    };
+    match Resolver::issue_as(kernel, request, &cap) {
+        Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
+        Err(e) => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            format!("<p class=\"cms-error\">{e}</p>").into_bytes(),
+        ),
+    }
+}
+
+/// Minimal percent-decoding for a URL path/query segment (`%XX` and `+`→space).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Resolve an HTTP request-target to a safe relative path under `dist/`: strip the query,
@@ -620,8 +723,50 @@ fn error_reply(msg: &str) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, safe_rel, serve_static};
+    use super::{content_type, resolve_http, safe_rel, serve_http};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A CMS kernel over a temp bookmarks fixture, plus its fs-read entitlement.
+    fn fixture(dir: &std::path::Path) -> (ikigai_core::Kernel, Vec<String>) {
+        let bm = dir.join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bm,
+            "* Bookmarks\n** [[https://sci.example][Science Bookmark]]\n   \
+             :PROPERTIES:\n   :TAGS: science\n   :END:\n",
+        )
+        .unwrap();
+        let kernel = ikigai_cms_web::build_cms_kernel(dir.to_path_buf(), None);
+        let ent = vec![format!("urn:cap:fs:read:{}", dir.display())];
+        (kernel, ent)
+    }
+
+    #[test]
+    fn the_http_resolve_route_renders_under_dev_open_and_gates_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kernel, ent) = fixture(dir.path());
+        // dev-open: resolves under the entitlement → the tag view renders the bookmark.
+        let (status, ctype, body) =
+            resolve_http(&kernel, &ent, true, "urn:cms:view:science?style=catalog");
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, "200 OK");
+        assert!(ctype.contains("text/html"));
+        assert!(
+            body.contains("Science Bookmark"),
+            "dev-open renders the view: {body}"
+        );
+        // Not dev-open: public ceiling → the graph is gated → nothing resolves.
+        let (_s, _c, gated) =
+            resolve_http(&kernel, &ent, false, "urn:cms:view:science?style=catalog");
+        assert!(
+            !String::from_utf8_lossy(&gated).contains("Science Bookmark"),
+            "gated without dev-open (until cookie auth): {}",
+            String::from_utf8_lossy(&gated)
+        );
+        // A malformed IRI → 400.
+        assert_eq!(resolve_http(&kernel, &ent, true, "").0, "400 Bad Request");
+    }
 
     #[test]
     fn safe_rel_defaults_root_and_refuses_traversal() {
@@ -644,14 +789,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_page_server_serves_dist_and_404s_the_rest() {
+    async fn the_page_server_serves_dist_resolves_r_and_404s_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<h1>reading room</h1>").unwrap();
+        let (kernel, ent) = fixture(dir.path());
         // A free ephemeral port.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        tokio::spawn(serve_static(dir.path().to_path_buf(), port));
+        tokio::spawn(serve_http(
+            dir.path().to_path_buf(),
+            port,
+            Arc::new(kernel),
+            Arc::new(ent),
+            true, // dev-open, so /r/ resolves under the entitlement
+        ));
 
         async fn get(port: u16, target: &str) -> String {
             // retry until the server is listening
@@ -676,6 +828,14 @@ mod tests {
         assert!(root.contains("200 OK"), "root serves index.html: {root}");
         assert!(root.contains("reading room"), "body: {root}");
         assert!(root.contains("text/html"), "content-type: {root}");
+
+        // The resource face: /r/{iri} resolves the same fragment the wire would.
+        let view = get(port, "/r/urn:cms:view:science?style=catalog").await;
+        assert!(view.contains("200 OK"), "/r/ resolves: {view}");
+        assert!(
+            view.contains("Science Bookmark"),
+            "/r/ renders the tag view over HTTP: {view}"
+        );
 
         assert!(
             get(port, "/nope.html").await.contains("404"),
