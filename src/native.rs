@@ -373,6 +373,14 @@ fn sparql_lit(s: &str) -> String {
 /// the type view and a tag view's `type` scope resolve through it, so they can't disagree.
 /// (They did: a missing `presentation` arm made a scoped tag view silently drop its filter
 /// while the header still said "Presentations".)
+///
+/// ADDING A CONTENT TYPE means updating, in lockstep:
+/// 1. this map, plus a graph source that types the resource `a cms:{Class}`;
+/// 2. `TYPE_LABELS` in `dist/index.html` (the browser's display label + facet chip);
+/// 3. a **colour rule** `.cms-card[data-kind="{slug}"]` (+ dark variant) in `dist/index.html`.
+///    The card *rendering* is generic — every card carries a `cms:kind` slug (see
+///    `KIND_CONSTRUCT`) that the stylesheets turn into `data-kind`, so only the colour is
+///    per-type; a new type with no rule just shows no accent until you add one.
 fn cms_class(ty: &str) -> Option<&'static str> {
     match ty {
         "book" => Some("Book"),
@@ -381,6 +389,15 @@ fn cms_class(ty: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Emit each card's kind as a lowercased slug (`cms:kind "presentation"`) so the stylesheets
+/// can tag it `data-kind` for per-type colouring — with no per-type logic in the SPARQL or
+/// the XSLT (the slug is derived from whatever `cms:` type the resource carries). Appended to
+/// the card views' CONSTRUCT/WHERE. Requires `PREFIX cms:` on the query.
+const KIND_CONSTRUCT: &str = " ; cms:kind ?kind";
+const KIND_WHERE: &str = " OPTIONAL { ?s a ?kt . \
+    FILTER(STRSTARTS(STR(?kt), \"https://ikigai-rs.dev/ns/cms#\")) \
+    BIND(LCASE(REPLACE(STR(?kt), \"^.*#\", \"\")) AS ?kind) }";
 
 /// The validated card stylesheet from the `style` arg — only shipped card themes are
 /// honored (never resolve an arbitrary `urn:cms:style:*` off a client string).
@@ -565,10 +582,11 @@ impl Endpoint for TagView {
         // full data — LIMIT/OFFSET on triples would slice a card in half.
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
+             PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?st WHERE {{ {type_filter}?s dc:subject \"{safe}\" ; dc:title ?st }} \
                          ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
-                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }} }}"
+                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
     }
@@ -613,12 +631,13 @@ impl Endpoint for SearchView {
         );
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
+             PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s dc:title ?t ; dc:identifier ?u . \
                  FILTER(CONTAINS(LCASE(?t), LCASE(\"{safe}\"))) \
              }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
     }
@@ -689,11 +708,11 @@ impl Endpoint for TypeView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c }} \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
              WHERE {{ {{ SELECT DISTINCT ?s ?t ?u WHERE {{ \
                  ?s a cms:{class} ; dc:title ?t ; dc:identifier ?u . \
              }} ORDER BY {order} LIMIT {PAGE_SIZE} OFFSET {offset} }} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
         render_page(inv, count_query, query, card_style(inv), offset).await
     }
@@ -1136,6 +1155,11 @@ mod tests {
         assert!(
             all.contains("Science Bookmark") && all.contains("Science Talk"),
             "unscoped shows both: {all}"
+        );
+        // Each card carries its kind (cms:kind → data-kind) for per-type colouring.
+        assert!(
+            all.contains("data-kind='presentation'") && all.contains("data-kind='bookmark'"),
+            "cards are tagged by kind: {all}"
         );
         // Scoped to presentation: ONLY the presentation (the fix).
         let as_pres = resolve_html(

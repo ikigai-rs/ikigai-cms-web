@@ -45,6 +45,26 @@
   .cms-page-off { opacity:.38; cursor:default; }
   .cms-page-off:hover { border-color:var(--line); color:var(--fg); }
   .cms-page-info { color:var(--mut); font-size:13px; }
+  /* Per-type accent: each card carries data-kind (a cms:kind slug); the kind label + a left
+     rule are tinted by kind. The facet chip for a type is tinted to match its cards.
+     ADDING A TYPE → add a colour pair below (+ its dark variant), plus cms_class and
+     TYPE_LABELS. The rendering is generic, so a new kind with no rule just shows no accent. */
+  .cms-kind { display:block; font-size:10.5px; letter-spacing:.1em; text-transform:capitalize; font-weight:700; color:var(--mut); margin-bottom:1px; }
+  .cms-card[data-kind] { border-left-style:solid; border-left-width:3px; }
+  .cms-card[data-kind="bookmark"] { border-left-color:#3f6ea8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#3f6ea8; }
+  .cms-card[data-kind="book"] { border-left-color:#9e7b33; } .cms-card[data-kind="book"] .cms-kind { color:#9e7b33; }
+  .cms-card[data-kind="presentation"] { border-left-color:#b0563f; } .cms-card[data-kind="presentation"] .cms-kind { color:#b0563f; }
+  .cms-facet-type[data-cms-type="bookmark"] { border-color:#3f6ea8; color:#3f6ea8; }
+  .cms-facet-type[data-cms-type="book"] { border-color:#9e7b33; color:#9e7b33; }
+  .cms-facet-type[data-cms-type="presentation"] { border-color:#b0563f; color:#b0563f; }
+  @media (prefers-color-scheme: dark) {
+    .cms-card[data-kind="bookmark"] { border-left-color:#7ba6d8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#7ba6d8; }
+    .cms-card[data-kind="book"] { border-left-color:#c7a35e; } .cms-card[data-kind="book"] .cms-kind { color:#c7a35e; }
+    .cms-card[data-kind="presentation"] { border-left-color:#d38a72; } .cms-card[data-kind="presentation"] .cms-kind { color:#d38a72; }
+    .cms-facet-type[data-cms-type="bookmark"] { border-color:#7ba6d8; color:#7ba6d8; }
+    .cms-facet-type[data-cms-type="book"] { border-color:#c7a35e; color:#c7a35e; }
+    .cms-facet-type[data-cms-type="presentation"] { border-color:#d38a72; color:#d38a72; }
+  }
 </style>
 </head>
 <body>
