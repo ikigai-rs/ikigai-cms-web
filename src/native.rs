@@ -1015,14 +1015,27 @@ mod tests {
             "* Bookmarks\n** [[https://x][X]]\n   :PROPERTIES:\n   :TAGS: misc\n   :END:\n",
         )
         .unwrap();
-        // A deck under a venue path → a free `#uberconf` tag, plus an authored topic tag.
+        // A deck under a venue path → a free `#uberconf` tag, plus an authored topic tag
+        // from its built JSON-LD (`genomics`). The title slide's H1 supplies the title; its
+        // `.tag` span is deliberately NOT read (that's presentation, not semantics).
         let pres = tempfile::tempdir().unwrap();
         let deck = pres.path().join("conferences/nfjs/uberconf/2026/quant-bio");
         std::fs::create_dir_all(deck.join("slides")).unwrap();
+        std::fs::create_dir_all(deck.join("dist")).unwrap();
         std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").unwrap();
         std::fs::write(
             deck.join("slides/00-title.md"),
-            "# Quantitative Biology\n\n<span class=\"tag ink\">genomics</span>\n",
+            "# Quantitative Biology\n\n<span class=\"tag ink\">ignored-span</span>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            deck.join("dist/index.html"),
+            "<script type=\"application/ld+json\">{\
+             \"@context\":{\"dc\":\"http://purl.org/dc/elements/1.1/\",\
+             \"cms\":\"https://ikigai-rs.dev/ns/cms#\",\"title\":\"dc:title\",\
+             \"tags\":{\"@id\":\"dc:subject\",\"@container\":\"@set\"}},\
+             \"@type\":\"cms:Presentation\",\"title\":\"Quantitative Biology\",\
+             \"tags\":[\"genomics\"]}</script>",
         )
         .unwrap();
 
@@ -1051,11 +1064,20 @@ mod tests {
             by_venue.contains("Quantitative Biology"),
             "deck reachable by #uberconf: {by_venue}"
         );
-        // And an authored topic tag works too.
+        // An authored (JSON-LD) topic tag reaches it; the ignored `.tag` span does not.
         let by_tag = resolve_html(&kernel, "urn:cms:view:genomics", &[("style", "catalog")]);
         assert!(
             by_tag.contains("Quantitative Biology"),
-            "deck reachable by an authored tag: {by_tag}"
+            "deck reachable by its authored JSON-LD tag: {by_tag}"
+        );
+        let by_span = resolve_html(
+            &kernel,
+            "urn:cms:view:ignored-span",
+            &[("style", "catalog")],
+        );
+        assert!(
+            !by_span.contains("Quantitative Biology"),
+            "the .tag span must NOT be a browsable tag: {by_span}"
         );
     }
 
