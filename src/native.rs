@@ -497,6 +497,15 @@ fn order_by(inv: &Invocation<'_>, var: &str) -> String {
     }
 }
 
+/// The sort direction arg normalized to `"desc"` or `"asc"` (default) — for the view hx-vals.
+fn dir_arg(inv: &Invocation<'_>) -> &'static str {
+    if inv.inline_str("dir") == Ok("desc") {
+        "desc"
+    } else {
+        "asc"
+    }
+}
+
 /// A paginated resource subquery `{ SELECT {vars} … }` yielding the page
 /// `[offset, offset+PAGE_SIZE)` of DISTINCT resources matching `body`, ordered by `order`.
 ///
@@ -534,10 +543,11 @@ async fn count_resources(inv: &Invocation<'_>, query: String) -> Result<usize> {
         .unwrap_or(0))
 }
 
-/// The first/prev/next/last pager appended under a page of cards. Buttons carry the target
-/// `offset` (the browser re-issues the same view with it); an edge that doesn't exist renders
-/// as a dimmed span so the row stays put. Empty when it all fits on one page.
-fn pager_html(offset: usize, total: usize) -> String {
+/// The first/prev/next/last pager appended under a page of cards. Each live control is an
+/// htmx `hx-get` to `/r/{iri}?offset={target}` (the other args — style/dir/type/q — ride the
+/// enclosing view's inherited `hx-vals`, so paging preserves them); an edge that doesn't exist
+/// renders as a dimmed span. Empty when it all fits on one page.
+fn pager_html(iri: &str, offset: usize, total: usize) -> String {
     if total <= PAGE_SIZE {
         return String::new();
     }
@@ -546,10 +556,12 @@ fn pager_html(offset: usize, total: usize) -> String {
     let last = (total - 1) / PAGE_SIZE * PAGE_SIZE; // offset of the final page
     let at_start = offset == 0;
     let at_end = end >= total;
-    // One pager control: a live button that jumps to `target`, or a dimmed span at an edge.
+    // One pager control: a live htmx button that jumps to `target`, or a dimmed span at an edge.
     let ctl = |avail: bool, target: usize, label: &str| {
         if avail {
-            format!("<button class=\"cms-page\" data-offset=\"{target}\">{label}</button>")
+            format!(
+                "<button class=\"cms-page\" hx-get=\"/r/{iri}?offset={target}\">{label}</button>"
+            )
         } else {
             format!("<span class=\"cms-page cms-page-off\">{label}</span>")
         }
@@ -566,14 +578,45 @@ fn pager_html(offset: usize, total: usize) -> String {
     nav
 }
 
-/// Render one page of a card view: the page's CONSTRUCT through the stylesheet, then a
-/// pager sized from `count_query`. Shared by the tag, search, and type views — the
-/// pagination is uniform, the query differs.
+/// The identity + args of the view being rendered — its public IRI (for the pager/controls)
+/// and the current `style`/`dir`/`type`/`q`. Emitted as an inheritable `hx-vals` on the view
+/// wrapper, so every htmx control inside (tag chips, pager) carries the same context without
+/// baking it into each link.
+struct ViewCtx<'a> {
+    iri: &'a str,
+    style: &'a str,
+    dir: &'a str,
+    type_scope: Option<&'a str>,
+    q: Option<&'a str>,
+}
+
+/// The view context as an HTML-attribute-escaped JSON object for `hx-vals`.
+fn view_hxvals(ctx: &ViewCtx<'_>) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert("style".into(), ctx.style.into());
+    m.insert("dir".into(), ctx.dir.into());
+    if let Some(t) = ctx.type_scope {
+        m.insert("type".into(), t.into());
+    }
+    if let Some(q) = ctx.q {
+        m.insert("q".into(), q.into());
+    }
+    serde_json::Value::Object(m)
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Render one page of a card view: a wrapper carrying the view context as `hx-vals`, the
+/// page's CONSTRUCT through the stylesheet, then an htmx pager sized from `count_query`.
+/// Shared by the tag, search, and type views — the pagination is uniform, the query differs.
 async fn render_page(
     inv: &Invocation<'_>,
+    ctx: &ViewCtx<'_>,
     count_query: String,
     construct_query: String,
-    style: &str,
     offset: usize,
 ) -> Result<Representation> {
     let total = count_resources(inv, count_query).await?;
@@ -582,11 +625,16 @@ async fn render_page(
         "urn:sparql:construct",
         construct_query,
         "rdfxml",
-        style,
+        ctx.style,
     )
     .await?;
-    let mut html = cards.bytes;
-    html.extend_from_slice(pager_html(offset, total).as_bytes());
+    // The wrapper's hx-vals is inherited by every control the fragment swaps into #room, so a
+    // tag click or a page step keeps the current style/dir/type/q.
+    let mut html =
+        format!("<div class=\"cms-view\" hx-vals=\"{}\">", view_hxvals(ctx)).into_bytes();
+    html.extend_from_slice(&cards.bytes);
+    html.extend_from_slice(pager_html(ctx.iri, offset, total).as_bytes());
+    html.extend_from_slice(b"</div>");
     Ok(Representation::new(
         ReprType::new("text/html").with_param("charset", "utf-8"),
         html,
@@ -636,7 +684,15 @@ impl Endpoint for TagView {
              WHERE {{ {paged} \
                       ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
-        render_page(inv, count_query, query, card_style(inv), offset).await
+        let view_iri = format!("urn:cms:view:{tag}");
+        let ctx = ViewCtx {
+            iri: &view_iri,
+            style: card_style(inv),
+            dir: dir_arg(inv),
+            type_scope: inv.inline_str("type").ok(),
+            q: None,
+        };
+        render_page(inv, &ctx, count_query, query, offset).await
     }
 
     fn name(&self) -> &str {
@@ -690,7 +746,14 @@ impl Endpoint for SearchView {
              WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
-        render_page(inv, count_query, query, card_style(inv), offset).await
+        let ctx = ViewCtx {
+            iri: "urn:cms:search",
+            style: card_style(inv),
+            dir: dir_arg(inv),
+            type_scope: None,
+            q: Some(q),
+        };
+        render_page(inv, &ctx, count_query, query, offset).await
     }
 
     fn name(&self) -> &str {
@@ -769,7 +832,15 @@ impl Endpoint for TypeView {
              WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
         );
-        render_page(inv, count_query, query, card_style(inv), offset).await
+        let view_iri = format!("urn:cms:type:{ty}");
+        let ctx = ViewCtx {
+            iri: &view_iri,
+            style: card_style(inv),
+            dir: dir_arg(inv),
+            type_scope: None,
+            q: None,
+        };
+        render_page(inv, &ctx, count_query, query, offset).await
     }
 
     fn name(&self) -> &str {
@@ -998,44 +1069,57 @@ mod tests {
 
     #[test]
     fn the_pager_reflects_position_in_the_result_set() {
+        let iri = "urn:cms:view:x";
         // Fits on one page → no pager at all.
-        assert_eq!(pager_html(0, PAGE_SIZE), "");
-        assert_eq!(pager_html(0, 5), "");
-        // First page of many: first+prev dimmed, next+last live, range shown.
-        let first = pager_html(0, 200);
+        assert_eq!(pager_html(iri, 0, PAGE_SIZE), "");
+        assert_eq!(pager_html(iri, 0, 5), "");
+        // First page of many: first+prev dimmed, next+last live (htmx hx-get), range shown.
+        let first = pager_html(iri, 0, 200);
         assert!(
             first.contains("cms-page cms-page-off\">« first")
                 && first.contains("cms-page cms-page-off\">‹ prev"),
             "first + prev disabled on page 1: {first}"
         );
         assert!(
-            first.contains(&format!("data-offset=\"{PAGE_SIZE}\">next")),
-            "next jumps a page: {first}"
+            first.contains(&format!("hx-get=\"/r/{iri}?offset={PAGE_SIZE}\">next")),
+            "next jumps a page over htmx: {first}"
         );
         // last-page offset for 200 items at size 60 → 180.
         assert!(
-            first.contains("data-offset=\"180\">last »"),
+            first.contains(&format!("hx-get=\"/r/{iri}?offset=180\">last »")),
             "last jumps to the final page: {first}"
         );
         assert!(first.contains(&format!("1–{PAGE_SIZE} of 200")), "{first}");
         // A middle page: every edge live (first→0, prev→0, next→120, last→180).
-        let mid = pager_html(PAGE_SIZE, 200);
-        assert!(mid.contains("data-offset=\"0\">« first"), "{mid}");
-        assert!(mid.contains("data-offset=\"0\">‹ prev"), "{mid}");
+        let mid = pager_html(iri, PAGE_SIZE, 200);
         assert!(
-            mid.contains(&format!("data-offset=\"{}\">next", PAGE_SIZE * 2)),
+            mid.contains(&format!("hx-get=\"/r/{iri}?offset=0\">« first")),
             "{mid}"
         );
-        assert!(mid.contains("data-offset=\"180\">last »"), "{mid}");
+        assert!(
+            mid.contains(&format!("hx-get=\"/r/{iri}?offset=0\">‹ prev")),
+            "{mid}"
+        );
+        assert!(
+            mid.contains(&format!(
+                "hx-get=\"/r/{iri}?offset={}\">next",
+                PAGE_SIZE * 2
+            )),
+            "{mid}"
+        );
+        assert!(
+            mid.contains(&format!("hx-get=\"/r/{iri}?offset=180\">last »")),
+            "{mid}"
+        );
         // The last page: next+last dimmed, first live.
-        let last = pager_html(180, 200);
+        let last = pager_html(iri, 180, 200);
         assert!(
             last.contains("cms-page cms-page-off\">next")
                 && last.contains("cms-page cms-page-off\">last »"),
             "next + last disabled on the last page: {last}"
         );
         assert!(
-            last.contains("data-offset=\"0\">« first"),
+            last.contains(&format!("hx-get=\"/r/{iri}?offset=0\">« first")),
             "first live: {last}"
         );
         assert!(last.contains("181–200 of 200"), "{last}");
@@ -1068,8 +1152,10 @@ mod tests {
             "range on page 1: {p1}"
         );
         assert!(
-            p1.contains(&format!("data-offset=\"{PAGE_SIZE}\">next")),
-            "next offered"
+            p1.contains(&format!(
+                "hx-get=\"/r/urn:cms:view:paged?offset={PAGE_SIZE}\">next"
+            )),
+            "next offered over htmx: {p1}"
         );
         assert!(
             p1.contains("cms-page cms-page-off\">‹ prev"),
@@ -1089,8 +1175,13 @@ mod tests {
             "page 2 is the remainder"
         );
         assert!(
-            p2.contains("data-offset=\"0\">‹ prev"),
+            p2.contains("hx-get=\"/r/urn:cms:view:paged?offset=0\">‹ prev"),
             "prev back to page 1: {p2}"
+        );
+        // The fragment carries the view context as an inherited hx-vals wrapper.
+        assert!(
+            p2.contains("class=\"cms-view\" hx-vals="),
+            "context wrapper: {p2}"
         );
         assert!(
             p2.contains("cms-page cms-page-off\">next"),
