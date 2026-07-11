@@ -6,17 +6,26 @@
 //! behind the fs-read cap, so the room is gated), and a verified passkey raises it to
 //! the credential's entitlement (rung 3a's `dispatch` clamp then enforces it).
 //!
-//! The WebAuthn ceremony rides over the same wire as `urn:auth:*` resources, intercepted
-//! here by the session layer (not the kernel). It binds to the *page* origin (where
-//! `navigator.credentials` runs, default `http://localhost:8080`), configurable via
-//! `CMS_RP_ID` / `CMS_RP_ORIGIN`; the `{Passkey → scopes}` store persists through the OS
-//! keystore (macOS Keychain via `ikigai-secret`), not a plaintext file.
+//! The same reading room is also served over plain **HTTP** on the page port (so vanilla htmx
+//! can drive it): `/r/{iri}?args` resolves a fragment under the caller's session capability,
+//! `/auth/*` runs the passkey ceremony, and a `cms_session` cookie carries the granted
+//! entitlement between requests. Both faces reuse the one transport-agnostic [`Rp`], so the room
+//! is passkey-gated identically over the wire and over HTTP (`CMS_DEV_OPEN=1` ungates the HTTP
+//! face for localhost dev).
+//!
+//! The WebAuthn ceremony binds to the *page* origin (where `navigator.credentials` runs, default
+//! `http://localhost:8080`), configurable via `CMS_RP_ID` / `CMS_RP_ORIGIN`; the
+//! `{Passkey → scopes}` store persists through the OS keystore (macOS Keychain via
+//! `ikigai-secret`), not a plaintext file.
 //!
 //! Run: `cargo run --features server --bin cms-server -- [port] [src_dir]`
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use uuid::Uuid;
 
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, Verb};
 use ikigai_resolve::{CacheStatus, Resolver};
@@ -185,11 +194,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 
-    // Serve the reading-room page (dist/) AND an HTTP resolve face (`/r/{iri}`) ourselves —
-    // no separate `python3 -m http.server`, and the same resolution the wire does, over plain
-    // HTTP (so vanilla htmx can drive it). CMS_DEV_OPEN=1 runs the HTTP face under the full
-    // entitlement (localhost dev, ungated) until the cookie-session auth lands; the wire stays
-    // passkey-gated regardless. Default off.
+    // The HTTP session table: the passkey ceremony + cookie sessions for the HTTP face, so the
+    // room is passkey-gated over HTTP just as it is over the wire (both reuse the same `rp`).
+    let http_auth = Arc::new(HttpAuth::default());
+
+    // Serve the reading-room page (dist/), an HTTP resolve face (`/r/{iri}`), AND the passkey
+    // ceremony (`/auth/*`) ourselves — no separate `python3 -m http.server`, the same resolution
+    // the wire does, over plain HTTP (so vanilla htmx can drive it). A finished login grants the
+    // session the room entitlement; unauthenticated requests resolve public (the gated graph →
+    // nothing). CMS_DEV_OPEN=1 elevates the HTTP face to the full entitlement without login
+    // (localhost dev only); the wire stays passkey-gated regardless. Default off.
     let dev_open = std::env::var("CMS_DEV_OPEN").as_deref() == Ok("1");
     if dev_open {
         println!("HTTP resolve face: /r/{{iri}} — DEV-OPEN (ungated; localhost only)");
@@ -198,6 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dist,
         page_port,
         Arc::clone(&kernel),
+        Arc::clone(&rp),
+        Arc::clone(&http_auth),
+        Arc::clone(&recent),
         Arc::clone(&entitlement),
         dev_open,
     ));
@@ -223,15 +240,286 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// One HTTP session, keyed by the `cms_session` cookie. It starts unauthenticated — it may
+/// hold only an in-flight passkey ceremony — and a finished login fills in `scopes` (the
+/// granted entitlement the room resolves under) and the `principal` the recency trail is keyed
+/// to. In memory only: a server restart clears every session (re-login), which suits a
+/// short-lived single-user room. The HTTP analogue of the wire's per-connection [`Session`].
+#[derive(Default)]
+struct HttpSession {
+    scopes: Option<Vec<String>>,
+    principal: Option<String>,
+    pending: Option<Pending>,
+}
+
+/// A WebAuthn ceremony held between its `start` and `finish` HTTP requests (the wire holds the
+/// equivalent on the connection; HTTP is stateless, so it lives in the session table instead).
+enum Pending {
+    Login(PasskeyAuthentication),
+    Register(PasskeyRegistration),
+}
+
+/// The HTTP session table: `cms_session` cookie → [`HttpSession`]. A single-user reading room,
+/// so lock contention is nil; the mutex is held only for the brief lookup/mutate, never across
+/// a resolve or socket I/O.
+#[derive(Default)]
+struct HttpAuth {
+    sessions: Mutex<HashMap<String, HttpSession>>,
+}
+
+/// The three things we need off a request line + headers: the method, the target, the cookie
+/// jar, and the body length. Everything else is ignored.
+struct ReqHead {
+    method: String,
+    target: String,
+    cookies: HashMap<String, String>,
+    content_length: usize,
+}
+
+/// Parse the request head (everything before the blank line) into a [`ReqHead`]. Header names
+/// are matched case-insensitively; only `Cookie` and `Content-Length` are read.
+fn parse_head(head: &str) -> ReqHead {
+    let mut lines = head.lines();
+    let first = lines.next().unwrap_or("");
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let target = parts.next().unwrap_or("/").to_string();
+    let mut cookies = HashMap::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some(v) = header_val(line, "cookie") {
+            for kv in v.split(';') {
+                if let Some((k, val)) = kv.trim().split_once('=') {
+                    cookies.insert(k.trim().to_string(), val.trim().to_string());
+                }
+            }
+        } else if let Some(v) = header_val(line, "content-length") {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    ReqHead {
+        method,
+        target,
+        cookies,
+        content_length,
+    }
+}
+
+/// The value of header `name` on `line` (`Name: value`), or `None` if it's a different header.
+fn header_val<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (k, v) = line.split_once(':')?;
+    k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+}
+
+/// The capability a `/r/` request resolves under, plus the principal to attribute its recency
+/// to. An authenticated session grants its stored scopes; otherwise the room is public (empty
+/// cap → the gated graph resolves to nothing), unless `dev_open` elevates localhost dev to the
+/// full entitlement. The lock is released before the caller resolves.
+fn session_cap(
+    auth: &HttpAuth,
+    sid: Option<&str>,
+    entitlement: &[String],
+    dev_open: bool,
+) -> (Capability, Option<String>) {
+    if let Some(sid) = sid {
+        let sessions = auth.sessions.lock().unwrap();
+        if let Some(sess) = sessions.get(sid) {
+            if let Some(scopes) = &sess.scopes {
+                return (Capability::scoped(scopes.clone()), sess.principal.clone());
+            }
+        }
+    }
+    if dev_open {
+        (Capability::scoped(entitlement.to_vec()), None)
+    } else {
+        (Capability::scoped(Vec::<String>::new()), None)
+    }
+}
+
+/// The `Set-Cookie` value for the session cookie. `HttpOnly` (no JS access) + `SameSite=Strict`
+/// (only same-origin requests carry it). No `Secure` — the room is served over `http://localhost`
+/// (a secure context, but not HTTPS); add `Secure` once it moves behind TLS/WebTransport.
+fn session_cookie(id: &str) -> String {
+    format!("cms_session={id}; Path=/; HttpOnly; SameSite=Strict")
+}
+
+/// The passkey ceremony over HTTP: `POST /auth/{login,register}/{start,finish}`, `POST
+/// /auth/logout`, `GET /auth/status`. Reuses the transport-agnostic [`Rp`] (same verifier, same
+/// Touch-ID enroll gate as the wire). The in-flight ceremony state lives in the session table,
+/// keyed by the `cms_session` cookie minted on `start`; a finished login stores the granted
+/// entitlement there. Returns `(status, content-type, body, Set-Cookie?)`.
+#[allow(clippy::too_many_arguments)]
+fn http_auth(
+    route: &str,
+    method: &str,
+    body: &[u8],
+    sid: Option<&str>,
+    rp: &Rp,
+    auth: &HttpAuth,
+    entitlement: &[String],
+    dev_open: bool,
+) -> (&'static str, &'static str, Vec<u8>, Option<String>) {
+    let json = "application/json; charset=utf-8";
+    let err = |m: &str| {
+        (
+            "200 OK",
+            json,
+            serde_json::json!({ "error": m }).to_string().into_bytes(),
+            None,
+        )
+    };
+    // `status` is a GET; every other auth route is a POST.
+    if route == "status" {
+        let (authed, principal) = match sid {
+            Some(sid) => {
+                let sessions = auth.sessions.lock().unwrap();
+                match sessions.get(sid) {
+                    Some(s) if s.scopes.is_some() => (true, s.principal.clone()),
+                    _ => (false, None),
+                }
+            }
+            None => (false, None),
+        };
+        let body = serde_json::json!({
+            "authenticated": authed,
+            "principal": principal,
+            "enrolled": rp.is_enrolled(),
+            "dev_open": dev_open,
+        });
+        return ("200 OK", json, body.to_string().into_bytes(), None);
+    }
+    if method != "POST" {
+        return ("405 Method Not Allowed", json, b"{}".to_vec(), None);
+    }
+    match route {
+        "login/start" => match rp.login_start() {
+            Ok((challenge, state)) => {
+                let (id, set) = ensure_session(auth, sid);
+                auth.sessions.lock().unwrap().get_mut(&id).unwrap().pending =
+                    Some(Pending::Login(state));
+                ("200 OK", json, challenge.into_bytes(), set)
+            }
+            Err(e) => err(&e),
+        },
+        "login/finish" => {
+            let Some(sid) = sid else {
+                return err("no session");
+            };
+            let state = {
+                let mut sessions = auth.sessions.lock().unwrap();
+                match sessions.get_mut(sid).and_then(|s| s.pending.take()) {
+                    Some(Pending::Login(state)) => state,
+                    other => {
+                        // put a non-login pending back so a concurrent register isn't lost
+                        if let (Some(s), Some(p)) = (sessions.get_mut(sid), other) {
+                            s.pending = Some(p);
+                        }
+                        return err("no login in progress");
+                    }
+                }
+            };
+            match rp.login_finish(body, &state) {
+                // Grant the CURRENT server entitlement (not the scopes frozen at registration):
+                // the room-wide grant grows as sources are added, and this is a single-user room.
+                Ok((_stored, principal)) => {
+                    let mut sessions = auth.sessions.lock().unwrap();
+                    if let Some(s) = sessions.get_mut(sid) {
+                        s.scopes = Some(entitlement.to_vec());
+                        s.principal = Some(principal);
+                    }
+                    ("200 OK", json, br#"{"ok":true}"#.to_vec(), None)
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "register/start" => {
+            if rp.is_enrolled() {
+                return err("registration closed: a passkey is already enrolled");
+            }
+            let name = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v["name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "ikigai".to_string());
+            match rp.register_start(&name) {
+                Ok((challenge, state)) => {
+                    let (id, set) = ensure_session(auth, sid);
+                    auth.sessions.lock().unwrap().get_mut(&id).unwrap().pending =
+                        Some(Pending::Register(state));
+                    ("200 OK", json, challenge.into_bytes(), set)
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "register/finish" => {
+            if rp.is_enrolled() {
+                return err("registration closed");
+            }
+            let Some(sid) = sid else {
+                return err("no session");
+            };
+            let state = {
+                let mut sessions = auth.sessions.lock().unwrap();
+                match sessions.get_mut(sid).and_then(|s| s.pending.take()) {
+                    Some(Pending::Register(state)) => state,
+                    other => {
+                        if let (Some(s), Some(p)) = (sessions.get_mut(sid), other) {
+                            s.pending = Some(p);
+                        }
+                        return err("no registration in progress");
+                    }
+                }
+            };
+            // Touch-ID gate lives inside register_finish (someone must be at the server box).
+            match rp.register_finish(body, &state, entitlement.to_vec()) {
+                Ok(()) => ("200 OK", json, br#"{"ok":true}"#.to_vec(), None),
+                Err(e) => err(&e),
+            }
+        }
+        "logout" => {
+            if let Some(sid) = sid {
+                auth.sessions.lock().unwrap().remove(sid);
+            }
+            // Expire the cookie (Max-Age=0) so the browser drops it.
+            (
+                "200 OK",
+                json,
+                br#"{"ok":true}"#.to_vec(),
+                Some("cms_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".to_string()),
+            )
+        }
+        other => err(&format!("unknown auth route `{other}`")),
+    }
+}
+
+/// Look up the session for `sid`, or mint a fresh one. Returns its id and, when newly minted, a
+/// `Set-Cookie` to send so the browser carries it on the follow-up `finish` request.
+fn ensure_session(auth: &HttpAuth, sid: Option<&str>) -> (String, Option<String>) {
+    let mut sessions = auth.sessions.lock().unwrap();
+    if let Some(sid) = sid {
+        if sessions.contains_key(sid) {
+            return (sid.to_string(), None);
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    sessions.insert(id.clone(), HttpSession::default());
+    let cookie = session_cookie(&id);
+    (id, Some(cookie))
+}
+
 /// Serve the reading room over plain HTTP on `port`, localhost only — replacing the separate
-/// `python3 -m http.server`. Two routes: `/r/{iri}?args` resolves a resource to its fragment
-/// (the same `resolve()` the wire does — so vanilla htmx can drive the room over HTTP), and
-/// everything else is a static file from `dist/`. `http://localhost` is a secure context, so
-/// WebTransport + the passkey ceremony work from it. GET-only, `Connection: close`.
+/// `python3 -m http.server`. Routes: `/r/{iri}?args` resolves a resource to its fragment under
+/// the caller's session capability (the same `resolve()` the wire does — so vanilla htmx can
+/// drive the room over HTTP); `/auth/*` runs the passkey ceremony; everything else is a static
+/// file from `dist/`. `http://localhost` is a secure context, so WebTransport + the passkey
+/// ceremony work from it. One request per connection (`Connection: close`).
+#[allow(clippy::too_many_arguments)]
 async fn serve_http(
     dist: PathBuf,
     port: u16,
     kernel: Arc<Kernel>,
+    rp: Arc<Rp>,
+    auth: Arc<HttpAuth>,
+    recent: Arc<RecentLog>,
     entitlement: Arc<Vec<String>>,
     dev_open: bool,
 ) {
@@ -248,9 +536,22 @@ async fn serve_http(
             Ok((sock, _)) => {
                 let dist = dist.clone();
                 let kernel = Arc::clone(&kernel);
+                let rp = Arc::clone(&rp);
+                let auth = Arc::clone(&auth);
+                let recent = Arc::clone(&recent);
                 let entitlement = Arc::clone(&entitlement);
                 tokio::spawn(async move {
-                    let _ = handle_http(sock, &dist, &kernel, &entitlement, dev_open).await;
+                    let _ = handle_http(
+                        sock,
+                        &dist,
+                        &kernel,
+                        &rp,
+                        &auth,
+                        &recent,
+                        &entitlement,
+                        dev_open,
+                    )
+                    .await;
                 });
             }
             Err(e) => eprintln!("http accept: {e}"),
@@ -258,39 +559,68 @@ async fn serve_http(
     }
 }
 
-/// Answer one HTTP GET: `/r/{iri}?args` → a resolved fragment; anything else → a `dist/` file
-/// (or 404). One request per connection (`Connection: close`).
+/// Answer one HTTP request. `/r/{iri}?args` → a fragment resolved under the caller's session
+/// capability; `/auth/*` → the passkey ceremony; anything else → a `dist/` file (or 404). One
+/// request per connection (`Connection: close`).
+#[allow(clippy::too_many_arguments)]
 async fn handle_http(
     mut sock: TcpStream,
     dist: &Path,
     kernel: &Kernel,
+    rp: &Rp,
+    auth: &HttpAuth,
+    recent: &RecentLog,
     entitlement: &[String],
     dev_open: bool,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
-    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+    // Read up to the end of the headers (the blank line).
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             return Ok(());
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 16 * 1024 {
+        if buf.len() > 64 * 1024 {
+            return Ok(());
+        }
+    };
+    let req = parse_head(&String::from_utf8_lossy(&buf[..header_end]));
+    // Read the body (POST) up to Content-Length.
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < req.content_length {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+        if body.len() > 256 * 1024 {
             break;
         }
     }
-    let head = String::from_utf8_lossy(&buf);
-    let request_target = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let sid = req.cookies.get("cms_session").map(String::as_str);
 
-    let (status, ctype, body) = if let Some(target) = request_target.strip_prefix("/r/") {
-        // The resource face: resolve `{iri}?args` to its fragment, exactly as the wire does.
-        resolve_http(kernel, entitlement, dev_open, target)
+    let (status, ctype, out, set_cookie) = if let Some(route) = req.target.strip_prefix("/auth/") {
+        http_auth(
+            route,
+            &req.method,
+            &body,
+            sid,
+            rp,
+            auth,
+            entitlement,
+            dev_open,
+        )
+    } else if let Some(target) = req.target.strip_prefix("/r/") {
+        let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
+        let (s, c, b) = resolve_http(kernel, recent, &cap, principal.as_deref(), target);
+        (s, c, b, None)
     } else {
-        match safe_rel(request_target) {
+        let (s, c, b) = match safe_rel(&req.target) {
             Some(rel) => match std::fs::read(dist.join(&rel)) {
                 Ok(bytes) => ("200 OK", content_type(&rel), bytes),
                 Err(_) => (
@@ -304,48 +634,70 @@ async fn handle_http(
                 "text/plain; charset=utf-8",
                 b"bad path".to_vec(),
             ),
-        }
+        };
+        (s, c, b, None)
     };
 
+    let cookie_line = set_cookie
+        .map(|c| format!("Set-Cookie: {c}\r\n"))
+        .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
-        body.len()
+         {cookie_line}Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        out.len()
     );
     sock.write_all(header.as_bytes()).await?;
-    sock.write_all(&body).await?;
+    sock.write_all(&out).await?;
     sock.flush().await
 }
 
-/// Resolve `/r/{iri}?args` to an HTML fragment via the kernel — the same `resolve()` the wire
-/// runs. The ceiling is the full entitlement under `dev_open` (localhost dev, pre-auth) else
-/// public (so the gated graph resolves to nothing). Args ride as query params. A resolve
-/// error becomes an inline error fragment so htmx swaps something visible.
+/// Resolve `/r/{iri}?args` to an HTML fragment via the kernel under `cap` — the same `resolve()`
+/// the wire runs. `urn:cms:recent` is a session resource (this principal's trail), rendered here
+/// rather than in the kernel; every other resolved view is noted to the trail. Args ride as
+/// query params. A resolve error becomes an inline error fragment so htmx swaps something visible.
 fn resolve_http(
     kernel: &Kernel,
-    entitlement: &[String],
-    dev_open: bool,
+    recent: &RecentLog,
+    cap: &Capability,
+    principal: Option<&str>,
     target: &str,
 ) -> (&'static str, &'static str, Vec<u8>) {
     let (iri_enc, query) = target.split_once('?').unwrap_or((target, ""));
-    let Ok(resource) = Iri::parse(percent_decode(iri_enc)) else {
+    let iri = percent_decode(iri_enc);
+    // The recency trail is a session resource, not a kernel one — render it from this
+    // principal's history through the shared `recent` stylesheet, exactly as the wire does.
+    if iri == "urn:cms:recent" {
+        return match render_recent_html(kernel, recent, principal, cap) {
+            Ok(bytes) => ("200 OK", "text/html; charset=utf-8", bytes),
+            Err(e) => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                format!("<p class=\"cms-error\">{e}</p>").into_bytes(),
+            ),
+        };
+    }
+    let Ok(resource) = Iri::parse(iri.clone()) else {
         return (
             "400 Bad Request",
             "text/plain; charset=utf-8",
             b"bad iri".to_vec(),
         );
     };
+    // A tag opened inside a kind carries `type` — record it so the trail re-opens it scoped.
+    let scope = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "type")
+        .map(|(_, v)| percent_decode(v));
     let mut request = Request::new(Verb::Source, resource);
     for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
         request = request.with_arg(k, ArgRef::Inline(percent_decode(v).into_bytes()));
     }
-    let cap = if dev_open {
-        Capability::scoped(entitlement.to_vec())
-    } else {
-        Capability::scoped(Vec::<String>::new())
-    };
-    match Resolver::issue_as(kernel, request, &cap) {
-        Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
+    match Resolver::issue_as(kernel, request, cap) {
+        Ok((repr, _)) => {
+            note_recent(recent, principal, &iri, scope.as_deref());
+            ("200 OK", "text/html; charset=utf-8", repr.bytes)
+        }
         Err(e) => (
             "200 OK",
             "text/html; charset=utf-8",
@@ -484,7 +836,9 @@ fn handle(
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
             let reply = resolve(kernel, &session.ceiling, req);
-            note_recent(recent, session, &iri, scope.as_deref(), &reply);
+            if matches!(reply, Reply::Resolved(..)) {
+                note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
+            }
             reply
         }
         // A client may carry a capability to attenuate below the ceiling; clamp it.
@@ -494,7 +848,9 @@ fn handle(
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
             let reply = resolve(kernel, &session.ceiling.clamp(&carried), req);
-            note_recent(recent, session, &iri, scope.as_deref(), &reply);
+            if matches!(reply, Reply::Resolved(..)) {
+                note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
+            }
             reply
         }
         Ok(Call::IsCached(req)) => {
@@ -533,22 +889,12 @@ fn recordable(iri: &str, scope: Option<&str>) -> Option<(String, Option<String>)
     None
 }
 
-/// If a signed-in principal just successfully opened a recordable view, add it to the
-/// trail (a repeat visit moves it to the front). `scope` = the view's `type` arg, so a
-/// tag opened inside a kind is recorded and re-opened within that kind.
-fn note_recent(
-    recent: &RecentLog,
-    session: &Session,
-    iri: &str,
-    scope: Option<&str>,
-    reply: &Reply,
-) {
-    if !matches!(reply, Reply::Resolved(..)) {
-        return;
-    }
-    let (Some(principal), Some((label, scope))) =
-        (session.principal.as_deref(), recordable(iri, scope))
-    else {
+/// If a signed-in `principal` just successfully opened a recordable view, add it to the trail
+/// (a repeat visit moves it to the front). `scope` = the view's `type` arg, so a tag opened
+/// inside a kind is recorded and re-opened within that kind. Callers invoke this only on a
+/// successful resolve. Shared by both transports (wire session + HTTP session).
+fn note_recent(recent: &RecentLog, principal: Option<&str>, iri: &str, scope: Option<&str>) {
+    let (Some(principal), Some((label, scope))) = (principal, recordable(iri, scope)) else {
         return;
     };
     recent.record(
@@ -561,14 +907,16 @@ fn note_recent(
     );
 }
 
-/// Render this identity's recency trail as an htmx fragment, through the `recent`
-/// stylesheet resource — a view is a query; here the "query" is the session's trail.
-fn render_recent(kernel: &Kernel, recent: &RecentLog, session: &Session) -> Reply {
-    let items = session
-        .principal
-        .as_deref()
-        .map(|p| recent.list(p))
-        .unwrap_or_default();
+/// Render `principal`'s recency trail to an htmx fragment through the shared `recent` stylesheet
+/// resource — a view is a query; here the "query" is the principal's trail. The transport-neutral
+/// core, resolved under `cap`; the wire wraps it in a `Reply`, HTTP serves the bytes directly.
+fn render_recent_html(
+    kernel: &Kernel,
+    recent: &RecentLog,
+    principal: Option<&str>,
+    cap: &Capability,
+) -> Result<Vec<u8>, String> {
+    let items = principal.map(|p| recent.list(p)).unwrap_or_default();
     let xml = recent_xml(&items);
     let req = Request::new(
         Verb::Source,
@@ -579,8 +927,26 @@ fn render_recent(kernel: &Kernel, recent: &RecentLog, session: &Session) -> Repl
         "stylesheet",
         ArgRef::Inline(b"urn:cms:style:recent".to_vec()),
     );
-    match Resolver::issue_as(kernel, req, &session.ceiling) {
-        Ok((repr, _)) => Reply::Resolved(repr, CacheStatus::Uncacheable),
+    Resolver::issue_as(kernel, req, cap)
+        .map(|(repr, _)| repr.bytes)
+        .map_err(|e| e.to_string())
+}
+
+/// The wire's recency reply: `render_recent_html` wrapped as an uncacheable `Reply`.
+fn render_recent(kernel: &Kernel, recent: &RecentLog, session: &Session) -> Reply {
+    match render_recent_html(
+        kernel,
+        recent,
+        session.principal.as_deref(),
+        &session.ceiling,
+    ) {
+        Ok(bytes) => Reply::Resolved(
+            Representation::new(
+                ReprType::new("text/html").with_param("charset", "utf-8"),
+                bytes,
+            ),
+            CacheStatus::Uncacheable,
+        ),
         Err(e) => Reply::Error(e),
     }
 }
@@ -723,7 +1089,12 @@ fn error_reply(msg: &str) -> Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, resolve_http, safe_rel, serve_http};
+    use super::{
+        content_type, ensure_session, http_auth, parse_head, resolve_http, safe_rel, serve_http,
+        session_cap, HttpAuth, HttpSession,
+    };
+    use ikigai_cms_web::session::{RecentLog, Rp};
+    use ikigai_core::Capability;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -742,30 +1113,179 @@ mod tests {
         (kernel, ent)
     }
 
+    /// A relying party over a Keychain-free file backend (no biometric, empty store) — enough to
+    /// exercise the HTTP auth routing that doesn't need a real authenticator.
+    fn empty_rp(dir: &std::path::Path) -> Rp {
+        Rp::new(
+            "localhost",
+            "http://localhost:8080",
+            Arc::new(ikigai_secret::FileBackend::new(dir)),
+        )
+        .expect("rp builds")
+    }
+
     #[test]
-    fn the_http_resolve_route_renders_under_dev_open_and_gates_without() {
+    fn the_http_resolve_route_renders_under_a_granted_cap_and_gates_without() {
         let dir = tempfile::tempdir().unwrap();
         let (kernel, ent) = fixture(dir.path());
-        // dev-open: resolves under the entitlement → the tag view renders the bookmark.
-        let (status, ctype, body) =
-            resolve_http(&kernel, &ent, true, "urn:cms:view:science?style=catalog");
+        let recent = RecentLog::default();
+        // A granted cap (an authenticated session's scopes) → the tag view renders the bookmark.
+        let full = Capability::scoped(ent.clone());
+        let (status, ctype, body) = resolve_http(
+            &kernel,
+            &recent,
+            &full,
+            None,
+            "urn:cms:view:science?style=catalog",
+        );
         let body = String::from_utf8_lossy(&body);
         assert_eq!(status, "200 OK");
         assert!(ctype.contains("text/html"));
         assert!(
             body.contains("Science Bookmark"),
-            "dev-open renders the view: {body}"
+            "a granted cap renders the view: {body}"
         );
-        // Not dev-open: public ceiling → the graph is gated → nothing resolves.
-        let (_s, _c, gated) =
-            resolve_http(&kernel, &ent, false, "urn:cms:view:science?style=catalog");
+        // A public cap → the whole graph is gated → nothing resolves.
+        let public = Capability::scoped(Vec::<String>::new());
+        let (_s, _c, gated) = resolve_http(
+            &kernel,
+            &recent,
+            &public,
+            None,
+            "urn:cms:view:science?style=catalog",
+        );
         assert!(
             !String::from_utf8_lossy(&gated).contains("Science Bookmark"),
-            "gated without dev-open (until cookie auth): {}",
+            "public cap → gated: {}",
             String::from_utf8_lossy(&gated)
         );
         // A malformed IRI → 400.
-        assert_eq!(resolve_http(&kernel, &ent, true, "").0, "400 Bad Request");
+        assert_eq!(
+            resolve_http(&kernel, &recent, &full, None, "").0,
+            "400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn parse_head_extracts_method_target_cookies_and_length() {
+        let head = "POST /auth/login/finish HTTP/1.1\r\nHost: x\r\n\
+             Content-Length: 12\r\nCookie: a=1; cms_session=abc";
+        let r = parse_head(head);
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.target, "/auth/login/finish");
+        assert_eq!(r.content_length, 12);
+        assert_eq!(
+            r.cookies.get("cms_session").map(String::as_str),
+            Some("abc")
+        );
+        assert_eq!(r.cookies.get("a").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn an_authenticated_session_resolves_the_room_and_gets_noted_to_the_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kernel, ent) = fixture(dir.path());
+        let recent = RecentLog::default();
+        let auth = HttpAuth::default();
+        // Seed a signed-in session carrying the room entitlement.
+        auth.sessions.lock().unwrap().insert(
+            "sid1".into(),
+            HttpSession {
+                scopes: Some(ent.clone()),
+                principal: Some("p".into()),
+                pending: None,
+            },
+        );
+        // Its cap resolves the gated view, and the visit is recorded to that principal's trail.
+        let (cap, who) = session_cap(&auth, Some("sid1"), &ent, false);
+        assert_eq!(who.as_deref(), Some("p"));
+        let (_s, _c, body) = resolve_http(
+            &kernel,
+            &recent,
+            &cap,
+            who.as_deref(),
+            "urn:cms:view:science?style=catalog",
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("Science Bookmark"),
+            "the session sees the room"
+        );
+        assert_eq!(recent.list("p").len(), 1, "the view was noted to the trail");
+        // An unknown session, not dev-open → public cap → gated.
+        let (cap2, _) = session_cap(&auth, Some("ghost"), &ent, false);
+        let (_s, _c, g) = resolve_http(
+            &kernel,
+            &recent,
+            &cap2,
+            None,
+            "urn:cms:view:science?style=catalog",
+        );
+        assert!(
+            !String::from_utf8_lossy(&g).contains("Science Bookmark"),
+            "no session → gated"
+        );
+    }
+
+    #[test]
+    fn http_auth_reports_status_and_guards_the_ceremony() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = empty_rp(dir.path());
+        let auth = HttpAuth::default();
+        let ent = vec!["urn:cap:fs:read:/x".to_string()];
+
+        // status: nothing enrolled, unauthenticated, and the dev_open flag is echoed back.
+        let (st, ctype, body, cookie) =
+            http_auth("status", "GET", b"", None, &rp, &auth, &ent, true);
+        assert_eq!(st, "200 OK");
+        assert!(ctype.contains("json"));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enrolled"], false);
+        assert_eq!(v["authenticated"], false);
+        assert_eq!(v["dev_open"], true);
+        assert!(cookie.is_none());
+
+        // login/finish with no session/ceremony → error, no panic.
+        let (_s, _c, body, _) =
+            http_auth("login/finish", "POST", b"{}", None, &rp, &auth, &ent, false);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("no session"));
+
+        // register/start (store empty → open) mints a session and sets the cookie.
+        let (_s, _c, _b, cookie) = http_auth(
+            "register/start",
+            "POST",
+            br#"{"name":"x"}"#,
+            None,
+            &rp,
+            &auth,
+            &ent,
+            false,
+        );
+        let cookie = cookie.expect("register/start sets a session cookie");
+        assert!(cookie.contains("cms_session="), "cookie: {cookie}");
+        assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
+
+        // A GET on a POST-only route → 405.
+        assert_eq!(
+            http_auth("logout", "GET", b"", None, &rp, &auth, &ent, false).0,
+            "405 Method Not Allowed"
+        );
+    }
+
+    #[test]
+    fn ensure_session_reuses_a_known_id_and_mints_otherwise() {
+        let auth = HttpAuth::default();
+        let (id1, c1) = ensure_session(&auth, None);
+        let c1 = c1.expect("a fresh session sets a cookie");
+        assert!(c1.contains(&id1));
+        // The same id → reused, no new cookie.
+        let (id2, c2) = ensure_session(&auth, Some(&id1));
+        assert_eq!(id1, id2);
+        assert!(c2.is_none());
+        // An unknown id → a fresh one is minted.
+        let (id3, c3) = ensure_session(&auth, Some("ghost"));
+        assert_ne!(id3, "ghost");
+        assert!(c3.is_some());
     }
 
     #[test]
@@ -801,6 +1321,9 @@ mod tests {
             dir.path().to_path_buf(),
             port,
             Arc::new(kernel),
+            Arc::new(empty_rp(dir.path())),
+            Arc::new(HttpAuth::default()),
+            Arc::new(RecentLog::default()),
             Arc::new(ent),
             true, // dev-open, so /r/ resolves under the entitlement
         ));

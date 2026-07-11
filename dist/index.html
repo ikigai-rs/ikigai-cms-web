@@ -18,6 +18,16 @@
   nav.nav button:hover { background:var(--card); }
   nav.nav form { margin-left:auto; display:flex; }
   nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
+  nav.nav .nav-signout { margin-left:8px; color:var(--mut); }
+  /* Passkey login panel — shown until a session is established (auth.js toggles [hidden]). */
+  .auth { max-width:420px; margin:44px auto; border:1px solid var(--line); border-radius:14px; padding:26px 24px; background:var(--card); text-align:center; }
+  .auth[hidden] { display:none; }
+  .auth h2 { margin:0 0 6px; font-size:17px; font-weight:600; }
+  .auth p { margin:0 0 18px; color:var(--mut); font-size:14px; line-height:1.5; }
+  .auth button { border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:9px; padding:9px 22px; font:14px system-ui; cursor:pointer; }
+  .auth button[hidden] { display:none; }
+  .auth button:hover { opacity:.92; }
+  .auth-status { margin-top:14px; color:#c0392b; font-size:13px; min-height:1em; }
   /* Context header + restyle/sort toolbar — server-rendered above each page of cards. */
   .cms-facet { display:flex; align-items:center; gap:10px; padding:2px 0 12px; }
   .cms-facet-label { font-size:19px; font-weight:600; color:var(--fg); }
@@ -58,6 +68,9 @@
 <!-- Vendored htmx (self-contained, no CDN). The whole room is htmx attributes over the
      `/r/{iri}` HTTP routes — no custom application JavaScript. -->
 <script src="htmx.min.js"></script>
+<!-- The one bit of app JS: the standard WebAuthn passkey ceremony (isolated from the room).
+     Deferred so the DOM + htmx global are ready when it runs. -->
+<script src="auth.js" defer></script>
 </head>
 <body>
 <div class="wrap">
@@ -65,21 +78,33 @@
     <h1>ikigai reading room</h1>
   </header>
 
+  <!-- Passkey login. Shown until a session is established; auth.js runs the WebAuthn ceremony
+       against the /auth/* routes, then reveals the nav + loads the room. -->
+  <section id="auth" class="auth" hidden>
+    <h2>ikigai reading room</h2>
+    <p>A personal semantic library. Sign in with your passkey to enter.</p>
+    <button id="auth-login" hidden>Sign in</button>
+    <button id="auth-enroll" hidden>Enroll a passkey</button>
+    <div id="auth-status" class="auth-status"></div>
+  </section>
+
   <!-- Navigation: every control is vanilla htmx over the /r/ HTTP routes. hx-target/hx-swap
        set here are inherited by the buttons, the search form, AND everything swapped into
-       #room (so a card's tag chips and the pager navigate the same way). -->
-  <nav class="nav" hx-target="#room" hx-swap="innerHTML">
+       #room (so a card's tag chips and the pager navigate the same way). Hidden until sign-in. -->
+  <nav class="nav" hx-target="#room" hx-swap="innerHTML" hidden>
     <button hx-get="/r/urn:cms:tags">tags</button>
     <button hx-get="/r/urn:cms:types">types</button>
     <button hx-get="/r/urn:cms:recent">recent</button>
     <form hx-get="/r/urn:cms:search">
       <input name="q" type="search" placeholder="search titles…" autocomplete="off" spellcheck="false" />
     </form>
+    <button id="auth-logout" class="nav-signout" type="button" hidden>sign out</button>
   </nav>
 
-  <!-- The reading room. Loads the tag index on arrival; each fragment carries the current
-       view context as an inherited hx-vals wrapper, so paging/tag clicks preserve it. -->
-  <div id="room" hx-get="/r/urn:cms:tags" hx-trigger="load" hx-target="#room" hx-swap="innerHTML">loading…</div>
+  <!-- The reading room. auth.js loads the tag index once a session exists (so it isn't
+       requested before login); each fragment carries its view context as an inherited
+       hx-vals wrapper, so paging/tag clicks preserve it. -->
+  <div id="room" hx-target="#room" hx-swap="innerHTML"></div>
 </div>
 </body>
 </html>
