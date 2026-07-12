@@ -148,10 +148,15 @@ pub fn cms_spaces_with(
     // compiled in (it shares that status format); it does no network, so it's safe in the serving
     // kernel.
     #[cfg(feature = "maintenance")]
-    spaces.push(Arc::new(EndpointSpace::new().bind(
-        Exact::new("urn:cms:linkstatus"),
-        crate::maintenance::LinkStatusView,
-    )) as Arc<dyn Space>);
+    spaces.push(Arc::new(
+        EndpointSpace::new()
+            .bind(
+                Exact::new("urn:cms:linkstatus"),
+                crate::maintenance::LinkStatusView,
+            )
+            // urn:cms:review — the suggested-deletes review, rendered via urn:cms:style:review.
+            .bind(Exact::new("urn:cms:review"), crate::maintenance::ReviewView),
+    ) as Arc<dyn Space>);
     spaces
 }
 
@@ -177,6 +182,8 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         "recent" => include_str!("../styles/recent.xsl"),
         // The type index renders SPARQL-results XML (kinds + counts) — like tags.
         "types" => include_str!("../styles/types.xsl"),
+        // The suggested-deletes review renders a server-supplied doc (urn:cms:review#).
+        "review" => include_str!("../styles/review.xsl"),
         _ => return Err(Error::Endpoint(format!("no stylesheet `{name}`"))),
     };
     Ok(Representation::new(
