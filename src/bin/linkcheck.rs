@@ -27,7 +27,7 @@ async fn main() {
     let bookmarks = std::env::var("CMS_BOOKMARKS").ok();
     let status_path = std::env::var("CMS_LINKSTATUS")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| src_dir.join(".cms-linkstatus.json"));
+        .unwrap_or_else(|_| ikigai_cms_web::maintenance::default_status_path());
 
     eprintln!(
         "source: {}  bookmarks: {}  status: {}",

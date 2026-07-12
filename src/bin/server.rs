@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _linkcheck = if std::env::var("CMS_LINKCHECK").as_deref() == Ok("1") {
         let status_path = std::env::var("CMS_LINKSTATUS")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| src_dir_maint.join(".cms-linkstatus.json"));
+            .unwrap_or_else(|_| ikigai_cms_web::maintenance::default_status_path());
         println!(
             "link-check: enabled (daily); status {}",
             status_path.display()
