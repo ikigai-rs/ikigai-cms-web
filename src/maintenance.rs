@@ -5,9 +5,11 @@
 //! `cms-server` `urn:time` schedule just *source* it, so there is one implementation.
 //!
 //! `ikigai-http` reports status honestly; the *policy* about what's "dead" lives here (the
-//! caller): `"true"` = alive, `"false"` = gone (404/410), a transient error = unreachable, a
-//! permanent one (a 400/403 the server *answered* with) = alive. Each check passes `max_age`, so
-//! in the long-lived server a URL checked within the week is a cache hit.
+//! caller): `"true"` = alive, a transient error = unreachable, a permanent one (a 400/403 the server
+//! *answered* with) = alive. A HEAD `"false"` (404/410) is NOT trusted alone — many live servers
+//! 404 a HEAD but serve a GET — so it is confirmed with a real `urn:httpGet`; only a GET that *also*
+//! 404s is `gone`. Each check passes `max_age`, so in the long-lived server a URL checked within the
+//! week is a cache hit.
 //!
 //! The checks run as **parked futures** bounded at [`CONCURRENCY`] in flight — no thread pool. The
 //! transport captures a tokio [`Handle`] and spawns each request onto it, so the fan-out works
@@ -25,21 +27,31 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Exact, Fallback, Invocation, Iri, Kernel,
+    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
     ReprType, Representation, Request, Result, Space, SystemClock, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 
 /// A fresh `ok` result is trusted for a week (also the `max_age` passed to each check); broken
-/// URLs are re-checked every run so a sustained failure is confirmed sooner.
+/// URLs are re-checked every run.
 const WEEK_SECS: u64 = 7 * 24 * 60 * 60;
-/// An `unreachable` link is a removal candidate only once it has stayed broken across ≥2 runs
-/// spanning at least this long — so a one-off timeout never qualifies.
-const CONFIRM_SPAN_SECS: u64 = 24 * 60 * 60;
 /// Checks in flight at once — a politeness/backpressure cap on parked futures, NOT a thread count.
-/// Kept modest: a big burst across thousands of distinct hosts overwhelms the system DNS resolver
-/// (spurious connection failures), and link-checking isn't latency-critical.
-const CONCURRENCY: usize = 24;
+/// Kept low on purpose: a burst of concurrent fresh connections across many hosts exhausts DNS/
+/// sockets and manufactures spurious connection failures (a live site checked in the burst fails,
+/// yet succeeds on a calm sequential recheck). Link-checking is a nightly background pass — slow and
+/// gentle beats fast and wrong.
+const CONCURRENCY: usize = 4;
+/// A transient (couldn't-connect) failure is retried once after this delay. It's long enough to land
+/// *after* a rate-limit window or a DNS hiccup rather than inside it — a 3s retry tended to fail for
+/// the same reason the first try did.
+const RETRY_BACKOFF: Duration = Duration::from_secs(10);
+/// Persist the status cache every this-many completed checks, so an interrupted pass keeps its
+/// progress (and a re-run resumes) instead of losing everything (the cache was previously written
+/// only at the very end).
+const CHECKPOINT_EVERY: usize = 100;
+/// A `running: true` meta whose heartbeat is older than this is treated as a dead/interrupted pass,
+/// not a live one — a hard-killed pass can't clear its own `running` flag, so the reader ages it out.
+const STALE_META_SECS: u64 = 90;
 
 // ---- the reqwest transport (async, self-sufficient off the timer thread) -----------------------
 
@@ -58,7 +70,10 @@ impl ReqwestTransport {
     /// default). Panics if not called within a tokio runtime — it needs a handle to spawn onto.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(12))
+            // Patient on purpose: a genuinely dead host fails fast (DNS/refused in <1s regardless of
+            // this), so the timeout only matters for slow-but-alive sites (old edu/personal servers).
+            // 20s gives them room to answer instead of being false-flagged unreachable.
+            .timeout(Duration::from_secs(20))
             .user_agent("ikigai-cms-linkcheck")
             // Every bookmark is a different host, so a per-host idle keep-alive pool is useless and
             // harmful: it accumulates hundreds of open connections and starves DNS/sockets, which
@@ -163,17 +178,13 @@ enum Outcome {
     Unreachable(String),
 }
 
-/// Whether a broken status is a removal candidate: `gone` always; `unreachable` only once it has
-/// stayed broken across ≥2 runs spanning at least [`CONFIRM_SPAN_SECS`]. Public so the review
-/// view (a later phase) can bucket the same way.
-pub fn removable(s: &Status, now: u64) -> bool {
-    match s.status.as_str() {
-        "gone" => true,
-        "unreachable" => {
-            s.broken_count >= 2 && now.saturating_sub(s.first_broken_at) >= CONFIRM_SPAN_SECS
-        }
-        _ => false,
-    }
+/// Whether a status is a removal candidate. **Only a definitive `gone` (HTTP 404/410) qualifies.**
+/// `unreachable` (a connection/timeout/DNS error) is deliberately NEVER auto-removable: those
+/// failures are too unreliable — a rate-limiting CDN, a DNS hiccup, or the checker throttling its
+/// own machine can all fake one, and a self-inflicted failure repeating every run would spuriously
+/// "confirm" it. Unreachable links are surfaced for the human to judge, not auto-purged.
+pub fn removable(s: &Status) -> bool {
+    s.status == "gone"
 }
 
 /// Load the persisted status cache (empty if absent/unreadable).
@@ -196,19 +207,18 @@ fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) {
     }
 }
 
-/// The one-line summary a pass returns (and the shape a later in-room indicator reads).
+/// The one-line summary a pass returns (and the shape the in-room indicator reads).
 pub struct Summary {
     pub checked: usize,
     pub gone: usize,
-    pub confirmed: usize,
-    pub pending: usize,
+    pub unreachable: usize,
 }
 
 impl Summary {
     fn line(&self) -> String {
         format!(
-            "link-check: {} gone · {} unreachable-confirmed · {} pending (checked {})",
-            self.gone, self.confirmed, self.pending, self.checked
+            "link-check: {} gone (removable) · {} unreachable (flagged) · checked {}",
+            self.gone, self.unreachable, self.checked
         )
     }
 }
@@ -221,6 +231,11 @@ pub struct Meta {
     pub running: bool,
     pub checked: usize,
     pub total: usize,
+    /// Unix seconds of the last progress tick — a liveness heartbeat. A `running: true` meta with a
+    /// stale heartbeat is a pass that was killed before it could clear the flag (see
+    /// [`STALE_META_SECS`]).
+    #[serde(default)]
+    pub heartbeat: u64,
     /// Unix seconds the last pass finished.
     #[serde(default)]
     pub finished_at: u64,
@@ -298,15 +313,12 @@ impl Endpoint for LinkCheckPass {
                 running: true,
                 checked: 0,
                 total: to_check.len(),
+                heartbeat: now,
                 finished_at: 0,
             },
         );
 
-        for (idx, outcome) in check_all(inv, &to_check, &meta).await {
-            let (subject, url, title) = to_check[idx];
-            let entry = merge(cache.get(url), subject, url, title, &outcome, now);
-            cache.insert(url.clone(), entry);
-        }
+        run_checks(inv, &to_check, &mut cache, &self.status_path, &meta, now).await;
         // Drop status for bookmarks that no longer exist.
         let current: HashSet<&str> = bookmarks.iter().map(|(_, u, _)| u.as_str()).collect();
         cache.retain(|url, _| current.contains(url.as_str()));
@@ -318,18 +330,18 @@ impl Endpoint for LinkCheckPass {
                 running: false,
                 checked: to_check.len(),
                 total: to_check.len(),
-                finished_at: now,
+                heartbeat: unix_now(),
+                finished_at: unix_now(),
             },
         );
-        let (gone, confirmed, pending) = buckets(&cache, now);
+        let (gone, unreachable) = buckets(&cache);
         let report_path = self.status_path.with_file_name("dead-links.org");
-        let _ = std::fs::write(report_path, report(&gone, &confirmed, &pending, now));
+        let _ = std::fs::write(report_path, report(&gone, &unreachable, now));
 
         let summary = Summary {
             checked: to_check.len(),
             gone: gone.len(),
-            confirmed: confirmed.len(),
-            pending: pending.len(),
+            unreachable: unreachable.len(),
         };
         Ok(Representation::new(
             ReprType::new("text/plain"),
@@ -344,8 +356,9 @@ impl Endpoint for LinkCheckPass {
     fn describe(&self) -> Description {
         Description::new("urn:cms:linkcheck")
             .summary(
-                "Run the link-check pass: HEAD-check every bookmark, reconcile the persisted \
-                 status, and write the dead-links review. Returns a summary line.",
+                "Run the link-check pass: HEAD-check every bookmark (a HEAD 404 confirmed by a \
+                 GET before it counts as gone), reconcile the persisted status, and write the \
+                 dead-links review. Returns a summary line.",
             )
             .verb(Verb::Source)
             .input(
@@ -395,13 +408,19 @@ async fn list_bookmarks(inv: &Invocation<'_>) -> Result<Vec<(String, String, Str
     Ok(out)
 }
 
-/// Check `items` as parked futures bounded at [`CONCURRENCY`] in flight, ticking the meta file's
-/// progress so the in-room indicator can update.
-async fn check_all(
+/// Run every item as a parked future bounded at [`CONCURRENCY`] in flight, folding each outcome into
+/// `cache` **as it lands** — updating the meta heartbeat each tick, and persisting the status cache
+/// every [`CHECKPOINT_EVERY`] completions. Streaming (not collect-then-apply) is what makes an
+/// interrupted pass keep its progress: the cache on disk is never more than `CHECKPOINT_EVERY` checks
+/// behind, and the heartbeat lets the reader tell a live pass from a killed one.
+async fn run_checks(
     inv: &Invocation<'_>,
     items: &[&(String, String, String)],
+    cache: &mut HashMap<String, Status>,
+    status_path: &std::path::Path,
     meta: &std::path::Path,
-) -> Vec<(usize, Outcome)> {
+    now: u64,
+) {
     let total = items.len();
     let done = AtomicUsize::new(0);
     // Own the `(index, url)` pairs so each future borrows only `inv`/`done` (one clear lifetime),
@@ -412,20 +431,37 @@ async fn check_all(
         .enumerate()
         .map(|(i, it)| (i, it.1.clone()))
         .collect();
-    futures::stream::iter(work)
-        .map(|(i, url)| check_one(inv, &done, total, meta, i, url))
-        .buffer_unordered(CONCURRENCY)
-        .collect()
-        .await
+    let mut results = futures::stream::iter(work)
+        .map(|(i, url)| check_one(inv, &done, total, i, url))
+        .buffer_unordered(CONCURRENCY);
+    while let Some((idx, outcome)) = results.next().await {
+        let (subject, url, title) = items[idx];
+        let entry = merge(cache.get(url), subject, url, title, &outcome, now);
+        cache.insert(url.clone(), entry);
+        let n = done.load(Ordering::Relaxed);
+        // A tiny meta write each tick keeps the heartbeat fresh (cheap); a full status checkpoint
+        // only every CHECKPOINT_EVERY (the bigger write).
+        write_meta(
+            meta,
+            &Meta {
+                running: true,
+                checked: n,
+                total,
+                heartbeat: unix_now(),
+                finished_at: 0,
+            },
+        );
+        if n.is_multiple_of(CHECKPOINT_EVERY) {
+            save_status(status_path, cache);
+        }
+    }
 }
 
-/// One item's check + progress log, ticking the meta file every 25 completions (a benign race on
-/// the counter — the indicator is approximate).
+/// One item's check + progress log.
 async fn check_one(
     inv: &Invocation<'_>,
     done: &AtomicUsize,
     total: usize,
-    meta: &std::path::Path,
     i: usize,
     url: String,
 ) -> (usize, Outcome) {
@@ -436,24 +472,30 @@ async fn check_one(
         Outcome::Unreachable(r) => eprintln!("[{n}/{total}] unreach {url}  ({r})"),
         Outcome::Alive => {}
     }
-    if n.is_multiple_of(25) {
-        write_meta(
-            meta,
-            &Meta {
-                running: true,
-                checked: n,
-                total,
-                finished_at: 0,
-            },
-        );
-    }
     (i, outcome)
 }
 
-/// One reachability check via `urn:httpHead`+`Exists` (cacheable a week). `"true"` = alive,
-/// `"false"` = gone; a **transient** error = unreachable (couldn't reach), a **permanent** one (a
-/// status the server answered with) = alive (a HEAD-hostile but live site isn't condemned).
+/// One reachability check, retrying a transient failure once after a short backoff — so a
+/// rate-limited or DNS-hiccup request that fails on the first try gets a second chance to come back
+/// `ok` instead of being flagged unreachable. Only `Unreachable` is transient; `Gone`/`Alive` are
+/// final. The delay is via `futures-timer`, so it works whether the pass is driven by tokio or by
+/// the `urn:time` timer thread.
 async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
+    match check_once(inv, url).await {
+        Outcome::Unreachable(_) => {
+            futures_timer::Delay::new(RETRY_BACKOFF).await;
+            check_once(inv, url).await
+        }
+        final_outcome => final_outcome,
+    }
+}
+
+/// A single reachability check. The cheap first pass is `urn:httpHead`+`Exists` (cacheable a week):
+/// `"true"` = alive, a **transient** error = unreachable, a **permanent** one (a status the server
+/// answered with) = alive (a HEAD-hostile but live site isn't condemned). A `"false"` (HEAD 404/410)
+/// is NOT trusted on its own — **many servers 404 a HEAD but serve a GET** — so we confirm with a
+/// real GET before ever concluding `gone`. Only a GET that *also* 404s is a removal candidate.
+async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
     let request = Request::new(Verb::Exists, Iri::parse("urn:httpHead").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
         .with_arg(
@@ -463,11 +505,31 @@ async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
     match inv.issue(request).await {
         Ok(repr) => match repr.bytes.as_slice() {
             b"true" => Outcome::Alive,
-            b"false" => Outcome::Gone("HTTP 404/410 (gone)".to_string()),
+            b"false" => confirm_gone_with_get(inv, url).await,
             other => {
                 Outcome::Unreachable(format!("unexpected: {}", String::from_utf8_lossy(other)))
             }
         },
+        Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
+        Err(_) => Outcome::Alive,
+    }
+}
+
+/// A HEAD said 404/410 — but HEAD is unreliable (plenty of live servers reject it with a 404 while
+/// serving the same URL on GET). Ask the authority: a real `urn:httpGet`. A GET that succeeds means
+/// the page is live (HEAD-hostile, not gone); a GET that *also* 404s (`Error::NotFound`) is a genuine
+/// `gone`; a transient GET error is `unreachable`; any other answered status (403/400/…) means the
+/// resource is there, just not fetchable this way — not gone.
+async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
+    let request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+        .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+        .with_arg(
+            "max_age",
+            ArgRef::Inline(WEEK_SECS.to_string().into_bytes()),
+        );
+    match inv.issue(request).await {
+        Ok(_) => Outcome::Alive,
+        Err(Error::NotFound(_)) => Outcome::Gone("HTTP 404/410 (GET-confirmed)".to_string()),
         Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
         Err(_) => Outcome::Alive,
     }
@@ -505,28 +567,26 @@ fn merge(
     base(status, reason, first, count)
 }
 
-/// Partition into (gone, unreachable-confirmed, unreachable-pending), each sorted by URL.
-fn buckets(
-    cache: &HashMap<String, Status>,
-    now: u64,
-) -> (Vec<&Status>, Vec<&Status>, Vec<&Status>) {
-    let (mut gone, mut confirmed, mut pending) = (Vec::new(), Vec::new(), Vec::new());
+/// Partition into (gone, unreachable), each sorted by URL. `gone` is the removable set;
+/// `unreachable` is flagged for the human but never auto-removed (see [`removable`]).
+fn buckets(cache: &HashMap<String, Status>) -> (Vec<&Status>, Vec<&Status>) {
+    let (mut gone, mut unreachable) = (Vec::new(), Vec::new());
     for s in cache.values() {
         match s.status.as_str() {
             "gone" => gone.push(s),
-            "unreachable" if removable(s, now) => confirmed.push(s),
-            "unreachable" => pending.push(s),
+            "unreachable" => unreachable.push(s),
             _ => {}
         }
     }
-    for v in [&mut gone, &mut confirmed, &mut pending] {
+    for v in [&mut gone, &mut unreachable] {
         v.sort_by(|a, b| a.url.cmp(&b.url));
     }
-    (gone, confirmed, pending)
+    (gone, unreachable)
 }
 
-/// The human-readable review as an org file, grouped by removability.
-fn report(gone: &[&Status], confirmed: &[&Status], pending: &[&Status], now: u64) -> String {
+/// The human-readable review as an org file: the removable `gone` set, then the flagged
+/// `unreachable` set (not auto-removed — your judgement).
+fn report(gone: &[&Status], unreachable: &[&Status], now: u64) -> String {
     let mut s = String::from("#+TITLE: Dead bookmarks — link check\n\n");
     let mut section = |title: &str, items: &[&Status], note: &str| {
         s.push_str(&format!("* {title}: {}\n", items.len()));
@@ -546,20 +606,11 @@ fn report(gone: &[&Status], confirmed: &[&Status], pending: &[&Status], now: u64
         }
         s.push('\n');
     };
+    section("Gone — removable", gone, "HTTP 404/410: definitively dead");
     section(
-        "Gone — removable",
-        gone,
-        "404/410 or DNS: definitively dead",
-    );
-    section(
-        "Unreachable — confirmed, removable",
-        confirmed,
-        "timeout/refused, sustained across runs",
-    );
-    section(
-        "Unreachable — pending recheck",
-        pending,
-        "down at least once; re-run the check to confirm before removing",
+        "Unreachable — flagged (not auto-removed)",
+        unreachable,
+        "connection/timeout/DNS errors — too unreliable to delete on; your call",
     );
     s
 }
@@ -606,7 +657,10 @@ impl Endpoint for LinkStatusView {
 /// Render the indicator fragment: run progress while a pass is running, else the last-run tally
 /// from the persisted status, else empty (never run).
 fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> String {
-    if meta.running {
+    // `running` only counts if the heartbeat is fresh — a hard-killed pass leaves `running: true`
+    // frozen, so an aged-out heartbeat means "interrupted", and we fall through to the last tally.
+    let live = meta.running && now.saturating_sub(meta.heartbeat) <= STALE_META_SECS;
+    if live {
         return format!(
             "<span class=\"cms-linkcheck running\">checking links… {} / {}</span>",
             group(meta.checked),
@@ -616,22 +670,21 @@ fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> St
     if cache.is_empty() {
         return String::new();
     }
-    let (gone, confirmed, pending) = buckets(cache, now);
-    let unreachable = confirmed.len() + pending.len();
+    let (gone, unreachable) = buckets(cache);
     let last = cache.values().map(|s| s.checked_at).max().unwrap_or(0);
     format!(
         "<span class=\"cms-linkcheck\">links: {} gone · {} unreachable · checked {}</span>",
         group(gone.len()),
-        group(unreachable),
+        group(unreachable.len()),
         ago(now, last),
     )
 }
 
 /// `urn:cms:review` — the suggested-deletes review as an htmx card fragment. Reads the persisted
-/// status, takes the removal candidates (`gone` + confirmed-`unreachable`), and renders them
-/// through the `review` stylesheet (a view is a query; here the "query" is the removable set). The
-/// pending count rides along so the header can note "N pending confirmation". Read-only — the
-/// authorized purge is a separate action.
+/// status: the **removable** set (`gone` = HTTP 404/410) becomes cards, and the count of **flagged**
+/// `unreachable` links rides in the header (they're surfaced but never auto-removed — connection
+/// errors are too unreliable). A view is a query; here the query is the removable set. Read-only —
+/// the authorized purge is a separate action.
 pub struct ReviewView;
 
 #[async_trait]
@@ -639,10 +692,8 @@ impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let cache = load_status(&resolved_status_path());
         let now = unix_now();
-        let (gone, confirmed, pending) = buckets(&cache, now);
-        let mut removable: Vec<&Status> = gone.into_iter().chain(confirmed).collect();
-        removable.sort_by(|a, b| a.url.cmp(&b.url));
-        let xml = review_xml(&removable, pending.len(), now);
+        let (gone, unreachable) = buckets(&cache);
+        let xml = review_xml(&gone, unreachable.len(), now);
         let req = Request::new(
             Verb::Source,
             Iri::parse("urn:xslt:transform").expect("valid IRI"),
@@ -653,11 +704,13 @@ impl Endpoint for ReviewView {
             ArgRef::Inline(b"urn:cms:style:review".to_vec()),
         );
         let out = inv.issue(req).await?;
+        // NOT cacheable: this reads the status file directly (std::fs, not through the kernel), so
+        // there's no golden thread to invalidate it — a cached fragment would freeze at its first
+        // render and keep showing already-purged links. Recompute every resolve (a cheap file read).
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
             out.bytes,
-        )
-        .cacheable())
+        ))
     }
 
     fn name(&self) -> &str {
@@ -671,11 +724,11 @@ impl Endpoint for ReviewView {
     }
 }
 
-/// Build the review doc (`urn:cms:review#`) from the removable candidates + the pending count.
-/// An empty candidate set is its own element (the stylesheet needs no conditionals).
-fn review_xml(removable: &[&Status], pending: usize, now: u64) -> String {
+/// Build the review doc (`urn:cms:review#`) from the removable (`gone`) candidates + the count of
+/// flagged (`unreachable`) links. An empty candidate set is its own element (no xrust conditionals).
+fn review_xml(removable: &[&Status], flagged: usize, now: u64) -> String {
     let mut s = format!(
-        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" pending=\"{pending}\">",
+        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" flagged=\"{flagged}\">",
         removable.len()
     );
     if removable.is_empty() {
@@ -709,6 +762,163 @@ fn xml_attr(out: &mut String, s: &str) {
             _ => out.push(c),
         }
     }
+}
+
+// ---- the authorized purge ----------------------------------------------------------------------
+
+/// `urn:cms:purge` — the reviewed removal. Resolving it with `Source` returns the confirm prompt
+/// (safe, idempotent); with `Sink` it *executes*: back up the bookmarks file, strike the confirmed
+/// removal candidates (`gone` + confirmed-`unreachable`) by URL, and write it back **through the
+/// kernel** — which cuts the bookmarks golden thread, so the derived graph re-derives and the room
+/// refreshes live. The HTTP face only reaches the `Sink` on an authenticated `POST /purge`.
+pub struct PurgeView {
+    /// The `urn:cms:src:{subpath}` IRI of the bookmarks file (what `BookmarkGraph` reads).
+    pub bookmarks_iri: String,
+    /// The `urn:cms:src:{subpath}.bak` IRI the old content is backed up to.
+    pub bak_iri: String,
+}
+
+#[async_trait]
+impl Endpoint for PurgeView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb == Verb::Sink {
+            self.execute(inv).await
+        } else {
+            Ok(fragment(self.confirm_html()))
+        }
+    }
+
+    fn name(&self) -> &str {
+        "cms-purge"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:purge")
+            .summary(
+                "Purge the confirmed-dead bookmarks from the source file (Sink executes, Source \
+                 returns the confirm prompt). Backs the file up first, then writes through the \
+                 kernel so the graph re-derives.",
+            )
+            .verb(Verb::Sink)
+            // It writes the bookmarks file (and its backup) through the fs resource.
+            .requires("urn:cap:fs:write:*")
+    }
+}
+
+impl PurgeView {
+    /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair.
+    fn confirm_html(&self) -> String {
+        let cache = load_status(&resolved_status_path());
+        let (gone, _unreachable) = buckets(&cache);
+        let n = gone.len();
+        if n == 0 {
+            return "<div class=\"cms-purge\"><p>Nothing to purge.</p>\
+                <button hx-get=\"/r/urn:cms:review\">back</button></div>"
+                .to_string();
+        }
+        format!(
+            "<div class=\"cms-purge\"><p>Remove <b>{}</b> definitively-dead (404/410) links from the \
+             bookmarks file? A backup is saved first — this can't be undone from the room.</p>\
+             <button class=\"cms-purge-go\" hx-post=\"/purge\">Confirm purge</button> \
+             <button hx-get=\"/r/urn:cms:review\">Cancel</button></div>",
+            group(n)
+        )
+    }
+
+    /// Execute (Sink): back up, strike, write through the kernel (→ live refresh), and drop the
+    /// purged URLs from the status cache too.
+    async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let status_path = resolved_status_path();
+        let cache = load_status(&status_path);
+        // Owned URLs, so the cache borrow is released before we rewrite the cache below. Only the
+        // removable (`gone`) set is ever purged — `unreachable` is flagged-only.
+        let removable: HashSet<String> = {
+            let (gone, _unreachable) = buckets(&cache);
+            gone.iter().map(|s| s.url.clone()).collect()
+        };
+        if removable.is_empty() {
+            return Ok(fragment(
+                "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
+            ));
+        }
+        let iri = Iri::parse(&self.bookmarks_iri)
+            .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
+        let bak = Iri::parse(&self.bak_iri)
+            .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
+        // Read the current file through the kernel, strike the matching entries.
+        let current = inv.source(&iri).await?;
+        let text = String::from_utf8_lossy(&current.bytes).into_owned();
+        let refs: HashSet<&str> = removable.iter().map(String::as_str).collect();
+        let (new_text, removed) = strike(&text, &refs);
+        // Back up the old content, then write the new — the write cuts the bookmarks golden thread
+        // (BookmarkGraph depends on it), so the graph re-derives and the room refreshes live.
+        inv.issue(
+            Request::new(Verb::Sink, bak).with_arg("content", ArgRef::Inline(text.into_bytes())),
+        )
+        .await?;
+        inv.issue(
+            Request::new(Verb::Sink, iri)
+                .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
+        )
+        .await?;
+        // The review view + indicator read the status cache (not the graph), so drop the purged
+        // URLs from it too — otherwise they'd keep showing as candidates until the next pass prunes
+        // them. Re-load in case a pass wrote it meanwhile.
+        let mut cache = load_status(&status_path);
+        cache.retain(|url, _| !removable.contains(url));
+        save_status(&status_path, &cache);
+        Ok(fragment(format!(
+            "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
+             refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
+            group(removed)
+        )))
+    }
+}
+
+/// Remove the org entries whose bookmark URL is in `removable`: drop each matching `*`-heading and
+/// the non-heading lines under it (its property drawer/body), keeping everything else verbatim.
+/// Returns the new content and how many entries were struck.
+fn strike(content: &str, removable: &HashSet<&str>) -> (String, usize) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut removed = 0;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if heading_url(line).is_some_and(|u| removable.contains(u.as_str())) {
+            // Drop the heading and its subtree (following non-heading lines).
+            removed += 1;
+            i += 1;
+            while i < lines.len() && !lines[i].starts_with('*') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    (out, removed)
+}
+
+/// The bookmark URL in an org heading `*… [[url][title]]` (or `[[url]]`), or `None` if the line is
+/// not a heading or has no link.
+fn heading_url(line: &str) -> Option<String> {
+    if !line.starts_with('*') {
+        return None;
+    }
+    let start = line.find("[[")? + 2;
+    let rest = &line[start..];
+    let end = rest.find([']', '['])?; // up to the `][` separator or the closing `]]`
+    Some(rest[..end].to_string())
+}
+
+/// Wrap an HTML string as an uncacheable text/html representation.
+fn fragment(html: String) -> Representation {
+    Representation::new(
+        ReprType::new("text/html").with_param("charset", "utf-8"),
+        html.into_bytes(),
+    )
 }
 
 /// A short "time ago" for the last check.
@@ -880,6 +1090,15 @@ mod tests {
             html.contains("cms-review"),
             "review renders its section: {html}"
         );
+
+        // The purge confirm prompt (Source — safe, no mutation) resolves and renders.
+        let preq = Request::new(Verb::Source, Iri::parse("urn:cms:purge").unwrap());
+        let prepr = futures::executor::block_on(kernel.issue(preq, &Capability::root()))
+            .expect("purge confirm resolves");
+        assert!(
+            String::from_utf8_lossy(&prepr.bytes).contains("cms-purge"),
+            "purge confirm renders"
+        );
     }
 
     fn st(status: &str, first: u64, count: u32) -> Status {
@@ -931,24 +1150,24 @@ mod tests {
     }
 
     #[test]
-    fn removable_needs_two_runs_over_a_day_for_unreachable_but_gone_always() {
-        let now = 3_000_000u64;
-        assert!(removable(&st("gone", now, 1), now));
-        assert!(!removable(&st("unreachable", now, 1), now));
-        assert!(!removable(&st("unreachable", now - 3_600, 2), now));
-        assert!(removable(&st("unreachable", now - 86_400, 2), now));
-        assert!(!removable(&st("ok", 0, 0), now));
+    fn only_gone_is_removable_never_unreachable() {
+        // A definitive 404/410 (`gone`) is removable; `unreachable` never, no matter how many times
+        // or how long it has failed (connection errors are too unreliable to delete on).
+        assert!(removable(&st("gone", 0, 1)));
+        assert!(!removable(&st("unreachable", 0, 9)));
+        assert!(!removable(&st("ok", 0, 0)));
     }
 
     #[test]
     fn the_status_fragment_shows_progress_running_tally_idle_and_nothing_before_a_run() {
         let now = 3_000_000u64;
-        // Running → progress, thousands-grouped, with the `running` class.
+        // Running with a FRESH heartbeat → progress, thousands-grouped, with the `running` class.
         let running = status_fragment(
             &Meta {
                 running: true,
                 checked: 1_240,
                 total: 5_373,
+                heartbeat: now,
                 finished_at: 0,
             },
             &HashMap::new(),
@@ -959,6 +1178,23 @@ mod tests {
             "{running}"
         );
         assert!(running.contains("cms-linkcheck running"), "{running}");
+        // Running but the heartbeat is STALE (killed pass, flag never cleared) → NOT shown as
+        // running; with no cache it falls through to empty.
+        let stale = status_fragment(
+            &Meta {
+                running: true,
+                checked: 1_240,
+                total: 5_373,
+                heartbeat: now - STALE_META_SECS - 1,
+                finished_at: 0,
+            },
+            &HashMap::new(),
+            now,
+        );
+        assert!(
+            stale.is_empty(),
+            "stale running should not show progress: {stale}"
+        );
         // Idle with a cache → the tally + "ago" (all entries checked in the same run, 2h ago).
         let mut cache = HashMap::new();
         let checked = |status: &str| {
@@ -984,7 +1220,7 @@ mod tests {
         g.title = "A \"quoted\" <title>".into();
         g.reason = "HTTP 404/410 (gone)".into();
         let xml = review_xml(&[&g], 638, now);
-        assert!(xml.contains("removable=\"1\" pending=\"638\""), "{xml}");
+        assert!(xml.contains("removable=\"1\" flagged=\"638\""), "{xml}");
         assert!(xml.contains("status=\"gone\""), "{xml}");
         assert!(xml.contains("days=\"2\""), "{xml}");
         // Attribute values are XML-escaped.
@@ -992,5 +1228,41 @@ mod tests {
         assert!(xml.contains("&quot;quoted&quot; &lt;title&gt;"), "{xml}");
         // No candidates → the empty marker.
         assert!(review_xml(&[], 0, now).contains("<empty/>"));
+    }
+
+    #[test]
+    fn heading_url_extracts_the_link_target() {
+        assert_eq!(
+            heading_url("** [[https://x/y][Title]]").as_deref(),
+            Some("https://x/y")
+        );
+        assert_eq!(
+            heading_url("** [[https://x/y]]").as_deref(),
+            Some("https://x/y")
+        );
+        assert_eq!(heading_url("   indented [[https://x]]"), None); // not a heading
+        assert_eq!(heading_url("** no link here"), None);
+    }
+
+    #[test]
+    fn strike_removes_matching_entries_and_their_drawers_keeping_the_rest() {
+        let content = "* Bookmarks\n\
+            ** [[https://dead.example][Dead]]\n   :PROPERTIES:\n   :ID: 1\n   :END:\n\
+            ** [[https://live.example][Live]]\n   :PROPERTIES:\n   :ID: 2\n   :END:\n\
+            ** [[https://gone.example]]\n";
+        let mut removable = HashSet::new();
+        removable.insert("https://dead.example");
+        removable.insert("https://gone.example");
+        let (out, removed) = strike(content, &removable);
+        assert_eq!(removed, 2);
+        assert!(!out.contains("dead.example"), "{out}");
+        assert!(!out.contains("gone.example"), "{out}");
+        assert!(
+            !out.contains(":ID: 1"),
+            "struck entry's drawer is gone: {out}"
+        );
+        assert!(out.contains("live.example"), "kept: {out}");
+        assert!(out.contains(":ID: 2"), "kept entry's drawer stays: {out}");
+        assert!(out.contains("* Bookmarks"), "parent heading stays: {out}");
     }
 }

@@ -731,6 +731,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1227,6 +1233,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "futures",
+ "futures-timer",
  "ikigai-cms",
  "ikigai-core",
  "ikigai-fs",
@@ -1275,9 +1282,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-http"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3245dcb41776b5b14fc7edb5e9c3e56111f47bc46b23810d7e68433b95d306"
+checksum = "9d039e0ba25dc7d4c0449c540d14a758fe32566f0fdc4d13296e735d714e3356"
 dependencies = [
  "async-trait",
  "ikigai-core",
