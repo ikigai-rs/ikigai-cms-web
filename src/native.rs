@@ -106,6 +106,10 @@ pub fn cms_spaces_with(
                 config: presentations,
             },
         )
+        .bind(Exact::new("urn:cms:graph:tags-approved"), ApprovedGraph)
+        .bind(Exact::new("urn:cms:graph:suggestions"), SuggestionsGraph)
+        .bind(Exact::new("urn:cms:tag-approve"), TagApprove)
+        .bind(Exact::new("urn:cms:tag-reject"), TagReject)
         .bind(Exact::new("urn:cms:graph"), CmsGraph);
     // The reading-room views — each IS a query, rendered as an htmx HTML fragment:
     // `urn:cms:view:{tag}` (cards for a tag), `urn:cms:search` (cards whose title
@@ -402,6 +406,22 @@ impl Endpoint for CmsGraph {
                 Iri::parse("urn:cms:graph:presentations").expect("valid IRI"),
             ))
             .await?;
+        // The tag overlays: promoted tags (dc:subject) and provisional suggestions
+        // (cms:suggestedTag), kept off the regenerated sources. Both are self-contained Turtle, so
+        // they concatenate like the rest. Issued through the kernel so a promote/dismiss (which
+        // rewrites the file) cuts this graph's thread and the room re-derives.
+        let approved = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:tags-approved").expect("valid IRI"),
+            ))
+            .await?;
+        let suggestions = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:suggestions").expect("valid IRI"),
+            ))
+            .await?;
         let mut turtle = bookmarks.bytes;
         turtle.push(b'\n');
         turtle.extend_from_slice(&bookmark_types.bytes);
@@ -409,11 +429,14 @@ impl Endpoint for CmsGraph {
         turtle.extend_from_slice(&books.bytes);
         turtle.push(b'\n');
         turtle.extend_from_slice(&presentations.bytes);
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&approved.bytes);
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&suggestions.bytes);
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             turtle,
-        )
-        .cacheable())
+        ))
     }
 
     fn name(&self) -> &str {
@@ -427,6 +450,110 @@ impl Endpoint for CmsGraph {
                  dc:subject/dc:title axis. Point `urn:sparql:* graph=urn:cms:graph` at it.",
             )
             .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:tags-approved` — the approved-tag overlay (`<resource> dc:subject "tag"`), read
+/// from the persisted store. Uncacheable: a promote rewrites the file outside the kernel's fs
+/// thread, so it must be re-read (the whole graph is uncacheable for the same reason).
+struct ApprovedGraph;
+
+#[async_trait]
+impl Endpoint for ApprovedGraph {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            crate::tagstore::approved_turtle().into_bytes(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-graph-tags-approved"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:tags-approved")
+            .summary("The human-approved tag overlay (dc:subject) merged into urn:cms:graph.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:suggestions` — the provisional-suggestion overlay (`<resource> cms:suggestedTag
+/// "tag"`), read from the persisted store. Uncacheable (see [`ApprovedGraph`]).
+struct SuggestionsGraph;
+
+#[async_trait]
+impl Endpoint for SuggestionsGraph {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            crate::tagstore::suggestions_turtle().into_bytes(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-graph-suggestions"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:suggestions")
+            .summary("The provisional tag-suggestion overlay (cms:suggestedTag) merged into urn:cms:graph.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:tag-approve` (Sink) — promote a suggested tag to a real `dc:subject`, returning the
+/// promoted tag as a normal chip so the `+` button swaps its pending chip for this in place (the
+/// resource now carries a real tag, and the overlay write makes it browsable under that tag).
+struct TagApprove;
+
+#[async_trait]
+impl Endpoint for TagApprove {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let book = inv.inline_str("book")?.to_string();
+        let tag = inv.inline_str("tag")?.to_string();
+        crate::tagstore::approve(&book, &tag);
+        let t = html_escape(&tag);
+        let html = format!(
+            "<a class=\"cms-tag\" hx-target=\"#room\" hx-get=\"/r/urn:cms:view:{t}\">#{t}</a>"
+        );
+        Ok(Representation::new(
+            ReprType::new("text/html").with_param("charset", "utf-8"),
+            html.into_bytes(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-tag-approve"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:tag-approve")
+            .summary("Promote a suggested tag to an approved dc:subject tag (Sink executes).")
+            .verb(Verb::Sink)
+            .input(ikigai_core::ArgSpec::new("book").summary("the resource IRI the tag is on"))
+            .input(ikigai_core::ArgSpec::new("tag").summary("the tag literal to promote"))
+    }
+}
+
+/// `urn:cms:tag-reject` (Sink) — dismiss a suggestion, returning nothing so the `x` button removes
+/// its pending chip.
+struct TagReject;
+
+#[async_trait]
+impl Endpoint for TagReject {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let book = inv.inline_str("book")?.to_string();
+        let tag = inv.inline_str("tag")?.to_string();
+        crate::tagstore::reject(&book, &tag);
+        Ok(Representation::new(
+            ReprType::new("text/html").with_param("charset", "utf-8"),
+            Vec::new(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-tag-reject"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:tag-reject")
+            .summary("Dismiss a tag suggestion (Sink executes).")
+            .verb(Verb::Sink)
+            .input(ikigai_core::ArgSpec::new("book").summary("the resource IRI the tag is on"))
+            .input(ikigai_core::ArgSpec::new("tag").summary("the tag literal to dismiss"))
     }
 }
 
@@ -478,6 +605,12 @@ const KIND_CONSTRUCT: &str = " ; cms:kind ?kind";
 const KIND_WHERE: &str = " OPTIONAL { ?s a ?kt . \
     FILTER(STRSTARTS(STR(?kt), \"https://ikigai-rs.dev/ns/cms#\")) \
     BIND(LCASE(REPLACE(STR(?kt), \"^.*#\", \"\")) AS ?kind) }";
+
+/// Carry provisional tag suggestions onto every card, joined from the `urn:cms:graph:suggestions`
+/// overlay (merged into `urn:cms:graph`). Multi-valued like `dc:subject` — repeated RDF/XML
+/// elements the stylesheet renders as pending chips with `+`/`x`.
+const SUGGEST_CONSTRUCT: &str = " ; cms:suggestedTag ?sg";
+const SUGGEST_WHERE: &str = " OPTIONAL { ?s cms:suggestedTag ?sg }";
 
 /// The validated card stylesheet from the `style` arg — only shipped card themes are
 /// honored (never resolve an arbitrary `urn:cms:style:*` off a client string).
@@ -821,9 +954,9 @@ impl Endpoint for TagView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
+                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
         );
         let view_iri = format!("urn:cms:view:{tag}");
         let ctx = ViewCtx {
@@ -884,9 +1017,9 @@ impl Endpoint for SearchView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
         );
         let ctx = ViewCtx {
             iri: "urn:cms:search",
@@ -971,9 +1104,9 @@ impl Endpoint for TypeView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT} }} \
+             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
         );
         let view_iri = format!("urn:cms:type:{ty}");
         let ctx = ViewCtx {
@@ -1113,6 +1246,64 @@ mod tests {
         }
         let (repr, _status) = Resolver::issue(kernel, request).expect("resolves");
         String::from_utf8(repr.bytes).unwrap()
+    }
+
+    #[test]
+    fn a_suggested_tag_renders_with_plus_x_and_approve_promotes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
+        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        let (_d, kernel) = kernel_over_fixture();
+        // The quic bookmark's subject IRI (skolemized) — what an overlay triple targets.
+        let json = select(
+            &kernel,
+            "SELECT ?s WHERE { ?s <http://purl.org/dc/elements/1.1/subject> \"quic\" } LIMIT 1",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = v["results"]["bindings"][0]["s"]["value"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Seed a suggestion on it, then render the quic view: the card shows a pending chip whose
+        // +/x buttons carry the book IRI (proving the CONSTRUCT join + `../@rdf:about` in xrust).
+        crate::tagstore::add_suggestion(&s, "networking-suggested");
+        let html = view(&kernel, "quic", "catalog");
+        assert!(html.contains("networking-suggested"), "chip text: {html}");
+        assert!(html.contains("/tag/approve"), "promote button: {html}");
+        assert!(html.contains("/tag/reject"), "dismiss button: {html}");
+        assert!(html.contains(&s), "hx-vals carries the book IRI: {html}");
+        // Every card theme renders the suggestion chip (suggestions ride the shared CONSTRUCT).
+        for style in ["mosaic", "agenda"] {
+            let h = view(&kernel, "quic", style);
+            assert!(
+                h.contains("networking-suggested") && h.contains("/tag/approve"),
+                "{style} renders the suggestion chip: {h}"
+            );
+        }
+
+        // Promote it through the endpoint → returns a real tag chip; the store moves it.
+        let ap = Request::new(Verb::Sink, Iri::parse("urn:cms:tag-approve").unwrap())
+            .with_arg("book", ArgRef::Inline(s.clone().into_bytes()))
+            .with_arg("tag", ArgRef::Inline(b"networking-suggested".to_vec()));
+        let (chip, _) = Resolver::issue(&kernel, ap).expect("approve resolves");
+        let chip = String::from_utf8(chip.bytes).unwrap();
+        assert!(
+            chip.contains("cms-tag") && chip.contains("networking-suggested"),
+            "promoted chip: {chip}"
+        );
+        assert!(
+            crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty(),
+            "suggestion left the suggestions overlay"
+        );
+        assert!(
+            crate::tagstore::entries(&crate::tagstore::approved_path())
+                .iter()
+                .any(|e| e.iri == s && e.tag == "networking-suggested"),
+            "suggestion landed in the approved overlay"
+        );
+        std::env::remove_var("CMS_TAG_SUGGESTIONS");
+        std::env::remove_var("CMS_TAG_APPROVED");
     }
 
     #[test]

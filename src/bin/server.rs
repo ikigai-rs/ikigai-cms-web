@@ -682,6 +682,12 @@ async fn handle_http(
     } else if req.target == "/purge" && req.method == "POST" {
         let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge");
         (s, c, b, None)
+    } else if req.target == "/tag/approve" && req.method == "POST" {
+        let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-approve", &body);
+        (s, c, b, None)
+    } else if req.target == "/tag/reject" && req.method == "POST" {
+        let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-reject", &body);
+        (s, c, b, None)
     } else if req.target == "/purge-unreachable" && req.method == "POST" {
         let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-unreachable");
         (s, c, b, None)
@@ -757,6 +763,58 @@ fn handle_purge(
             format!("<p class=\"cms-error\">purge failed: {e}</p>").into_bytes(),
         ),
     }
+}
+
+/// `POST /tag/{approve,reject}` — the reviewed tag-suggestion action. Same authorization as the
+/// purge (signed-in or `dev_open`), run elevated. `book`/`tag` ride in the form body (htmx `hx-vals`,
+/// URL-encoded). Returns the fragment the `+`/`x` button swaps in place (a real chip, or nothing).
+fn handle_tag(
+    kernel: &Kernel,
+    auth: &HttpAuth,
+    sid: Option<&str>,
+    dev_open: bool,
+    iri: &str,
+    body: &[u8],
+) -> (&'static str, &'static str, Vec<u8>) {
+    let authed = dev_open
+        || sid.is_some_and(|s| {
+            auth.sessions
+                .lock()
+                .unwrap()
+                .get(s)
+                .is_some_and(|sess| sess.scopes.is_some())
+        });
+    if !authed {
+        return (
+            "200 OK",
+            "text/html; charset=utf-8",
+            b"<span class=\"cms-error\">Sign in to curate tags.</span>".to_vec(),
+        );
+    }
+    let (book, tag) = (
+        form_param(body, "book").unwrap_or_default(),
+        form_param(body, "tag").unwrap_or_default(),
+    );
+    let req = Request::new(Verb::Sink, Iri::parse(iri).expect("valid IRI"))
+        .with_arg("book", ArgRef::Inline(book.into_bytes()))
+        .with_arg("tag", ArgRef::Inline(tag.into_bytes()));
+    match Resolver::issue_as(kernel, req, &Capability::root()) {
+        Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
+        Err(e) => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            format!("<span class=\"cms-error\">tag action failed: {e}</span>").into_bytes(),
+        ),
+    }
+}
+
+/// Pull one `application/x-www-form-urlencoded` field from a POST body (`+`→space, percent-decoded).
+fn form_param(body: &[u8], key: &str) -> Option<String> {
+    let s = String::from_utf8_lossy(body);
+    s.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| percent_decode(&v.replace('+', " ")))
+    })
 }
 
 /// the wire runs. `urn:cms:recent` is a session resource (this principal's trail), rendered here
