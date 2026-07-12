@@ -52,9 +52,10 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext;
 # 0.1.1 adds require_biometric (Touch ID) to gate enrollment.
 ikigai-secret = { version = "0.1.1", optional = true }
-# Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.5 =
-# honest status (HEAD → true/false) + the caller `max_age` freshness directive.
-ikigai-http = { version = "0.1.5", optional = true }
+# Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.6 = lenient
+# Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
+# failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.
+ikigai-http = { version = "0.1.6", optional = true }
 # An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
 # thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
 # system OpenSSL dep in CI.
