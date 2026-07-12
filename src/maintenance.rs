@@ -70,7 +70,10 @@ impl ReqwestTransport {
     /// default). Panics if not called within a tokio runtime — it needs a handle to spawn onto.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(12))
+            // Patient on purpose: a genuinely dead host fails fast (DNS/refused in <1s regardless of
+            // this), so the timeout only matters for slow-but-alive sites (old edu/personal servers).
+            // 20s gives them room to answer instead of being false-flagged unreachable.
+            .timeout(Duration::from_secs(20))
             .user_agent("ikigai-cms-linkcheck")
             // Every bookmark is a different host, so a per-host idle keep-alive pool is useless and
             // harmful: it accumulates hundreds of open connections and starves DNS/sockets, which
