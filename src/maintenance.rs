@@ -5,9 +5,11 @@
 //! `cms-server` `urn:time` schedule just *source* it, so there is one implementation.
 //!
 //! `ikigai-http` reports status honestly; the *policy* about what's "dead" lives here (the
-//! caller): `"true"` = alive, `"false"` = gone (404/410), a transient error = unreachable, a
-//! permanent one (a 400/403 the server *answered* with) = alive. Each check passes `max_age`, so
-//! in the long-lived server a URL checked within the week is a cache hit.
+//! caller): `"true"` = alive, a transient error = unreachable, a permanent one (a 400/403 the server
+//! *answered* with) = alive. A HEAD `"false"` (404/410) is NOT trusted alone — many live servers
+//! 404 a HEAD but serve a GET — so it is confirmed with a real `urn:httpGet`; only a GET that *also*
+//! 404s is `gone`. Each check passes `max_age`, so in the long-lived server a URL checked within the
+//! week is a cache hit.
 //!
 //! The checks run as **parked futures** bounded at [`CONCURRENCY`] in flight — no thread pool. The
 //! transport captures a tokio [`Handle`] and spawns each request onto it, so the fan-out works
@@ -339,8 +341,9 @@ impl Endpoint for LinkCheckPass {
     fn describe(&self) -> Description {
         Description::new("urn:cms:linkcheck")
             .summary(
-                "Run the link-check pass: HEAD-check every bookmark, reconcile the persisted \
-                 status, and write the dead-links review. Returns a summary line.",
+                "Run the link-check pass: HEAD-check every bookmark (a HEAD 404 confirmed by a \
+                 GET before it counts as gone), reconcile the persisted status, and write the \
+                 dead-links review. Returns a summary line.",
             )
             .verb(Verb::Source)
             .input(
@@ -460,9 +463,11 @@ async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
     }
 }
 
-/// A single `urn:httpHead`+`Exists` resolve (cacheable a week). `"true"` = alive, `"false"` = gone;
-/// a **transient** error = unreachable (couldn't reach), a **permanent** one (a status the server
-/// answered with) = alive (a HEAD-hostile but live site isn't condemned).
+/// A single reachability check. The cheap first pass is `urn:httpHead`+`Exists` (cacheable a week):
+/// `"true"` = alive, a **transient** error = unreachable, a **permanent** one (a status the server
+/// answered with) = alive (a HEAD-hostile but live site isn't condemned). A `"false"` (HEAD 404/410)
+/// is NOT trusted on its own — **many servers 404 a HEAD but serve a GET** — so we confirm with a
+/// real GET before ever concluding `gone`. Only a GET that *also* 404s is a removal candidate.
 async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
     let request = Request::new(Verb::Exists, Iri::parse("urn:httpHead").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
@@ -473,11 +478,31 @@ async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
     match inv.issue(request).await {
         Ok(repr) => match repr.bytes.as_slice() {
             b"true" => Outcome::Alive,
-            b"false" => Outcome::Gone("HTTP 404/410 (gone)".to_string()),
+            b"false" => confirm_gone_with_get(inv, url).await,
             other => {
                 Outcome::Unreachable(format!("unexpected: {}", String::from_utf8_lossy(other)))
             }
         },
+        Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
+        Err(_) => Outcome::Alive,
+    }
+}
+
+/// A HEAD said 404/410 — but HEAD is unreliable (plenty of live servers reject it with a 404 while
+/// serving the same URL on GET). Ask the authority: a real `urn:httpGet`. A GET that succeeds means
+/// the page is live (HEAD-hostile, not gone); a GET that *also* 404s (`Error::NotFound`) is a genuine
+/// `gone`; a transient GET error is `unreachable`; any other answered status (403/400/…) means the
+/// resource is there, just not fetchable this way — not gone.
+async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
+    let request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+        .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+        .with_arg(
+            "max_age",
+            ArgRef::Inline(WEEK_SECS.to_string().into_bytes()),
+        );
+    match inv.issue(request).await {
+        Ok(_) => Outcome::Alive,
+        Err(Error::NotFound(_)) => Outcome::Gone("HTTP 404/410 (GET-confirmed)".to_string()),
         Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
         Err(_) => Outcome::Alive,
     }
