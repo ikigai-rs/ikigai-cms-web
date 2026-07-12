@@ -45,6 +45,13 @@
   .cms-seg-btn:last-child { border-right:none; }
   .cms-seg-btn:hover { color:var(--fg); }
   .cms-seg-btn.is-active { background:var(--accent-bg); color:var(--accent); font-weight:600; cursor:default; }
+  /* Purge confirm/result (rendered by urn:cms:purge, no stylesheet of its own). */
+  .cms-purge { max-width:520px; margin:24px auto; border:1px solid var(--line); border-radius:14px; padding:20px 22px; background:var(--card); }
+  .cms-purge p { margin:0 0 16px; line-height:1.5; }
+  .cms-purge button { font:14px system-ui; padding:7px 16px; border:1px solid var(--line); border-radius:9px; background:var(--bg); color:var(--fg); cursor:pointer; margin-right:8px; }
+  .cms-purge button:hover { border-color:var(--accent); }
+  .cms-purge .cms-purge-go { border-color:#c0392b; color:#c0392b; }
+  .cms-purge .cms-purge-go:hover { background:#c0392b; color:#fff; }
   #room { margin-top:16px; }
   /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
   #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }

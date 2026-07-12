@@ -24,10 +24,13 @@
       .cms-dead-url{display:block;color:var(--mut,#888);font-size:11px;word-break:break-all;margin:2px 0}
       .cms-dead-meta{color:var(--mut,#888);font-size:12px}
       .cms-review-empty{color:var(--mut,#888);font-size:.95rem;padding:6px 0}
+      .cms-review-purge{font:13px system-ui;padding:4px 12px;border:1px solid #c0392b;border-radius:8px;background:transparent;color:#c0392b;cursor:pointer;margin-left:6px}
+      .cms-review-purge:hover{background:#c0392b;color:#fff}
     </style>
     <div class="cms-review-head">
       <xsl:value-of select="@removable"/><xsl:text> to remove · </xsl:text>
-      <xsl:value-of select="@pending"/><xsl:text> pending confirmation (re-run to promote)</xsl:text>
+      <xsl:value-of select="@pending"/><xsl:text> pending confirmation (re-run to promote) </xsl:text>
+      <button class="cms-review-purge" hx-get="/r/urn:cms:purge">Purge…</button>
     </div>
     <section class="cms-review">
       <xsl:apply-templates/>

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Exact, Fallback, Invocation, Iri, Kernel,
+    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
     ReprType, Representation, Request, Result, Space, SystemClock, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
@@ -711,6 +711,156 @@ fn xml_attr(out: &mut String, s: &str) {
     }
 }
 
+// ---- the authorized purge ----------------------------------------------------------------------
+
+/// `urn:cms:purge` — the reviewed removal. Resolving it with `Source` returns the confirm prompt
+/// (safe, idempotent); with `Sink` it *executes*: back up the bookmarks file, strike the confirmed
+/// removal candidates (`gone` + confirmed-`unreachable`) by URL, and write it back **through the
+/// kernel** — which cuts the bookmarks golden thread, so the derived graph re-derives and the room
+/// refreshes live. The HTTP face only reaches the `Sink` on an authenticated `POST /purge`.
+pub struct PurgeView {
+    /// The `urn:cms:src:{subpath}` IRI of the bookmarks file (what `BookmarkGraph` reads).
+    pub bookmarks_iri: String,
+    /// The `urn:cms:src:{subpath}.bak` IRI the old content is backed up to.
+    pub bak_iri: String,
+}
+
+#[async_trait]
+impl Endpoint for PurgeView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb == Verb::Sink {
+            self.execute(inv).await
+        } else {
+            Ok(fragment(self.confirm_html()))
+        }
+    }
+
+    fn name(&self) -> &str {
+        "cms-purge"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:purge")
+            .summary(
+                "Purge the confirmed-dead bookmarks from the source file (Sink executes, Source \
+                 returns the confirm prompt). Backs the file up first, then writes through the \
+                 kernel so the graph re-derives.",
+            )
+            .verb(Verb::Sink)
+            // It writes the bookmarks file (and its backup) through the fs resource.
+            .requires("urn:cap:fs:write:*")
+    }
+}
+
+impl PurgeView {
+    /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair.
+    fn confirm_html(&self) -> String {
+        let cache = load_status(&resolved_status_path());
+        let now = unix_now();
+        let (gone, confirmed, _pending) = buckets(&cache, now);
+        let n = gone.len() + confirmed.len();
+        if n == 0 {
+            return "<div class=\"cms-purge\"><p>Nothing to purge.</p>\
+                <button hx-get=\"/r/urn:cms:review\">back</button></div>"
+                .to_string();
+        }
+        format!(
+            "<div class=\"cms-purge\"><p>Remove <b>{}</b> confirmed-dead links from the bookmarks \
+             file? A backup is saved first — this can't be undone from the room.</p>\
+             <button class=\"cms-purge-go\" hx-post=\"/purge\">Confirm purge</button> \
+             <button hx-get=\"/r/urn:cms:review\">Cancel</button></div>",
+            group(n)
+        )
+    }
+
+    /// Execute (Sink): back up, strike, write through the kernel (→ live refresh).
+    async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let cache = load_status(&resolved_status_path());
+        let now = unix_now();
+        let (gone, confirmed, _pending) = buckets(&cache, now);
+        let removable: HashSet<&str> = gone
+            .iter()
+            .chain(&confirmed)
+            .map(|s| s.url.as_str())
+            .collect();
+        if removable.is_empty() {
+            return Ok(fragment(
+                "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
+            ));
+        }
+        let iri = Iri::parse(&self.bookmarks_iri)
+            .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
+        let bak = Iri::parse(&self.bak_iri)
+            .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
+        // Read the current file through the kernel.
+        let current = inv.source(&iri).await?;
+        let text = String::from_utf8_lossy(&current.bytes).into_owned();
+        let (new_text, removed) = strike(&text, &removable);
+        // Back up the old content, then write the new — the write cuts the bookmarks golden thread
+        // (BookmarkGraph depends on it), so the graph re-derives and the room refreshes live.
+        inv.issue(
+            Request::new(Verb::Sink, bak).with_arg("content", ArgRef::Inline(text.into_bytes())),
+        )
+        .await?;
+        inv.issue(
+            Request::new(Verb::Sink, iri)
+                .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
+        )
+        .await?;
+        Ok(fragment(format!(
+            "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
+             refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
+            group(removed)
+        )))
+    }
+}
+
+/// Remove the org entries whose bookmark URL is in `removable`: drop each matching `*`-heading and
+/// the non-heading lines under it (its property drawer/body), keeping everything else verbatim.
+/// Returns the new content and how many entries were struck.
+fn strike(content: &str, removable: &HashSet<&str>) -> (String, usize) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut removed = 0;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if heading_url(line).is_some_and(|u| removable.contains(u.as_str())) {
+            // Drop the heading and its subtree (following non-heading lines).
+            removed += 1;
+            i += 1;
+            while i < lines.len() && !lines[i].starts_with('*') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    (out, removed)
+}
+
+/// The bookmark URL in an org heading `*… [[url][title]]` (or `[[url]]`), or `None` if the line is
+/// not a heading or has no link.
+fn heading_url(line: &str) -> Option<String> {
+    if !line.starts_with('*') {
+        return None;
+    }
+    let start = line.find("[[")? + 2;
+    let rest = &line[start..];
+    let end = rest.find([']', '['])?; // up to the `][` separator or the closing `]]`
+    Some(rest[..end].to_string())
+}
+
+/// Wrap an HTML string as an uncacheable text/html representation.
+fn fragment(html: String) -> Representation {
+    Representation::new(
+        ReprType::new("text/html").with_param("charset", "utf-8"),
+        html.into_bytes(),
+    )
+}
+
 /// A short "time ago" for the last check.
 fn ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
@@ -880,6 +1030,15 @@ mod tests {
             html.contains("cms-review"),
             "review renders its section: {html}"
         );
+
+        // The purge confirm prompt (Source — safe, no mutation) resolves and renders.
+        let preq = Request::new(Verb::Source, Iri::parse("urn:cms:purge").unwrap());
+        let prepr = futures::executor::block_on(kernel.issue(preq, &Capability::root()))
+            .expect("purge confirm resolves");
+        assert!(
+            String::from_utf8_lossy(&prepr.bytes).contains("cms-purge"),
+            "purge confirm renders"
+        );
     }
 
     fn st(status: &str, first: u64, count: u32) -> Status {
@@ -992,5 +1151,41 @@ mod tests {
         assert!(xml.contains("&quot;quoted&quot; &lt;title&gt;"), "{xml}");
         // No candidates → the empty marker.
         assert!(review_xml(&[], 0, now).contains("<empty/>"));
+    }
+
+    #[test]
+    fn heading_url_extracts_the_link_target() {
+        assert_eq!(
+            heading_url("** [[https://x/y][Title]]").as_deref(),
+            Some("https://x/y")
+        );
+        assert_eq!(
+            heading_url("** [[https://x/y]]").as_deref(),
+            Some("https://x/y")
+        );
+        assert_eq!(heading_url("   indented [[https://x]]"), None); // not a heading
+        assert_eq!(heading_url("** no link here"), None);
+    }
+
+    #[test]
+    fn strike_removes_matching_entries_and_their_drawers_keeping_the_rest() {
+        let content = "* Bookmarks\n\
+            ** [[https://dead.example][Dead]]\n   :PROPERTIES:\n   :ID: 1\n   :END:\n\
+            ** [[https://live.example][Live]]\n   :PROPERTIES:\n   :ID: 2\n   :END:\n\
+            ** [[https://gone.example]]\n";
+        let mut removable = HashSet::new();
+        removable.insert("https://dead.example");
+        removable.insert("https://gone.example");
+        let (out, removed) = strike(content, &removable);
+        assert_eq!(removed, 2);
+        assert!(!out.contains("dead.example"), "{out}");
+        assert!(!out.contains("gone.example"), "{out}");
+        assert!(
+            !out.contains(":ID: 1"),
+            "struck entry's drawer is gone: {out}"
+        );
+        assert!(out.contains("live.example"), "kept: {out}");
+        assert!(out.contains(":ID: 2"), "kept entry's drawer stays: {out}");
+        assert!(out.contains("* Bookmarks"), "parent heading stays: {out}");
     }
 }

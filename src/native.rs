@@ -91,6 +91,9 @@ pub fn cms_spaces_with(
         "urn:cms:src:{}",
         bookmarks.as_deref().unwrap_or(DEFAULT_BOOKMARKS)
     );
+    // The purge writes the same bookmarks resource; keep its IRI before BookmarkGraph consumes it.
+    #[cfg(feature = "maintenance")]
+    let bookmarks_src_purge = bookmarks_src.clone();
     let graph = EndpointSpace::new()
         .bind(
             Exact::new("urn:cms:graph:bookmarks"),
@@ -155,7 +158,15 @@ pub fn cms_spaces_with(
                 crate::maintenance::LinkStatusView,
             )
             // urn:cms:review — the suggested-deletes review, rendered via urn:cms:style:review.
-            .bind(Exact::new("urn:cms:review"), crate::maintenance::ReviewView),
+            .bind(Exact::new("urn:cms:review"), crate::maintenance::ReviewView)
+            // urn:cms:purge — the reviewed removal (Source = confirm, Sink = execute).
+            .bind(
+                Exact::new("urn:cms:purge"),
+                crate::maintenance::PurgeView {
+                    bak_iri: format!("{bookmarks_src_purge}.bak"),
+                    bookmarks_iri: bookmarks_src_purge,
+                },
+            ),
     ) as Arc<dyn Space>);
     spaces
 }

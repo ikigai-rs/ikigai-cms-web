@@ -679,6 +679,9 @@ async fn handle_http(
             entitlement,
             dev_open,
         )
+    } else if req.target == "/purge" && req.method == "POST" {
+        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open);
+        (s, c, b, None)
     } else if let Some(target) = req.target.strip_prefix("/r/") {
         let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
         let (s, c, b) = resolve_http(kernel, recent, &cap, principal.as_deref(), target);
@@ -716,6 +719,42 @@ async fn handle_http(
 }
 
 /// Resolve `/r/{iri}?args` to an HTML fragment via the kernel under `cap` — the same `resolve()`
+/// `POST /purge` — execute the reviewed removal. Authorization is **"you're signed in"** (an
+/// authenticated session, or `dev_open`); the purge itself runs **elevated** (`root`) so it can
+/// write the bookmarks file, since the room's session capability is deliberately read-only. The
+/// two-step confirm (Source prompt → this POST) plus the file backup are the guardrails.
+fn handle_purge(
+    kernel: &Kernel,
+    auth: &HttpAuth,
+    sid: Option<&str>,
+    dev_open: bool,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let authed = dev_open
+        || sid.is_some_and(|s| {
+            auth.sessions
+                .lock()
+                .unwrap()
+                .get(s)
+                .is_some_and(|sess| sess.scopes.is_some())
+        });
+    if !authed {
+        return (
+            "200 OK",
+            "text/html; charset=utf-8",
+            b"<p class=\"cms-error\">Sign in to purge.</p>".to_vec(),
+        );
+    }
+    let req = Request::new(Verb::Sink, Iri::parse("urn:cms:purge").expect("valid IRI"));
+    match Resolver::issue_as(kernel, req, &Capability::root()) {
+        Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
+        Err(e) => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            format!("<p class=\"cms-error\">purge failed: {e}</p>").into_bytes(),
+        ),
+    }
+}
+
 /// the wire runs. `urn:cms:recent` is a session resource (this principal's trail), rendered here
 /// rather than in the kernel; every other resolved view is noted to the trail. Args ride as
 /// query params. A resolve error becomes an inline error fragment so htmx swaps something visible.
