@@ -627,6 +627,90 @@ fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> St
     )
 }
 
+/// `urn:cms:review` — the suggested-deletes review as an htmx card fragment. Reads the persisted
+/// status, takes the removal candidates (`gone` + confirmed-`unreachable`), and renders them
+/// through the `review` stylesheet (a view is a query; here the "query" is the removable set). The
+/// pending count rides along so the header can note "N pending confirmation". Read-only — the
+/// authorized purge is a separate action.
+pub struct ReviewView;
+
+#[async_trait]
+impl Endpoint for ReviewView {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let cache = load_status(&resolved_status_path());
+        let now = unix_now();
+        let (gone, confirmed, pending) = buckets(&cache, now);
+        let mut removable: Vec<&Status> = gone.into_iter().chain(confirmed).collect();
+        removable.sort_by(|a, b| a.url.cmp(&b.url));
+        let xml = review_xml(&removable, pending.len(), now);
+        let req = Request::new(
+            Verb::Source,
+            Iri::parse("urn:xslt:transform").expect("valid IRI"),
+        )
+        .with_arg("content", ArgRef::Inline(xml.into_bytes()))
+        .with_arg(
+            "stylesheet",
+            ArgRef::Inline(b"urn:cms:style:review".to_vec()),
+        );
+        let out = inv.issue(req).await?;
+        Ok(Representation::new(
+            ReprType::new("text/html").with_param("charset", "utf-8"),
+            out.bytes,
+        )
+        .cacheable())
+    }
+
+    fn name(&self) -> &str {
+        "cms-review"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:review")
+            .summary("The suggested-deletes review: the link-check removal candidates rendered as cards.")
+            .verb(Verb::Source)
+    }
+}
+
+/// Build the review doc (`urn:cms:review#`) from the removable candidates + the pending count.
+/// An empty candidate set is its own element (the stylesheet needs no conditionals).
+fn review_xml(removable: &[&Status], pending: usize, now: u64) -> String {
+    let mut s = format!(
+        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" pending=\"{pending}\">",
+        removable.len()
+    );
+    if removable.is_empty() {
+        s.push_str("<empty/>");
+    } else {
+        for it in removable {
+            let days = now.saturating_sub(it.first_broken_at) / 86_400;
+            s.push_str("<item status=\"");
+            xml_attr(&mut s, &it.status);
+            s.push_str("\" reason=\"");
+            xml_attr(&mut s, &it.reason);
+            s.push_str(&format!("\" days=\"{days}\" url=\""));
+            xml_attr(&mut s, &it.url);
+            s.push_str("\" title=\"");
+            xml_attr(&mut s, &it.title);
+            s.push_str("\"/>");
+        }
+    }
+    s.push_str("</review>");
+    s
+}
+
+/// Escape a value for an XML double-quoted attribute.
+fn xml_attr(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+}
+
 /// A short "time ago" for the last check.
 fn ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
@@ -785,6 +869,17 @@ mod tests {
             futures::executor::block_on(kernel.issue(sreq, &Capability::root())).is_ok(),
             "urn:cms:linkstatus resolves"
         );
+
+        // The review view resolves through the review stylesheet (xrust) — this exercises the
+        // whole pipeline (endpoint → build XML → urn:xslt:transform → urn:cms:style:review).
+        let rreq = Request::new(Verb::Source, Iri::parse("urn:cms:review").unwrap());
+        let rrepr = futures::executor::block_on(kernel.issue(rreq, &Capability::root()))
+            .expect("review resolves");
+        let html = String::from_utf8_lossy(&rrepr.bytes);
+        assert!(
+            html.contains("cms-review"),
+            "review renders its section: {html}"
+        );
     }
 
     fn st(status: &str, first: u64, count: u32) -> Status {
@@ -879,5 +974,23 @@ mod tests {
         assert!(idle.contains("2h ago"), "{idle}");
         // Never run → empty (the CSS hides an empty indicator).
         assert!(status_fragment(&Meta::default(), &HashMap::new(), now).is_empty());
+    }
+
+    #[test]
+    fn review_xml_lists_candidates_with_escaped_attrs_or_an_empty_marker() {
+        let now = 3_000_000u64;
+        let mut g = st("gone", now - 172_800, 1); // 2 days
+        g.url = "https://x/?a=1&b=2".into();
+        g.title = "A \"quoted\" <title>".into();
+        g.reason = "HTTP 404/410 (gone)".into();
+        let xml = review_xml(&[&g], 638, now);
+        assert!(xml.contains("removable=\"1\" pending=\"638\""), "{xml}");
+        assert!(xml.contains("status=\"gone\""), "{xml}");
+        assert!(xml.contains("days=\"2\""), "{xml}");
+        // Attribute values are XML-escaped.
+        assert!(xml.contains("a=1&amp;b=2"), "{xml}");
+        assert!(xml.contains("&quot;quoted&quot; &lt;title&gt;"), "{xml}");
+        // No candidates → the empty marker.
+        assert!(review_xml(&[], 0, now).contains("<empty/>"));
     }
 }
