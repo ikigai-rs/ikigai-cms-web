@@ -25,6 +25,7 @@ async fn main() {
         });
     let limit = args.next();
     let bookmarks = std::env::var("CMS_BOOKMARKS").ok();
+    let zotero = std::env::var_os("CMS_ZOTERO").map(PathBuf::from);
     let status_path = std::env::var("CMS_LINKSTATUS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| ikigai_cms_web::maintenance::default_status_path());
@@ -35,7 +36,7 @@ async fn main() {
         bookmarks.as_deref().unwrap_or("(default)"),
         status_path.display()
     );
-    let kernel = build_maintenance_kernel(src_dir, bookmarks, status_path);
+    let kernel = build_maintenance_kernel(src_dir, zotero, bookmarks, status_path);
     let mut req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
     if let Some(limit) = limit {
         req = req.with_arg("limit", ArgRef::Inline(limit.into_bytes()));

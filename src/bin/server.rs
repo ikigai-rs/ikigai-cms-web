@@ -188,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cloned for the optional maintenance kernel (below), before the serving kernel consumes them.
     let src_dir_maint = src_dir.clone();
     let bookmarks_maint = bookmarks.clone();
+    let zotero_maint = zotero.clone();
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
         src_dir,
         zotero,
@@ -237,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let maint = Arc::new(ikigai_cms_web::maintenance::build_maintenance_kernel(
             src_dir_maint,
+            zotero_maint,
             bookmarks_maint,
             status_path,
         ));

@@ -269,11 +269,19 @@ PREFIX z: <http://www.zotero.org/namespaces/export#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX cms: <https://ikigai-rs.dev/ns/cms#>
-CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug }
+CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug ; cms:isbn ?isbn }
 WHERE {
   ?book a bib:Book ; dc:title ?title .
   BIND(IRI(CONCAT("urn:cms:book:", SHA256(STR(?book)))) AS ?id)
   BIND(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title)) AS ?lookup)
+  # Zotero keys a book's subject IRI on its ISBN (urn:isbn:…) — surface it so the tag-suggest pass
+  # can look the book up in OpenLibrary by ISBN. Unbound (no triple) when the book has no ISBN. The
+  # OPTIONAL carries a triple anchor (not just BIND/FILTER) so Oxigraph binds ?isbn.
+  OPTIONAL {
+    ?book a bib:Book .
+    FILTER(STRSTARTS(STR(?book), "urn:isbn:"))
+    BIND(REPLACE(STR(?book), "^urn:isbn:", "") AS ?isbn)
+  }
   OPTIONAL {
     ?book bib:authors ?seq . ?seq ?ap ?person .
     FILTER(STRSTARTS(STR(?ap), "http://www.w3.org/1999/02/22-rdf-syntax-ns#_"))
@@ -1250,6 +1258,7 @@ mod tests {
 
     #[test]
     fn a_suggested_tag_renders_with_plus_x_and_approve_promotes_it() {
+        let _g = crate::tagstore::env_guard();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
