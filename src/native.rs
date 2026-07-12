@@ -128,7 +128,8 @@ pub fn cms_spaces_with(
         FnEndpoint::new("cms-style", stylesheet),
     );
 
-    vec![
+    #[allow(unused_mut)]
+    let mut spaces = vec![
         // Before `src`: the exact `urn:cms:src:zotero` must win over the `urn:cms:src:{path}`
         // template (which would otherwise match it with path=`zotero`).
         Arc::new(zotero_space) as Arc<dyn Space>,
@@ -141,7 +142,17 @@ pub fn cms_spaces_with(
         Arc::new(ikigai_sparql::space()) as Arc<dyn Space>,
         // urn:xslt:transform — the view pipes its CONSTRUCT'd RDF/XML through a stylesheet.
         Arc::new(ikigai_xslt::space()) as Arc<dyn Space>,
-    ]
+    ];
+    // The link-check status indicator (`urn:cms:linkstatus`) — a file-backed HTML fragment the room
+    // htmx-polls for the running/last-run state. Present only when the maintenance stack is
+    // compiled in (it shares that status format); it does no network, so it's safe in the serving
+    // kernel.
+    #[cfg(feature = "maintenance")]
+    spaces.push(Arc::new(EndpointSpace::new().bind(
+        Exact::new("urn:cms:linkstatus"),
+        crate::maintenance::LinkStatusView,
+    )) as Arc<dyn Space>);
+    spaces
 }
 
 /// `urn:cms:style:{name}` — a reading-room stylesheet (XSLT), keyed on the confirmed
