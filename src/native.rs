@@ -159,11 +159,22 @@ pub fn cms_spaces_with(
             )
             // urn:cms:review — the suggested-deletes review, rendered via urn:cms:style:review.
             .bind(Exact::new("urn:cms:review"), crate::maintenance::ReviewView)
-            // urn:cms:purge — the reviewed removal (Source = confirm, Sink = execute).
+            // urn:cms:purge — the reviewed removal of the definitively-dead `gone` set.
             .bind(
                 Exact::new("urn:cms:purge"),
                 crate::maintenance::PurgeView {
+                    set: crate::maintenance::RemovalSet::Gone,
                     bak_iri: format!("{bookmarks_src_purge}.bak"),
+                    bookmarks_iri: bookmarks_src_purge.clone(),
+                },
+            )
+            // urn:cms:purge-unreachable — the reviewed removal of the durably-unreachable set (its
+            // own backup file so it doesn't clobber the `gone` purge's backup).
+            .bind(
+                Exact::new("urn:cms:purge-unreachable"),
+                crate::maintenance::PurgeView {
+                    set: crate::maintenance::RemovalSet::DurableUnreachable,
+                    bak_iri: format!("{bookmarks_src_purge}.unreach.bak"),
                     bookmarks_iri: bookmarks_src_purge,
                 },
             ),

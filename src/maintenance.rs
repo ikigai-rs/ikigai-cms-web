@@ -178,13 +178,71 @@ enum Outcome {
     Unreachable(String),
 }
 
-/// Whether a status is a removal candidate. **Only a definitive `gone` (HTTP 404/410) qualifies.**
-/// `unreachable` (a connection/timeout/DNS error) is deliberately NEVER auto-removable: those
-/// failures are too unreliable — a rate-limiting CDN, a DNS hiccup, or the checker throttling its
-/// own machine can all fake one, and a self-inflicted failure repeating every run would spuriously
-/// "confirm" it. Unreachable links are surfaced for the human to judge, not auto-purged.
+/// Whether a status is auto-removable evidence-wise. **Only a definitive `gone` (HTTP 404/410)
+/// qualifies.** `unreachable` (a connection/timeout/DNS error) is NEVER auto-removable on a single
+/// check: those failures are too unreliable — a rate-limiting CDN, a DNS hiccup, or the checker
+/// throttling its own machine can all fake one. Unreachable links become removable only after
+/// *sustained* confirmation ([`durably_unreachable`]), and even then only via the reviewed, human-
+/// authorized unreachable purge — never automatically.
 pub fn removable(s: &Status) -> bool {
     s.status == "gone"
+}
+
+/// Runs an `unreachable` must fail the patient re-check, and time it must stay broken, before it is
+/// eligible for the (reviewed, authorized) unreachable purge. A false-unreachable (a slow or
+/// burst-throttled but live site) recovers within a run or two and so never reaches the bar; only a
+/// persistently unresolvable host accumulates enough failures over enough days.
+const DURABLE_RUNS: u32 = 3;
+const DURABLE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Whether an `unreachable` has failed across enough runs over enough time to be a review-and-purge
+/// candidate. Never true for `gone`/`ok`. This is the *eligibility* test; removal still requires the
+/// human to review the batch and authorize the purge.
+pub fn durably_unreachable(s: &Status, now: u64) -> bool {
+    s.status == "unreachable"
+        && s.broken_count >= DURABLE_RUNS
+        && now.saturating_sub(s.first_broken_at) >= DURABLE_SECS
+}
+
+/// Which reviewed set a [`PurgeView`] strikes — the two are separate authorized actions with
+/// separate confidence levels (definitive vs sustained-heuristic), never conflated.
+#[derive(Clone, Copy)]
+pub enum RemovalSet {
+    /// Definitively dead: HTTP 404/410, GET-confirmed.
+    Gone,
+    /// Durably unreachable: failed the patient re-check across ≥[`DURABLE_RUNS`] runs over
+    /// ≥[`DURABLE_SECS`] (see [`durably_unreachable`]).
+    DurableUnreachable,
+}
+
+impl RemovalSet {
+    /// The candidate URLs from the status cache for this set.
+    fn candidates(self, cache: &HashMap<String, Status>, now: u64) -> HashSet<String> {
+        cache
+            .values()
+            .filter(|s| match self {
+                RemovalSet::Gone => removable(s),
+                RemovalSet::DurableUnreachable => durably_unreachable(s, now),
+            })
+            .map(|s| s.url.clone())
+            .collect()
+    }
+
+    /// The bound purge IRI (also the endpoint's describe subject).
+    fn iri(self) -> &'static str {
+        match self {
+            RemovalSet::Gone => "urn:cms:purge",
+            RemovalSet::DurableUnreachable => "urn:cms:purge-unreachable",
+        }
+    }
+
+    /// The `POST` route the confirm button submits to.
+    fn route(self) -> &'static str {
+        match self {
+            RemovalSet::Gone => "/purge",
+            RemovalSet::DurableUnreachable => "/purge-unreachable",
+        }
+    }
 }
 
 /// Load the persisted status cache (empty if absent/unreadable).
@@ -584,6 +642,20 @@ fn buckets(cache: &HashMap<String, Status>) -> (Vec<&Status>, Vec<&Status>) {
     (gone, unreachable)
 }
 
+/// The three review buckets: definitively-`gone` (removable now), durably-`unreachable` (eligible
+/// for the reviewed unreachable purge), and the count of `unreachable` still under observation (not
+/// yet durable — kept as a count so the human sees they're tracked but not offered for removal).
+fn review_buckets(
+    cache: &HashMap<String, Status>,
+    now: u64,
+) -> (Vec<&Status>, Vec<&Status>, usize) {
+    let (gone, unreachable) = buckets(cache);
+    let (durable, observing): (Vec<&Status>, Vec<&Status>) = unreachable
+        .into_iter()
+        .partition(|s| durably_unreachable(s, now));
+    (gone, durable, observing.len())
+}
+
 /// The human-readable review as an org file: the removable `gone` set, then the flagged
 /// `unreachable` set (not auto-removed — your judgement).
 fn report(gone: &[&Status], unreachable: &[&Status], now: u64) -> String {
@@ -692,8 +764,8 @@ impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let cache = load_status(&resolved_status_path());
         let now = unix_now();
-        let (gone, unreachable) = buckets(&cache);
-        let xml = review_xml(&gone, unreachable.len(), now);
+        let (gone, durable, observing) = review_buckets(&cache, now);
+        let xml = review_xml(&gone, &durable, observing, now);
         let req = Request::new(
             Verb::Source,
             Iri::parse("urn:xslt:transform").expect("valid IRI"),
@@ -724,31 +796,83 @@ impl Endpoint for ReviewView {
     }
 }
 
-/// Build the review doc (`urn:cms:review#`) from the removable (`gone`) candidates + the count of
-/// flagged (`unreachable`) links. An empty candidate set is its own element (no xrust conditionals).
-fn review_xml(removable: &[&Status], flagged: usize, now: u64) -> String {
-    let mut s = format!(
-        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" flagged=\"{flagged}\">",
-        removable.len()
-    );
-    if removable.is_empty() {
+/// Build the review doc (`urn:cms:review#`): a `<section>` per removal category (each carrying its
+/// own purge action + call-to-action), plus a `<note>` for the count still under observation. Each
+/// section is emitted only when non-empty, so the xrust stylesheet needs no conditionals — it just
+/// renders whatever sections exist (and `<empty/>` when there are none at all).
+fn review_xml(gone: &[&Status], durable: &[&Status], observing: usize, now: u64) -> String {
+    let mut s = String::from("<review xmlns=\"urn:cms:review#\">");
+    if gone.is_empty() && durable.is_empty() {
         s.push_str("<empty/>");
     } else {
-        for it in removable {
-            let days = now.saturating_sub(it.first_broken_at) / 86_400;
-            s.push_str("<item status=\"");
-            xml_attr(&mut s, &it.status);
-            s.push_str("\" reason=\"");
-            xml_attr(&mut s, &it.reason);
-            s.push_str(&format!("\" days=\"{days}\" url=\""));
-            xml_attr(&mut s, &it.url);
-            s.push_str("\" title=\"");
-            xml_attr(&mut s, &it.title);
-            s.push_str("\"/>");
+        if !gone.is_empty() {
+            section_xml(
+                &mut s,
+                gone,
+                now,
+                &format!(
+                    "{} removable — definitively dead (HTTP 404/410)",
+                    group(gone.len())
+                ),
+                RemovalSet::Gone.iri(),
+                "Purge dead links…",
+            );
         }
+        if !durable.is_empty() {
+            section_xml(
+                &mut s,
+                durable,
+                now,
+                &format!(
+                    "{} durably unreachable — failed ≥3 checks over ≥7 days",
+                    group(durable.len())
+                ),
+                RemovalSet::DurableUnreachable.iri(),
+                "Purge unreachable…",
+            );
+        }
+    }
+    if observing > 0 {
+        s.push_str("<note>");
+        xml_text(
+            &mut s,
+            &format!(
+                "{} more unreachable under observation — not yet eligible (need 3 failed checks \
+                 over a week).",
+                group(observing)
+            ),
+        );
+        s.push_str("</note>");
     }
     s.push_str("</review>");
     s
+}
+
+/// Emit one `<section>` (header label + purge action + call-to-action) wrapping its item cards. The
+/// section `kind` (for card colour) is the items' shared status — `gone` or `unreachable`.
+fn section_xml(s: &mut String, items: &[&Status], now: u64, label: &str, action: &str, cta: &str) {
+    s.push_str("<section kind=\"");
+    xml_attr(s, &items[0].status);
+    s.push_str("\" label=\"");
+    xml_attr(s, label);
+    s.push_str("\" action=\"");
+    xml_attr(s, action);
+    s.push_str("\" cta=\"");
+    xml_attr(s, cta);
+    s.push_str("\">");
+    for it in items {
+        let days = now.saturating_sub(it.first_broken_at) / 86_400;
+        s.push_str("<item status=\"");
+        xml_attr(s, &it.status);
+        s.push_str("\" reason=\"");
+        xml_attr(s, &it.reason);
+        s.push_str(&format!("\" days=\"{days}\" url=\""));
+        xml_attr(s, &it.url);
+        s.push_str("\" title=\"");
+        xml_attr(s, &it.title);
+        s.push_str("\"/>");
+    }
+    s.push_str("</section>");
 }
 
 /// Escape a value for an XML double-quoted attribute.
@@ -764,6 +888,18 @@ fn xml_attr(out: &mut String, s: &str) {
     }
 }
 
+/// Escape a value for XML element text content.
+fn xml_text(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
 // ---- the authorized purge ----------------------------------------------------------------------
 
 /// `urn:cms:purge` — the reviewed removal. Resolving it with `Source` returns the confirm prompt
@@ -772,9 +908,12 @@ fn xml_attr(out: &mut String, s: &str) {
 /// kernel** — which cuts the bookmarks golden thread, so the derived graph re-derives and the room
 /// refreshes live. The HTTP face only reaches the `Sink` on an authenticated `POST /purge`.
 pub struct PurgeView {
+    /// Which reviewed set this instance strikes (`gone` vs durably-`unreachable`).
+    pub set: RemovalSet,
     /// The `urn:cms:src:{subpath}` IRI of the bookmarks file (what `BookmarkGraph` reads).
     pub bookmarks_iri: String,
-    /// The `urn:cms:src:{subpath}.bak` IRI the old content is backed up to.
+    /// The `urn:cms:src:{subpath}.bak` IRI the old content is backed up to. Each set uses its own
+    /// backup file so purging one doesn't clobber the other's backup.
     pub bak_iri: String,
 }
 
@@ -789,13 +928,16 @@ impl Endpoint for PurgeView {
     }
 
     fn name(&self) -> &str {
-        "cms-purge"
+        match self.set {
+            RemovalSet::Gone => "cms-purge",
+            RemovalSet::DurableUnreachable => "cms-purge-unreachable",
+        }
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:cms:purge")
+        Description::new(self.set.iri())
             .summary(
-                "Purge the confirmed-dead bookmarks from the source file (Sink executes, Source \
+                "Purge the reviewed removal set from the source file (Sink executes, Source \
                  returns the confirm prompt). Backs the file up first, then writes through the \
                  kernel so the graph re-derives.",
             )
@@ -806,22 +948,31 @@ impl Endpoint for PurgeView {
 }
 
 impl PurgeView {
-    /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair.
+    /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair, worded per set.
     fn confirm_html(&self) -> String {
         let cache = load_status(&resolved_status_path());
-        let (gone, _unreachable) = buckets(&cache);
-        let n = gone.len();
+        let now = unix_now();
+        let n = self.set.candidates(&cache, now).len();
         if n == 0 {
             return "<div class=\"cms-purge\"><p>Nothing to purge.</p>\
                 <button hx-get=\"/r/urn:cms:review\">back</button></div>"
                 .to_string();
         }
+        let what = match self.set {
+            RemovalSet::Gone => format!("<b>{}</b> definitively-dead (404/410) links", group(n)),
+            RemovalSet::DurableUnreachable => format!(
+                "<b>{}</b> durably-unreachable links (repeatedly couldn't connect across ≥3 checks \
+                 over ≥7 days — almost all dead domains, but a rare persistently-slow site could \
+                 still be alive)",
+                group(n)
+            ),
+        };
         format!(
-            "<div class=\"cms-purge\"><p>Remove <b>{}</b> definitively-dead (404/410) links from the \
-             bookmarks file? A backup is saved first — this can't be undone from the room.</p>\
-             <button class=\"cms-purge-go\" hx-post=\"/purge\">Confirm purge</button> \
+            "<div class=\"cms-purge\"><p>Remove {what} from the bookmarks file? A backup is saved \
+             first — this can't be undone from the room.</p>\
+             <button class=\"cms-purge-go\" hx-post=\"{}\">Confirm purge</button> \
              <button hx-get=\"/r/urn:cms:review\">Cancel</button></div>",
-            group(n)
+            self.set.route()
         )
     }
 
@@ -829,13 +980,11 @@ impl PurgeView {
     /// purged URLs from the status cache too.
     async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let status_path = resolved_status_path();
+        let now = unix_now();
         let cache = load_status(&status_path);
-        // Owned URLs, so the cache borrow is released before we rewrite the cache below. Only the
-        // removable (`gone`) set is ever purged — `unreachable` is flagged-only.
-        let removable: HashSet<String> = {
-            let (gone, _unreachable) = buckets(&cache);
-            gone.iter().map(|s| s.url.clone()).collect()
-        };
+        // Owned URLs, so the cache borrow is released before we rewrite the cache below. The
+        // candidate set is exactly this instance's reviewed set — `gone`, or durably-`unreachable`.
+        let removable: HashSet<String> = self.set.candidates(&cache, now);
         if removable.is_empty() {
             return Ok(fragment(
                 "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
@@ -1080,24 +1229,63 @@ mod tests {
             "urn:cms:linkstatus resolves"
         );
 
+        // Point the view endpoints at the same controlled cache the pass wrote, then add a
+        // durably-unreachable entry (old + many runs) and an observing one (too few runs) so the
+        // review exercises BOTH the gone section AND the durable-unreachable section + the note.
+        std::env::set_var("CMS_LINKSTATUS", &status_path);
+        let mut cache = load_status(&status_path);
+        let mut durable = st("unreachable", 0, 4); // first_broken at epoch (>7d ago), 4 runs
+        durable.url = "http://durable.example".into();
+        cache.insert(durable.url.clone(), durable);
+        let mut observing = st("unreachable", 0, 1); // only 1 run → still under observation
+        observing.url = "http://observing.example".into();
+        cache.insert(observing.url.clone(), observing);
+        save_status(&status_path, &cache);
+
         // The review view resolves through the review stylesheet (xrust) — this exercises the
         // whole pipeline (endpoint → build XML → urn:xslt:transform → urn:cms:style:review).
         let rreq = Request::new(Verb::Source, Iri::parse("urn:cms:review").unwrap());
         let rrepr = futures::executor::block_on(kernel.issue(rreq, &Capability::root()))
             .expect("review resolves");
         let html = String::from_utf8_lossy(&rrepr.bytes);
+        // Both sections render, each wired to its own purge action, plus the observation note.
         assert!(
-            html.contains("cms-review"),
-            "review renders its section: {html}"
+            html.contains("/r/urn:cms:purge"),
+            "gone purge button: {html}"
+        );
+        assert!(
+            html.contains("/r/urn:cms:purge-unreachable"),
+            "unreachable purge button: {html}"
+        );
+        assert!(
+            html.contains("http://durable.example"),
+            "durable card renders: {html}"
+        );
+        assert!(
+            html.contains("under observation"),
+            "observation note renders: {html}"
         );
 
-        // The purge confirm prompt (Source — safe, no mutation) resolves and renders.
+        // Both purge confirm prompts (Source — safe, no mutation) resolve and render, each wording
+        // its own set and posting to its own route.
         let preq = Request::new(Verb::Source, Iri::parse("urn:cms:purge").unwrap());
         let prepr = futures::executor::block_on(kernel.issue(preq, &Capability::root()))
             .expect("purge confirm resolves");
         assert!(
-            String::from_utf8_lossy(&prepr.bytes).contains("cms-purge"),
-            "purge confirm renders"
+            String::from_utf8_lossy(&prepr.bytes).contains("hx-post=\"/purge\""),
+            "gone purge confirm posts to /purge"
+        );
+        let ureq = Request::new(
+            Verb::Source,
+            Iri::parse("urn:cms:purge-unreachable").unwrap(),
+        );
+        let urepr = futures::executor::block_on(kernel.issue(ureq, &Capability::root()))
+            .expect("unreachable purge confirm resolves");
+        let uhtml = String::from_utf8_lossy(&urepr.bytes);
+        assert!(
+            uhtml.contains("hx-post=\"/purge-unreachable\"")
+                && uhtml.contains("durably-unreachable"),
+            "unreachable purge confirm posts to /purge-unreachable: {uhtml}"
         );
     }
 
@@ -1213,21 +1401,58 @@ mod tests {
     }
 
     #[test]
-    fn review_xml_lists_candidates_with_escaped_attrs_or_an_empty_marker() {
+    fn durably_unreachable_needs_sustained_failure_never_gone_or_ok() {
+        let now = 30 * 86_400u64;
+        // 3 runs over ≥7 days → eligible.
+        assert!(durably_unreachable(
+            &st("unreachable", now - 7 * 86_400, 3),
+            now
+        ));
+        // Enough runs but not enough elapsed time → not yet.
+        assert!(!durably_unreachable(
+            &st("unreachable", now - 3 * 86_400, 5),
+            now
+        ));
+        // Old enough but too few runs → not yet.
+        assert!(!durably_unreachable(
+            &st("unreachable", now - 30 * 86_400, 2),
+            now
+        ));
+        // gone / ok are never in the unreachable set.
+        assert!(!durably_unreachable(&st("gone", now - 30 * 86_400, 9), now));
+        assert!(!durably_unreachable(&st("ok", 0, 0), now));
+        // …and gone is removable while a fresh unreachable is not (single-check).
+        assert!(RemovalSet::Gone
+            .candidates(&HashMap::from([("http://x".into(), st("gone", 0, 1))]), now)
+            .contains("http://x"));
+    }
+
+    #[test]
+    fn review_xml_emits_sections_per_set_escaped_or_an_empty_marker() {
         let now = 3_000_000u64;
         let mut g = st("gone", now - 172_800, 1); // 2 days
         g.url = "https://x/?a=1&b=2".into();
         g.title = "A \"quoted\" <title>".into();
         g.reason = "HTTP 404/410 (gone)".into();
-        let xml = review_xml(&[&g], 638, now);
-        assert!(xml.contains("removable=\"1\" flagged=\"638\""), "{xml}");
+        let u = st("unreachable", now - 10 * 86_400, 4);
+        let xml = review_xml(&[&g], &[&u], 638, now);
+        // Two sections, each with its own purge action; the observing count rides in a note.
+        assert!(xml.contains("action=\"urn:cms:purge\""), "{xml}");
+        assert!(
+            xml.contains("action=\"urn:cms:purge-unreachable\""),
+            "{xml}"
+        );
+        assert!(xml.contains("<note>"), "{xml}");
+        assert!(xml.contains("638 more unreachable"), "{xml}");
         assert!(xml.contains("status=\"gone\""), "{xml}");
         assert!(xml.contains("days=\"2\""), "{xml}");
         // Attribute values are XML-escaped.
         assert!(xml.contains("a=1&amp;b=2"), "{xml}");
         assert!(xml.contains("&quot;quoted&quot; &lt;title&gt;"), "{xml}");
-        // No candidates → the empty marker.
-        assert!(review_xml(&[], 0, now).contains("<empty/>"));
+        // No candidates at all → the empty marker (and no note when nothing observing).
+        let empty = review_xml(&[], &[], 0, now);
+        assert!(empty.contains("<empty/>"), "{empty}");
+        assert!(!empty.contains("<note>"), "{empty}");
     }
 
     #[test]

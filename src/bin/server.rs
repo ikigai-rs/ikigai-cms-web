@@ -680,7 +680,10 @@ async fn handle_http(
             dev_open,
         )
     } else if req.target == "/purge" && req.method == "POST" {
-        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open);
+        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge");
+        (s, c, b, None)
+    } else if req.target == "/purge-unreachable" && req.method == "POST" {
+        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-unreachable");
         (s, c, b, None)
     } else if let Some(target) = req.target.strip_prefix("/r/") {
         let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
@@ -728,6 +731,7 @@ fn handle_purge(
     auth: &HttpAuth,
     sid: Option<&str>,
     dev_open: bool,
+    purge_iri: &str,
 ) -> (&'static str, &'static str, Vec<u8>) {
     let authed = dev_open
         || sid.is_some_and(|s| {
@@ -744,7 +748,7 @@ fn handle_purge(
             b"<p class=\"cms-error\">Sign in to purge.</p>".to_vec(),
         );
     }
-    let req = Request::new(Verb::Sink, Iri::parse("urn:cms:purge").expect("valid IRI"));
+    let req = Request::new(Verb::Sink, Iri::parse(purge_iri).expect("valid IRI"));
     match Resolver::issue_as(kernel, req, &Capability::root()) {
         Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
         Err(e) => (
