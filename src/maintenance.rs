@@ -36,13 +36,22 @@ use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 /// URLs are re-checked every run.
 const WEEK_SECS: u64 = 7 * 24 * 60 * 60;
 /// Checks in flight at once — a politeness/backpressure cap on parked futures, NOT a thread count.
-/// Kept small: a big burst across many distinct hosts (especially several behind the same CDN)
-/// trips rate-limiting/bot-protection that fails the checker's own connections, and link-checking
-/// isn't latency-critical.
-const CONCURRENCY: usize = 8;
-/// A transient failure is retried once after this delay — a rate-limited or DNS-hiccup request
-/// usually succeeds a moment later, so this collapses most spurious `unreachable`s to `ok`.
-const RETRY_BACKOFF: Duration = Duration::from_secs(3);
+/// Kept low on purpose: a burst of concurrent fresh connections across many hosts exhausts DNS/
+/// sockets and manufactures spurious connection failures (a live site checked in the burst fails,
+/// yet succeeds on a calm sequential recheck). Link-checking is a nightly background pass — slow and
+/// gentle beats fast and wrong.
+const CONCURRENCY: usize = 4;
+/// A transient (couldn't-connect) failure is retried once after this delay. It's long enough to land
+/// *after* a rate-limit window or a DNS hiccup rather than inside it — a 3s retry tended to fail for
+/// the same reason the first try did.
+const RETRY_BACKOFF: Duration = Duration::from_secs(10);
+/// Persist the status cache every this-many completed checks, so an interrupted pass keeps its
+/// progress (and a re-run resumes) instead of losing everything (the cache was previously written
+/// only at the very end).
+const CHECKPOINT_EVERY: usize = 100;
+/// A `running: true` meta whose heartbeat is older than this is treated as a dead/interrupted pass,
+/// not a live one — a hard-killed pass can't clear its own `running` flag, so the reader ages it out.
+const STALE_META_SECS: u64 = 90;
 
 // ---- the reqwest transport (async, self-sufficient off the timer thread) -----------------------
 
@@ -219,6 +228,11 @@ pub struct Meta {
     pub running: bool,
     pub checked: usize,
     pub total: usize,
+    /// Unix seconds of the last progress tick — a liveness heartbeat. A `running: true` meta with a
+    /// stale heartbeat is a pass that was killed before it could clear the flag (see
+    /// [`STALE_META_SECS`]).
+    #[serde(default)]
+    pub heartbeat: u64,
     /// Unix seconds the last pass finished.
     #[serde(default)]
     pub finished_at: u64,
@@ -296,15 +310,12 @@ impl Endpoint for LinkCheckPass {
                 running: true,
                 checked: 0,
                 total: to_check.len(),
+                heartbeat: now,
                 finished_at: 0,
             },
         );
 
-        for (idx, outcome) in check_all(inv, &to_check, &meta).await {
-            let (subject, url, title) = to_check[idx];
-            let entry = merge(cache.get(url), subject, url, title, &outcome, now);
-            cache.insert(url.clone(), entry);
-        }
+        run_checks(inv, &to_check, &mut cache, &self.status_path, &meta, now).await;
         // Drop status for bookmarks that no longer exist.
         let current: HashSet<&str> = bookmarks.iter().map(|(_, u, _)| u.as_str()).collect();
         cache.retain(|url, _| current.contains(url.as_str()));
@@ -316,7 +327,8 @@ impl Endpoint for LinkCheckPass {
                 running: false,
                 checked: to_check.len(),
                 total: to_check.len(),
-                finished_at: now,
+                heartbeat: unix_now(),
+                finished_at: unix_now(),
             },
         );
         let (gone, unreachable) = buckets(&cache);
@@ -393,13 +405,19 @@ async fn list_bookmarks(inv: &Invocation<'_>) -> Result<Vec<(String, String, Str
     Ok(out)
 }
 
-/// Check `items` as parked futures bounded at [`CONCURRENCY`] in flight, ticking the meta file's
-/// progress so the in-room indicator can update.
-async fn check_all(
+/// Run every item as a parked future bounded at [`CONCURRENCY`] in flight, folding each outcome into
+/// `cache` **as it lands** — updating the meta heartbeat each tick, and persisting the status cache
+/// every [`CHECKPOINT_EVERY`] completions. Streaming (not collect-then-apply) is what makes an
+/// interrupted pass keep its progress: the cache on disk is never more than `CHECKPOINT_EVERY` checks
+/// behind, and the heartbeat lets the reader tell a live pass from a killed one.
+async fn run_checks(
     inv: &Invocation<'_>,
     items: &[&(String, String, String)],
+    cache: &mut HashMap<String, Status>,
+    status_path: &std::path::Path,
     meta: &std::path::Path,
-) -> Vec<(usize, Outcome)> {
+    now: u64,
+) {
     let total = items.len();
     let done = AtomicUsize::new(0);
     // Own the `(index, url)` pairs so each future borrows only `inv`/`done` (one clear lifetime),
@@ -410,20 +428,37 @@ async fn check_all(
         .enumerate()
         .map(|(i, it)| (i, it.1.clone()))
         .collect();
-    futures::stream::iter(work)
-        .map(|(i, url)| check_one(inv, &done, total, meta, i, url))
-        .buffer_unordered(CONCURRENCY)
-        .collect()
-        .await
+    let mut results = futures::stream::iter(work)
+        .map(|(i, url)| check_one(inv, &done, total, i, url))
+        .buffer_unordered(CONCURRENCY);
+    while let Some((idx, outcome)) = results.next().await {
+        let (subject, url, title) = items[idx];
+        let entry = merge(cache.get(url), subject, url, title, &outcome, now);
+        cache.insert(url.clone(), entry);
+        let n = done.load(Ordering::Relaxed);
+        // A tiny meta write each tick keeps the heartbeat fresh (cheap); a full status checkpoint
+        // only every CHECKPOINT_EVERY (the bigger write).
+        write_meta(
+            meta,
+            &Meta {
+                running: true,
+                checked: n,
+                total,
+                heartbeat: unix_now(),
+                finished_at: 0,
+            },
+        );
+        if n.is_multiple_of(CHECKPOINT_EVERY) {
+            save_status(status_path, cache);
+        }
+    }
 }
 
-/// One item's check + progress log, ticking the meta file every 25 completions (a benign race on
-/// the counter — the indicator is approximate).
+/// One item's check + progress log.
 async fn check_one(
     inv: &Invocation<'_>,
     done: &AtomicUsize,
     total: usize,
-    meta: &std::path::Path,
     i: usize,
     url: String,
 ) -> (usize, Outcome) {
@@ -433,17 +468,6 @@ async fn check_one(
         Outcome::Gone(r) => eprintln!("[{n}/{total}] GONE    {url}  ({r})"),
         Outcome::Unreachable(r) => eprintln!("[{n}/{total}] unreach {url}  ({r})"),
         Outcome::Alive => {}
-    }
-    if n.is_multiple_of(25) {
-        write_meta(
-            meta,
-            &Meta {
-                running: true,
-                checked: n,
-                total,
-                finished_at: 0,
-            },
-        );
     }
     (i, outcome)
 }
@@ -630,7 +654,10 @@ impl Endpoint for LinkStatusView {
 /// Render the indicator fragment: run progress while a pass is running, else the last-run tally
 /// from the persisted status, else empty (never run).
 fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> String {
-    if meta.running {
+    // `running` only counts if the heartbeat is fresh — a hard-killed pass leaves `running: true`
+    // frozen, so an aged-out heartbeat means "interrupted", and we fall through to the last tally.
+    let live = meta.running && now.saturating_sub(meta.heartbeat) <= STALE_META_SECS;
+    if live {
         return format!(
             "<span class=\"cms-linkcheck running\">checking links… {} / {}</span>",
             group(meta.checked),
@@ -1131,12 +1158,13 @@ mod tests {
     #[test]
     fn the_status_fragment_shows_progress_running_tally_idle_and_nothing_before_a_run() {
         let now = 3_000_000u64;
-        // Running → progress, thousands-grouped, with the `running` class.
+        // Running with a FRESH heartbeat → progress, thousands-grouped, with the `running` class.
         let running = status_fragment(
             &Meta {
                 running: true,
                 checked: 1_240,
                 total: 5_373,
+                heartbeat: now,
                 finished_at: 0,
             },
             &HashMap::new(),
@@ -1147,6 +1175,23 @@ mod tests {
             "{running}"
         );
         assert!(running.contains("cms-linkcheck running"), "{running}");
+        // Running but the heartbeat is STALE (killed pass, flag never cleared) → NOT shown as
+        // running; with no cache it falls through to empty.
+        let stale = status_fragment(
+            &Meta {
+                running: true,
+                checked: 1_240,
+                total: 5_373,
+                heartbeat: now - STALE_META_SECS - 1,
+                finished_at: 0,
+            },
+            &HashMap::new(),
+            now,
+        );
+        assert!(
+            stale.is_empty(),
+            "stale running should not show progress: {stale}"
+        );
         // Idle with a cache → the tally + "ago" (all entries checked in the same run, 2h ago).
         let mut cache = HashMap::new();
         let checked = |status: &str| {
