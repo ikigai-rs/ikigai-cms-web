@@ -185,6 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("(default: old-org/pinboard-bookmarks.org)")
     );
 
+    // Cloned for the optional maintenance kernel (below), before the serving kernel consumes them.
+    let src_dir_maint = src_dir.clone();
+    let bookmarks_maint = bookmarks.clone();
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
         src_dir,
         zotero,
@@ -218,6 +221,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&entitlement),
         dev_open,
     ));
+
+    // Optionally run the link-check maintenance pass on a recurring `urn:time` job (CMS_LINKCHECK=1,
+    // default off). The pass is `urn:cms:linkcheck` on a dedicated maintenance kernel (the CMS
+    // graph + outbound HTTP); the time transport fires it daily, and we fire once on startup in the
+    // background so a fresh start doesn't wait a day. The registry is held for the process lifetime
+    // (the accept loop below never returns), which keeps its timer thread alive.
+    let _linkcheck = if std::env::var("CMS_LINKCHECK").as_deref() == Ok("1") {
+        let status_path = std::env::var("CMS_LINKSTATUS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| src_dir_maint.join(".cms-linkstatus.json"));
+        println!(
+            "link-check: enabled (daily); status {}",
+            status_path.display()
+        );
+        let maint = Arc::new(ikigai_cms_web::maintenance::build_maintenance_kernel(
+            src_dir_maint,
+            bookmarks_maint,
+            status_path,
+        ));
+        let registry = ikigai_time::JobRegistry::new(Arc::new(ikigai_time::ThreadTimer))
+            .with_capability(Capability::root());
+        registry.set_resolver(Arc::clone(&maint) as Arc<dyn Resolver>);
+        match ikigai_time::parse_schedule("24h").and_then(|s| {
+            registry.schedule_persistent("urn:cms:linkcheck".into(), Verb::Source, s, true)
+        }) {
+            Ok(id) => println!("link-check: scheduled daily (job {id})"),
+            Err(e) => eprintln!("link-check: schedule failed: {e}"),
+        }
+        tokio::spawn(async move {
+            let req = Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:linkcheck").expect("valid IRI"),
+            );
+            // The async, under-capability resolve (no block_on) — so the pass's fan-out parks.
+            match maint.issue_as_async(req, &Capability::root()).await {
+                Ok((r, _)) => {
+                    println!(
+                        "link-check (startup): {}",
+                        String::from_utf8_lossy(&r.bytes)
+                    )
+                }
+                Err(e) => eprintln!("link-check (startup): {e}"),
+            }
+        });
+        Some(registry)
+    } else {
+        None
+    };
 
     let config = ServerConfig::builder()
         .with_bind_default(port)
