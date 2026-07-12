@@ -178,6 +178,14 @@ pub fn approved_turtle() -> String {
     serialize(&entries(&approved_path()), DC_SUBJECT)
 }
 
+/// Serializes tests that mutate the process-global `CMS_TAG_*` env vars (they'd otherwise clobber
+/// each other's overlay paths under the parallel test runner). Poison-tolerant.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +206,7 @@ mod tests {
 
     #[test]
     fn approve_moves_suggestion_to_approved_and_reject_drops_it() {
+        let _g = env_guard();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));

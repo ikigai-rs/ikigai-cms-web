@@ -1124,24 +1124,273 @@ fn group(n: usize) -> String {
     out
 }
 
+// ---- S2: OpenLibrary tag suggestion ------------------------------------------------------------
+
+/// Polite spacing between OpenLibrary lookups — one book at a time, a beat apart, so a batch of
+/// suggestions never looks like a scrape (Conan the Librarian stays calm).
+const OL_SPACING: Duration = Duration::from_secs(2);
+
+/// `urn:cms:tag-suggest` — suggest tags for untagged books. Sourcing it queries the graph for books
+/// with no tag (and no pending suggestion), looks each up in OpenLibrary (ISBN-first, then title),
+/// turns the subjects into clean candidate tags, and writes them to the suggestions overlay for
+/// your `+`/`x` review. Capped per run (`limit`, default 5) and paced — gentle by design. The LLM
+/// residual that maps these onto your vocabulary (and coins better ones) is S3.
+pub struct TagSuggestPass;
+
+#[async_trait]
+impl Endpoint for TagSuggestPass {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let limit = inv
+            .inline_str("limit")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5);
+        let books = list_untagged_books(inv, limit).await?;
+        let (mut tagged, mut added) = (0usize, 0usize);
+        for (i, (id, title, isbn)) in books.iter().enumerate() {
+            if i > 0 {
+                futures_timer::Delay::new(OL_SPACING).await;
+            }
+            let subjects = openlibrary_subjects(inv, isbn, title).await;
+            let tags = filter_subjects(&subjects);
+            if !tags.is_empty() {
+                tagged += 1;
+            }
+            for t in &tags {
+                crate::tagstore::add_suggestion(id, t);
+                added += 1;
+                eprintln!("[tag-suggest] {title} → +{t}");
+            }
+        }
+        let line = format!(
+            "tag-suggest: {added} suggestions across {tagged}/{} untagged books checked",
+            books.len()
+        );
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            line.into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "cms-tag-suggest"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:tag-suggest")
+            .summary(
+                "Suggest tags for untagged books from OpenLibrary subjects, writing the suggestions \
+                 overlay for review. ISBN-first, capped + paced.",
+            )
+            .verb(Verb::Source)
+            .input(
+                ikigai_core::ArgSpec::new("limit")
+                    .optional()
+                    .summary("check at most N untagged books this run (default 5)"),
+            )
+            .requires("urn:cap:net:*")
+    }
+}
+
+/// `(book IRI, title, isbn)` for untagged books that also have no pending suggestion — title-ordered
+/// (stable), capped at `limit`. Skipping already-suggested books makes re-runs advance, not repeat.
+async fn list_untagged_books(
+    inv: &Invocation<'_>,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>> {
+    let query = format!(
+        "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+         PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+         SELECT ?id ?title ?isbn WHERE {{ \
+           ?id a cms:Book ; dc:title ?title . OPTIONAL {{ ?id cms:isbn ?isbn }} \
+           FILTER NOT EXISTS {{ ?id dc:subject ?sub }} \
+           FILTER NOT EXISTS {{ ?id cms:suggestedTag ?sg }} }} ORDER BY ?title LIMIT {limit}"
+    );
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:sparql:select").expect("valid IRI"),
+    )
+    .with_arg("query", ArgRef::Inline(query.into_bytes()))
+    .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+    let repr = inv.issue(request).await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&repr.bytes).unwrap_or(serde_json::Value::Null);
+    let mut out = Vec::new();
+    if let Some(rows) = json["results"]["bindings"].as_array() {
+        for r in rows {
+            let (Some(id), Some(title)) = (r["id"]["value"].as_str(), r["title"]["value"].as_str())
+            else {
+                continue;
+            };
+            let isbn = r["isbn"]["value"].as_str().unwrap_or("").to_string();
+            out.push((id.to_string(), title.to_string(), isbn));
+        }
+    }
+    Ok(out)
+}
+
+/// The response shape of the two OpenLibrary endpoints we read.
+enum OlShape {
+    /// `/api/books?...jscmd=data` → `{ "ISBN:x": { subjects: [{name}] } }`.
+    Books,
+    /// `/search.json?...` → `{ docs: [ { subject: [..] } ] }`.
+    Search,
+}
+
+/// OpenLibrary subjects for a book: ISBN-first (exact edition), then a title search. Best-effort —
+/// any error or miss yields an empty list (the book simply gets no suggestion this run).
+async fn openlibrary_subjects(inv: &Invocation<'_>, isbn: &str, title: &str) -> Vec<String> {
+    if !isbn.is_empty() {
+        let url =
+            format!("https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data");
+        let subs = ol_fetch(inv, &url, OlShape::Books).await;
+        if !subs.is_empty() {
+            return subs;
+        }
+    }
+    if !title.is_empty() {
+        let url = format!(
+            "https://openlibrary.org/search.json?title={}&fields=subject&limit=1",
+            url_encode(title)
+        );
+        return ol_fetch(inv, &url, OlShape::Search).await;
+    }
+    Vec::new()
+}
+
+/// One `urn:httpGet` to OpenLibrary (cacheable a week — its subject data is stable), parsed for the
+/// subject list per `shape`.
+async fn ol_fetch(inv: &Invocation<'_>, url: &str, shape: OlShape) -> Vec<String> {
+    let request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+        .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+        .with_arg(
+            "max_age",
+            ArgRef::Inline(WEEK_SECS.to_string().into_bytes()),
+        );
+    let Ok(repr) = inv.issue(request).await else {
+        return Vec::new();
+    };
+    let json: serde_json::Value =
+        serde_json::from_slice(&repr.bytes).unwrap_or(serde_json::Value::Null);
+    match shape {
+        OlShape::Books => json
+            .as_object()
+            .into_iter()
+            .flatten()
+            .flat_map(|(_, v)| v["subjects"].as_array().cloned().unwrap_or_default())
+            .filter_map(|s| s["name"].as_str().map(String::from))
+            .collect(),
+        OlShape::Search => json["docs"]
+            .as_array()
+            .and_then(|d| d.first())
+            .and_then(|d| d["subject"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Percent-encode a query-string value (the OpenLibrary title search).
+fn url_encode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+/// Raw OpenLibrary subjects → clean candidate tags: drop classification/BISAC codes and all-caps
+/// category headers, slugify, drop over-verbose phrases, dedupe, cap at 4. Deliberately
+/// deterministic — the LLM residual (map to your vocabulary, coin better tags) is S3.
+fn filter_subjects(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in raw {
+        if is_subject_junk(s) {
+            continue;
+        }
+        let slug = slug_tag(s);
+        if slug.len() < 2 || !slug.chars().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if slug.matches('-').count() > 3 {
+            continue; // > 4 words — too verbose to be a good tag
+        }
+        if !out.contains(&slug) {
+            out.push(slug);
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether a raw OpenLibrary subject is code/noise rather than a topic: a classification code
+/// (`cs.cmp_sc.app_sw`), a BISAC code (`Com051260`), or an ALL-CAPS category header
+/// (`BUSINESS & ECONOMICS`).
+fn is_subject_junk(raw: &str) -> bool {
+    let t = raw.trim();
+    if t.contains('.') {
+        return true;
+    }
+    if t.len() >= 6
+        && t.is_char_boundary(3)
+        && t[..3].chars().all(|c| c.is_ascii_alphabetic())
+        && t[3..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    let letters: String = t.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    letters.len() > 4 && letters.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// Lowercase-hyphen slug (matching the book graph's tag slugs).
+fn slug_tag(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
 // ---- kernel assembly ---------------------------------------------------------------------------
 
-/// A maintenance kernel: the CMS graph spaces + the `ikigai-http` outbound endpoints over
-/// `transport` + the `urn:cms:linkcheck` pass (persisting to `status_path`), with a system clock
-/// so cacheable reads honor their deadlines. `transport` is injectable so a test can supply a
-/// canned one.
+/// A maintenance kernel: the CMS graph spaces (bookmarks + `zotero` books) + the `ikigai-http`
+/// outbound endpoints over `transport` + the `urn:cms:linkcheck` and `urn:cms:tag-suggest` passes,
+/// with a system clock so cacheable reads honor their deadlines. `transport` is injectable so a
+/// test can supply a canned one.
 pub fn maintenance_kernel(
     src_dir: PathBuf,
+    zotero: Option<PathBuf>,
     bookmarks: Option<String>,
     status_path: PathBuf,
     transport: std::sync::Arc<dyn HttpTransport>,
 ) -> Kernel {
-    let mut spaces = crate::cms_spaces_with(src_dir, None, None, bookmarks);
+    let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks);
     spaces.push(std::sync::Arc::new(ikigai_http::space(transport)) as std::sync::Arc<dyn Space>);
-    spaces.push(std::sync::Arc::new(EndpointSpace::new().bind(
-        Exact::new("urn:cms:linkcheck"),
-        LinkCheckPass { status_path },
-    )) as std::sync::Arc<dyn Space>);
+    spaces.push(std::sync::Arc::new(
+        EndpointSpace::new()
+            .bind(
+                Exact::new("urn:cms:linkcheck"),
+                LinkCheckPass { status_path },
+            )
+            .bind(Exact::new("urn:cms:tag-suggest"), TagSuggestPass),
+    ) as std::sync::Arc<dyn Space>);
     Kernel::new(std::sync::Arc::new(Fallback::new(spaces)))
         .with_clock(std::sync::Arc::new(SystemClock))
 }
@@ -1161,11 +1410,13 @@ pub fn default_status_path() -> PathBuf {
 /// [`maintenance_kernel`] over the real reqwest transport. Must be built inside a tokio runtime.
 pub fn build_maintenance_kernel(
     src_dir: PathBuf,
+    zotero: Option<PathBuf>,
     bookmarks: Option<String>,
     status_path: PathBuf,
 ) -> Kernel {
     maintenance_kernel(
         src_dir,
+        zotero,
         bookmarks,
         status_path,
         std::sync::Arc::new(ReqwestTransport::new()),
@@ -1194,6 +1445,110 @@ mod tests {
                 body: Vec::new(),
             })
         }
+    }
+
+    /// A canned transport returning a fixed 200 body (for the OpenLibrary JSON).
+    struct CannedBody {
+        body: Vec<u8>,
+    }
+    #[async_trait]
+    impl HttpTransport for CannedBody {
+        async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn filter_subjects_drops_codes_headers_and_verbose_slugs_and_caps() {
+        let raw: Vec<String> = [
+            "Rust (Computer program language)",
+            "Com051260",            // BISAC code
+            "cs.cmp_sc.app_sw",     // classification code (has '.')
+            "BUSINESS & ECONOMICS", // all-caps header
+            "Systems programming",
+            "General computing extra words here now", // too verbose (>4 words)
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let tags = filter_subjects(&raw);
+        assert!(
+            tags.contains(&"rust-computer-program-language".to_string()),
+            "{tags:?}"
+        );
+        assert!(
+            tags.contains(&"systems-programming".to_string()),
+            "{tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t.contains("com051260")),
+            "BISAC dropped: {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t.contains('.')),
+            "codes dropped: {tags:?}"
+        );
+        assert!(
+            !tags.contains(&"business-economics".to_string()),
+            "header dropped: {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t.matches('-').count() > 3),
+            "verbose dropped: {tags:?}"
+        );
+        assert!(tags.len() <= 4);
+    }
+
+    #[test]
+    fn tag_suggest_writes_filtered_openlibrary_subjects_for_an_untagged_book() {
+        let _g = crate::tagstore::env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
+        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        // A (near-empty) bookmarks file at the default path so the graph assembles.
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(&bm, "* Bookmarks\n").unwrap();
+        // An untagged book (no dc:subject) whose subject IRI carries its ISBN.
+        let z = dir.path().join("z.rdf");
+        std::fs::write(
+            &z,
+            r##"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:bib="http://purl.org/net/biblio#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:z="http://www.zotero.org/namespaces/export#">
+  <bib:Book rdf:about="urn:isbn:9781617294556"><z:itemType>book</z:itemType><dc:title>Rust in Action</dc:title></bib:Book>
+</rdf:RDF>"##,
+        )
+        .unwrap();
+        let body = br#"{"ISBN:9781617294556":{"subjects":[{"name":"Rust (Computer program language)"},{"name":"Com051260"},{"name":"BUSINESS & ECONOMICS"},{"name":"Systems programming"}]}}"#.to_vec();
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            dir.path().join("st.json"),
+            Arc::new(CannedBody { body }),
+        );
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
+        let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
+            .expect("tag-suggest runs");
+        let summary = String::from_utf8(repr.bytes).unwrap();
+        assert!(summary.contains("2 suggestions"), "summary: {summary}");
+        // Only the clean subjects landed in the suggestions overlay — codes/headers dropped.
+        let sug = crate::tagstore::entries(&crate::tagstore::suggestions_path());
+        let tags: Vec<&str> = sug.iter().map(|e| e.tag.as_str()).collect();
+        assert!(tags.contains(&"rust-computer-program-language"), "{tags:?}");
+        assert!(tags.contains(&"systems-programming"), "{tags:?}");
+        assert_eq!(sug.len(), 2, "junk excluded: {tags:?}");
+        // The suggestion is keyed on the book's urn:cms:book: IRI.
+        assert!(
+            sug.iter().all(|e| e.iri.starts_with("urn:cms:book:")),
+            "{sug:?}"
+        );
+        std::env::remove_var("CMS_TAG_SUGGESTIONS");
+        std::env::remove_var("CMS_TAG_APPROVED");
     }
 
     #[derive(Clone)]
