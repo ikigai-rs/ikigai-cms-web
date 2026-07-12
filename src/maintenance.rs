@@ -37,7 +37,9 @@ const WEEK_SECS: u64 = 7 * 24 * 60 * 60;
 /// spanning at least this long — so a one-off timeout never qualifies.
 const CONFIRM_SPAN_SECS: u64 = 24 * 60 * 60;
 /// Checks in flight at once — a politeness/backpressure cap on parked futures, NOT a thread count.
-const CONCURRENCY: usize = 64;
+/// Kept modest: a big burst across thousands of distinct hosts overwhelms the system DNS resolver
+/// (spurious connection failures), and link-checking isn't latency-critical.
+const CONCURRENCY: usize = 24;
 
 // ---- the reqwest transport (async, self-sufficient off the timer thread) -----------------------
 
@@ -58,6 +60,11 @@ impl ReqwestTransport {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(12))
             .user_agent("ikigai-cms-linkcheck")
+            // Every bookmark is a different host, so a per-host idle keep-alive pool is useless and
+            // harmful: it accumulates hundreds of open connections and starves DNS/sockets, which
+            // shows up as spurious "error sending request" once the pass has run for a while. Don't
+            // keep idle connections — connect fresh per check.
+            .pool_max_idle_per_host(0)
             .build()
             .expect("build reqwest client");
         ReqwestTransport {
