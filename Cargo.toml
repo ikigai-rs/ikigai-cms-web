@@ -52,10 +52,15 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext;
 # 0.1.1 adds require_biometric (Touch ID) to gate enrollment.
 ikigai-secret = { version = "0.1.1", optional = true }
-# Maintenance: the link-checker resolves urn:httpHead through the kernel; ureq is the
-# blocking transport that backs it (2xx/3xx = reachable, else broken).
-ikigai-http = { version = "0.1", optional = true }
-ureq = { version = "2", optional = true }
+# Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.5 =
+# honest status (HEAD → true/false) + the caller `max_age` freshness directive.
+ikigai-http = { version = "0.1.5", optional = true }
+# An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
+# thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
+# system OpenSSL dep in CI.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+# buffer_unordered for the bounded concurrent fan-out.
+futures = { version = "0.3", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -66,8 +71,9 @@ wasm-bindgen = "=0.2.108"
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
-# serde derives the persisted link-status cache (the reconcile state across runs).
-maintenance = ["dep:ikigai-http", "dep:ureq", "dep:serde"]
+# serde derives the persisted link-status cache (the reconcile state across runs);
+# tokio runs the async fan-out; reqwest + futures back it.
+maintenance = ["dep:ikigai-http", "dep:reqwest", "dep:futures", "dep:tokio", "dep:serde"]
 
 [[bin]]
 name = "cms-server"
