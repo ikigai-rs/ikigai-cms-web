@@ -31,15 +31,16 @@ use ikigai_core::{
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 
 /// A fresh `ok` result is trusted for a week (also the `max_age` passed to each check); broken
-/// URLs are re-checked every run so a sustained failure is confirmed sooner.
+/// URLs are re-checked every run.
 const WEEK_SECS: u64 = 7 * 24 * 60 * 60;
-/// An `unreachable` link is a removal candidate only once it has stayed broken across ≥2 runs
-/// spanning at least this long — so a one-off timeout never qualifies.
-const CONFIRM_SPAN_SECS: u64 = 24 * 60 * 60;
 /// Checks in flight at once — a politeness/backpressure cap on parked futures, NOT a thread count.
-/// Kept modest: a big burst across thousands of distinct hosts overwhelms the system DNS resolver
-/// (spurious connection failures), and link-checking isn't latency-critical.
-const CONCURRENCY: usize = 24;
+/// Kept small: a big burst across many distinct hosts (especially several behind the same CDN)
+/// trips rate-limiting/bot-protection that fails the checker's own connections, and link-checking
+/// isn't latency-critical.
+const CONCURRENCY: usize = 8;
+/// A transient failure is retried once after this delay — a rate-limited or DNS-hiccup request
+/// usually succeeds a moment later, so this collapses most spurious `unreachable`s to `ok`.
+const RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
 // ---- the reqwest transport (async, self-sufficient off the timer thread) -----------------------
 
@@ -163,17 +164,13 @@ enum Outcome {
     Unreachable(String),
 }
 
-/// Whether a broken status is a removal candidate: `gone` always; `unreachable` only once it has
-/// stayed broken across ≥2 runs spanning at least [`CONFIRM_SPAN_SECS`]. Public so the review
-/// view (a later phase) can bucket the same way.
-pub fn removable(s: &Status, now: u64) -> bool {
-    match s.status.as_str() {
-        "gone" => true,
-        "unreachable" => {
-            s.broken_count >= 2 && now.saturating_sub(s.first_broken_at) >= CONFIRM_SPAN_SECS
-        }
-        _ => false,
-    }
+/// Whether a status is a removal candidate. **Only a definitive `gone` (HTTP 404/410) qualifies.**
+/// `unreachable` (a connection/timeout/DNS error) is deliberately NEVER auto-removable: those
+/// failures are too unreliable — a rate-limiting CDN, a DNS hiccup, or the checker throttling its
+/// own machine can all fake one, and a self-inflicted failure repeating every run would spuriously
+/// "confirm" it. Unreachable links are surfaced for the human to judge, not auto-purged.
+pub fn removable(s: &Status) -> bool {
+    s.status == "gone"
 }
 
 /// Load the persisted status cache (empty if absent/unreadable).
@@ -196,19 +193,18 @@ fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) {
     }
 }
 
-/// The one-line summary a pass returns (and the shape a later in-room indicator reads).
+/// The one-line summary a pass returns (and the shape the in-room indicator reads).
 pub struct Summary {
     pub checked: usize,
     pub gone: usize,
-    pub confirmed: usize,
-    pub pending: usize,
+    pub unreachable: usize,
 }
 
 impl Summary {
     fn line(&self) -> String {
         format!(
-            "link-check: {} gone · {} unreachable-confirmed · {} pending (checked {})",
-            self.gone, self.confirmed, self.pending, self.checked
+            "link-check: {} gone (removable) · {} unreachable (flagged) · checked {}",
+            self.gone, self.unreachable, self.checked
         )
     }
 }
@@ -321,15 +317,14 @@ impl Endpoint for LinkCheckPass {
                 finished_at: now,
             },
         );
-        let (gone, confirmed, pending) = buckets(&cache, now);
+        let (gone, unreachable) = buckets(&cache);
         let report_path = self.status_path.with_file_name("dead-links.org");
-        let _ = std::fs::write(report_path, report(&gone, &confirmed, &pending, now));
+        let _ = std::fs::write(report_path, report(&gone, &unreachable, now));
 
         let summary = Summary {
             checked: to_check.len(),
             gone: gone.len(),
-            confirmed: confirmed.len(),
-            pending: pending.len(),
+            unreachable: unreachable.len(),
         };
         Ok(Representation::new(
             ReprType::new("text/plain"),
@@ -450,10 +445,25 @@ async fn check_one(
     (i, outcome)
 }
 
-/// One reachability check via `urn:httpHead`+`Exists` (cacheable a week). `"true"` = alive,
-/// `"false"` = gone; a **transient** error = unreachable (couldn't reach), a **permanent** one (a
-/// status the server answered with) = alive (a HEAD-hostile but live site isn't condemned).
+/// One reachability check, retrying a transient failure once after a short backoff — so a
+/// rate-limited or DNS-hiccup request that fails on the first try gets a second chance to come back
+/// `ok` instead of being flagged unreachable. Only `Unreachable` is transient; `Gone`/`Alive` are
+/// final. The delay is via `futures-timer`, so it works whether the pass is driven by tokio or by
+/// the `urn:time` timer thread.
 async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
+    match check_once(inv, url).await {
+        Outcome::Unreachable(_) => {
+            futures_timer::Delay::new(RETRY_BACKOFF).await;
+            check_once(inv, url).await
+        }
+        final_outcome => final_outcome,
+    }
+}
+
+/// A single `urn:httpHead`+`Exists` resolve (cacheable a week). `"true"` = alive, `"false"` = gone;
+/// a **transient** error = unreachable (couldn't reach), a **permanent** one (a status the server
+/// answered with) = alive (a HEAD-hostile but live site isn't condemned).
+async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
     let request = Request::new(Verb::Exists, Iri::parse("urn:httpHead").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
         .with_arg(
@@ -505,28 +515,26 @@ fn merge(
     base(status, reason, first, count)
 }
 
-/// Partition into (gone, unreachable-confirmed, unreachable-pending), each sorted by URL.
-fn buckets(
-    cache: &HashMap<String, Status>,
-    now: u64,
-) -> (Vec<&Status>, Vec<&Status>, Vec<&Status>) {
-    let (mut gone, mut confirmed, mut pending) = (Vec::new(), Vec::new(), Vec::new());
+/// Partition into (gone, unreachable), each sorted by URL. `gone` is the removable set;
+/// `unreachable` is flagged for the human but never auto-removed (see [`removable`]).
+fn buckets(cache: &HashMap<String, Status>) -> (Vec<&Status>, Vec<&Status>) {
+    let (mut gone, mut unreachable) = (Vec::new(), Vec::new());
     for s in cache.values() {
         match s.status.as_str() {
             "gone" => gone.push(s),
-            "unreachable" if removable(s, now) => confirmed.push(s),
-            "unreachable" => pending.push(s),
+            "unreachable" => unreachable.push(s),
             _ => {}
         }
     }
-    for v in [&mut gone, &mut confirmed, &mut pending] {
+    for v in [&mut gone, &mut unreachable] {
         v.sort_by(|a, b| a.url.cmp(&b.url));
     }
-    (gone, confirmed, pending)
+    (gone, unreachable)
 }
 
-/// The human-readable review as an org file, grouped by removability.
-fn report(gone: &[&Status], confirmed: &[&Status], pending: &[&Status], now: u64) -> String {
+/// The human-readable review as an org file: the removable `gone` set, then the flagged
+/// `unreachable` set (not auto-removed — your judgement).
+fn report(gone: &[&Status], unreachable: &[&Status], now: u64) -> String {
     let mut s = String::from("#+TITLE: Dead bookmarks — link check\n\n");
     let mut section = |title: &str, items: &[&Status], note: &str| {
         s.push_str(&format!("* {title}: {}\n", items.len()));
@@ -546,20 +554,11 @@ fn report(gone: &[&Status], confirmed: &[&Status], pending: &[&Status], now: u64
         }
         s.push('\n');
     };
+    section("Gone — removable", gone, "HTTP 404/410: definitively dead");
     section(
-        "Gone — removable",
-        gone,
-        "404/410 or DNS: definitively dead",
-    );
-    section(
-        "Unreachable — confirmed, removable",
-        confirmed,
-        "timeout/refused, sustained across runs",
-    );
-    section(
-        "Unreachable — pending recheck",
-        pending,
-        "down at least once; re-run the check to confirm before removing",
+        "Unreachable — flagged (not auto-removed)",
+        unreachable,
+        "connection/timeout/DNS errors — too unreliable to delete on; your call",
     );
     s
 }
@@ -616,22 +615,21 @@ fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> St
     if cache.is_empty() {
         return String::new();
     }
-    let (gone, confirmed, pending) = buckets(cache, now);
-    let unreachable = confirmed.len() + pending.len();
+    let (gone, unreachable) = buckets(cache);
     let last = cache.values().map(|s| s.checked_at).max().unwrap_or(0);
     format!(
         "<span class=\"cms-linkcheck\">links: {} gone · {} unreachable · checked {}</span>",
         group(gone.len()),
-        group(unreachable),
+        group(unreachable.len()),
         ago(now, last),
     )
 }
 
 /// `urn:cms:review` — the suggested-deletes review as an htmx card fragment. Reads the persisted
-/// status, takes the removal candidates (`gone` + confirmed-`unreachable`), and renders them
-/// through the `review` stylesheet (a view is a query; here the "query" is the removable set). The
-/// pending count rides along so the header can note "N pending confirmation". Read-only — the
-/// authorized purge is a separate action.
+/// status: the **removable** set (`gone` = HTTP 404/410) becomes cards, and the count of **flagged**
+/// `unreachable` links rides in the header (they're surfaced but never auto-removed — connection
+/// errors are too unreliable). A view is a query; here the query is the removable set. Read-only —
+/// the authorized purge is a separate action.
 pub struct ReviewView;
 
 #[async_trait]
@@ -639,10 +637,8 @@ impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let cache = load_status(&resolved_status_path());
         let now = unix_now();
-        let (gone, confirmed, pending) = buckets(&cache, now);
-        let mut removable: Vec<&Status> = gone.into_iter().chain(confirmed).collect();
-        removable.sort_by(|a, b| a.url.cmp(&b.url));
-        let xml = review_xml(&removable, pending.len(), now);
+        let (gone, unreachable) = buckets(&cache);
+        let xml = review_xml(&gone, unreachable.len(), now);
         let req = Request::new(
             Verb::Source,
             Iri::parse("urn:xslt:transform").expect("valid IRI"),
@@ -673,11 +669,11 @@ impl Endpoint for ReviewView {
     }
 }
 
-/// Build the review doc (`urn:cms:review#`) from the removable candidates + the pending count.
-/// An empty candidate set is its own element (the stylesheet needs no conditionals).
-fn review_xml(removable: &[&Status], pending: usize, now: u64) -> String {
+/// Build the review doc (`urn:cms:review#`) from the removable (`gone`) candidates + the count of
+/// flagged (`unreachable`) links. An empty candidate set is its own element (no xrust conditionals).
+fn review_xml(removable: &[&Status], flagged: usize, now: u64) -> String {
     let mut s = format!(
-        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" pending=\"{pending}\">",
+        "<review xmlns=\"urn:cms:review#\" removable=\"{}\" flagged=\"{flagged}\">",
         removable.len()
     );
     if removable.is_empty() {
@@ -758,17 +754,16 @@ impl PurgeView {
     /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair.
     fn confirm_html(&self) -> String {
         let cache = load_status(&resolved_status_path());
-        let now = unix_now();
-        let (gone, confirmed, _pending) = buckets(&cache, now);
-        let n = gone.len() + confirmed.len();
+        let (gone, _unreachable) = buckets(&cache);
+        let n = gone.len();
         if n == 0 {
             return "<div class=\"cms-purge\"><p>Nothing to purge.</p>\
                 <button hx-get=\"/r/urn:cms:review\">back</button></div>"
                 .to_string();
         }
         format!(
-            "<div class=\"cms-purge\"><p>Remove <b>{}</b> confirmed-dead links from the bookmarks \
-             file? A backup is saved first — this can't be undone from the room.</p>\
+            "<div class=\"cms-purge\"><p>Remove <b>{}</b> definitively-dead (404/410) links from the \
+             bookmarks file? A backup is saved first — this can't be undone from the room.</p>\
              <button class=\"cms-purge-go\" hx-post=\"/purge\">Confirm purge</button> \
              <button hx-get=\"/r/urn:cms:review\">Cancel</button></div>",
             group(n)
@@ -780,14 +775,11 @@ impl PurgeView {
     async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let status_path = resolved_status_path();
         let cache = load_status(&status_path);
-        let now = unix_now();
-        // Owned URLs, so the cache borrow is released before we rewrite the cache below.
+        // Owned URLs, so the cache borrow is released before we rewrite the cache below. Only the
+        // removable (`gone`) set is ever purged — `unreachable` is flagged-only.
         let removable: HashSet<String> = {
-            let (gone, confirmed, _pending) = buckets(&cache, now);
-            gone.iter()
-                .chain(&confirmed)
-                .map(|s| s.url.clone())
-                .collect()
+            let (gone, _unreachable) = buckets(&cache);
+            gone.iter().map(|s| s.url.clone()).collect()
         };
         if removable.is_empty() {
             return Ok(fragment(
@@ -1103,13 +1095,12 @@ mod tests {
     }
 
     #[test]
-    fn removable_needs_two_runs_over_a_day_for_unreachable_but_gone_always() {
-        let now = 3_000_000u64;
-        assert!(removable(&st("gone", now, 1), now));
-        assert!(!removable(&st("unreachable", now, 1), now));
-        assert!(!removable(&st("unreachable", now - 3_600, 2), now));
-        assert!(removable(&st("unreachable", now - 86_400, 2), now));
-        assert!(!removable(&st("ok", 0, 0), now));
+    fn only_gone_is_removable_never_unreachable() {
+        // A definitive 404/410 (`gone`) is removable; `unreachable` never, no matter how many times
+        // or how long it has failed (connection errors are too unreliable to delete on).
+        assert!(removable(&st("gone", 0, 1)));
+        assert!(!removable(&st("unreachable", 0, 9)));
+        assert!(!removable(&st("ok", 0, 0)));
     }
 
     #[test]
@@ -1156,7 +1147,7 @@ mod tests {
         g.title = "A \"quoted\" <title>".into();
         g.reason = "HTTP 404/410 (gone)".into();
         let xml = review_xml(&[&g], 638, now);
-        assert!(xml.contains("removable=\"1\" pending=\"638\""), "{xml}");
+        assert!(xml.contains("removable=\"1\" flagged=\"638\""), "{xml}");
         assert!(xml.contains("status=\"gone\""), "{xml}");
         assert!(xml.contains("days=\"2\""), "{xml}");
         // Attribute values are XML-escaped.

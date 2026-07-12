@@ -28,8 +28,8 @@
       .cms-review-purge:hover{background:#c0392b;color:#fff}
     </style>
     <div class="cms-review-head">
-      <xsl:value-of select="@removable"/><xsl:text> to remove · </xsl:text>
-      <xsl:value-of select="@pending"/><xsl:text> pending confirmation (re-run to promote) </xsl:text>
+      <xsl:value-of select="@removable"/><xsl:text> removable (404/410) · </xsl:text>
+      <xsl:value-of select="@flagged"/><xsl:text> unreachable, flagged — not auto-removed (see dead-links.org) </xsl:text>
       <button class="cms-review-purge" hx-get="/r/urn:cms:purge">Purge…</button>
     </div>
     <section class="cms-review">

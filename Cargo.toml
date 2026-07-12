@@ -61,6 +61,9 @@ ikigai-http = { version = "0.1.5", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
 # buffer_unordered for the bounded concurrent fan-out.
 futures = { version = "0.3", optional = true }
+# A runtime-agnostic timer for the transient-failure retry backoff (works under tokio or the
+# urn:time timer thread alike).
+futures-timer = { version = "3", optional = true }
 # The time transport: cms-server schedules the link-check pass on a recurring urn:time job.
 ikigai-time = { version = "0.1.11", optional = true }
 
@@ -77,7 +80,7 @@ server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.
-maintenance = ["dep:ikigai-http", "dep:reqwest", "dep:futures", "dep:tokio", "dep:serde"]
+maintenance = ["dep:ikigai-http", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde"]
 
 [[bin]]
 name = "cms-server"
