@@ -504,6 +504,18 @@ pub fn maintenance_kernel(
         .with_clock(std::sync::Arc::new(SystemClock))
 }
 
+/// The default persisted-status path: `$HOME/.ikigai/cms-linkstatus.json` — the ikigai-owned
+/// state directory (created if missing), kept out of your synced content dirs. `CMS_LINKSTATUS`
+/// overrides it; `dead-links.org` is written beside it.
+pub fn default_status_path() -> PathBuf {
+    let dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".ikigai");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("cms-linkstatus.json")
+}
+
 /// [`maintenance_kernel`] over the real reqwest transport. Must be built inside a tokio runtime.
 pub fn build_maintenance_kernel(
     src_dir: PathBuf,
