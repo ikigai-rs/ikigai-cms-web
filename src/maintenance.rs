@@ -653,11 +653,13 @@ impl Endpoint for ReviewView {
             ArgRef::Inline(b"urn:cms:style:review".to_vec()),
         );
         let out = inv.issue(req).await?;
+        // NOT cacheable: this reads the status file directly (std::fs, not through the kernel), so
+        // there's no golden thread to invalidate it — a cached fragment would freeze at its first
+        // render and keep showing already-purged links. Recompute every resolve (a cheap file read).
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
             out.bytes,
-        )
-        .cacheable())
+        ))
     }
 
     fn name(&self) -> &str {
