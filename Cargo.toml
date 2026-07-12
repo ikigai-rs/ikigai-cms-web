@@ -61,6 +61,8 @@ ikigai-http = { version = "0.1.5", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
 # buffer_unordered for the bounded concurrent fan-out.
 futures = { version = "0.3", optional = true }
+# The time transport: cms-server schedules the link-check pass on a recurring urn:time job.
+ikigai-time = { version = "0.1.11", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -69,7 +71,9 @@ wasm-bindgen = "=0.2.108"
 [features]
 # The native WebTransport server + WebAuthn relying party. Off by default (keeps the
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
-server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret"]
+# The server includes the maintenance stack + the time transport so it can schedule the
+# link-check pass (urn:time) alongside serving the room.
+server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.

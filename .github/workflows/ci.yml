@@ -29,8 +29,8 @@ jobs:
       - name: test (server feature)
         run: cargo test --features server
       - name: clippy (maintenance feature)
-        run: cargo clippy --features maintenance --bin cms-linkcheck -- -D warnings
+        run: cargo clippy --features maintenance --all-targets -- -D warnings
       - name: test (maintenance feature)
-        run: cargo test --features maintenance --bin cms-linkcheck
+        run: cargo test --features maintenance
       - name: clippy (wasm wire codec)
         run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings

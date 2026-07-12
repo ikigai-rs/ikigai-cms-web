@@ -1234,6 +1234,7 @@ dependencies = [
  "ikigai-resolve",
  "ikigai-secret",
  "ikigai-sparql",
+ "ikigai-time",
  "ikigai-wire",
  "ikigai-xslt",
  "reqwest",
@@ -1317,6 +1318,16 @@ dependencies = [
  "ikigai-core",
  "ikigai-vocab",
  "oxigraph",
+]
+
+[[package]]
+name = "ikigai-time"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aae7a0bc02502e342f212fb5ecfaf31fd6b09410e89f697b3f20ae5c3a01ba4"
+dependencies = [
+ "ikigai-core",
+ "ikigai-resolve",
 ]
 
 [[package]]
