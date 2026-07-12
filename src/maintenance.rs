@@ -392,10 +392,8 @@ impl Endpoint for LinkCheckPass {
                 finished_at: unix_now(),
             },
         );
+        write_report(&self.status_path, &cache, now);
         let (gone, unreachable) = buckets(&cache);
-        let report_path = self.status_path.with_file_name("dead-links.org");
-        let _ = std::fs::write(report_path, report(&gone, &unreachable, now));
-
         let summary = Summary {
             checked: to_check.len(),
             gone: gone.len(),
@@ -642,23 +640,42 @@ fn buckets(cache: &HashMap<String, Status>) -> (Vec<&Status>, Vec<&Status>) {
     (gone, unreachable)
 }
 
-/// The three review buckets: definitively-`gone` (removable now), durably-`unreachable` (eligible
-/// for the reviewed unreachable purge), and the count of `unreachable` still under observation (not
-/// yet durable — kept as a count so the human sees they're tracked but not offered for removal).
-fn review_buckets(
+/// Partition into (gone, durably-unreachable, under-observation), each sorted by URL — the three
+/// removal/flag categories the review and the org worksheet both speak.
+fn dead_buckets(
     cache: &HashMap<String, Status>,
     now: u64,
-) -> (Vec<&Status>, Vec<&Status>, usize) {
+) -> (Vec<&Status>, Vec<&Status>, Vec<&Status>) {
     let (gone, unreachable) = buckets(cache);
     let (durable, observing): (Vec<&Status>, Vec<&Status>) = unreachable
         .into_iter()
         .partition(|s| durably_unreachable(s, now));
+    (gone, durable, observing)
+}
+
+/// The three review buckets for the in-room view: `gone`, durably-`unreachable`, and the *count*
+/// still under observation (tracked but not offered for removal, so a count suffices there).
+fn review_buckets(
+    cache: &HashMap<String, Status>,
+    now: u64,
+) -> (Vec<&Status>, Vec<&Status>, usize) {
+    let (gone, durable, observing) = dead_buckets(cache, now);
     (gone, durable, observing.len())
 }
 
-/// The human-readable review as an org file: the removable `gone` set, then the flagged
-/// `unreachable` set (not auto-removed — your judgement).
-fn report(gone: &[&Status], unreachable: &[&Status], now: u64) -> String {
+/// (Re)write the `dead-links.org` worksheet beside the status cache from the *current* cache — so
+/// it stays in step with the room. Called at the end of every pass AND right after a purge (the
+/// purge prunes the cache, so regenerating here keeps the worksheet from lagging the removal).
+fn write_report(status_path: &std::path::Path, cache: &HashMap<String, Status>, now: u64) {
+    let (gone, durable, observing) = dead_buckets(cache, now);
+    let path = status_path.with_file_name("dead-links.org");
+    let _ = std::fs::write(path, report(&gone, &durable, &observing, now));
+}
+
+/// The human-readable review as an org file, one section per category so the worksheet tells the
+/// same story as the room: removable `gone`, removal-eligible durable-`unreachable`, and the
+/// `unreachable` still under observation (not yet eligible).
+fn report(gone: &[&Status], durable: &[&Status], observing: &[&Status], now: u64) -> String {
     let mut s = String::from("#+TITLE: Dead bookmarks — link check\n\n");
     let mut section = |title: &str, items: &[&Status], note: &str| {
         s.push_str(&format!("* {title}: {}\n", items.len()));
@@ -680,9 +697,14 @@ fn report(gone: &[&Status], unreachable: &[&Status], now: u64) -> String {
     };
     section("Gone — removable", gone, "HTTP 404/410: definitively dead");
     section(
-        "Unreachable — flagged (not auto-removed)",
-        unreachable,
-        "connection/timeout/DNS errors — too unreliable to delete on; your call",
+        "Unreachable, durable — removal-eligible",
+        durable,
+        "couldn't connect across ≥3 checks over ≥7 days — offered for the reviewed unreachable purge",
+    );
+    section(
+        "Unreachable, under observation — not yet eligible",
+        observing,
+        "connection/timeout/DNS errors, but not yet sustained (need 3 failed checks over a week)",
     );
     s
 }
@@ -1016,6 +1038,10 @@ impl PurgeView {
         let mut cache = load_status(&status_path);
         cache.retain(|url, _| !removable.contains(url));
         save_status(&status_path, &cache);
+        // Regenerate the dead-links.org worksheet from the pruned cache so it doesn't lag the room
+        // (the purge just removed these; the next scheduled pass would otherwise be the only thing
+        // to refresh the org file).
+        write_report(&status_path, &cache, now);
         Ok(fragment(format!(
             "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
              refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
@@ -1286,6 +1312,28 @@ mod tests {
             uhtml.contains("hx-post=\"/purge-unreachable\"")
                 && uhtml.contains("durably-unreachable"),
             "unreachable purge confirm posts to /purge-unreachable: {uhtml}"
+        );
+
+        // Execute the gone purge (Sink): strikes the gone bookmark from the file, prunes the cache,
+        // and REGENERATES dead-links.org from the pruned cache — so the worksheet doesn't lag.
+        let xreq = Request::new(Verb::Sink, Iri::parse("urn:cms:purge").unwrap());
+        let xrepr = futures::executor::block_on(kernel.issue(xreq, &Capability::root()))
+            .expect("gone purge executes");
+        assert!(
+            String::from_utf8_lossy(&xrepr.bytes).contains("Removed"),
+            "purge reports removal"
+        );
+        let org = std::fs::read_to_string(status_path.with_file_name("dead-links.org")).unwrap();
+        // The purged gone link is gone from the worksheet; the un-purged unreachables remain, each
+        // in its own (now split) section.
+        assert!(!org.contains("sci.example"), "purged link dropped: {org}");
+        assert!(
+            org.contains("http://durable.example"),
+            "durable listed: {org}"
+        );
+        assert!(
+            org.contains("removal-eligible") && org.contains("under observation"),
+            "worksheet split into durable + observation sections: {org}"
         );
     }
 
