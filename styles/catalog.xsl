@@ -14,7 +14,11 @@
 .cms-title:hover{text-decoration:underline}
 .cms-author{display:inline-block;color:var(--mut);font-size:13px;font-style:italic;margin:2px 8px 0 0}
 .cms-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.cms-tag{font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);text-decoration:none;cursor:pointer}</style>
+.cms-tag{font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);text-decoration:none;cursor:pointer}
+.cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);border:1px dashed var(--line);border-radius:10px;padding:1px 4px 1px 7px}
+.cms-sug-yes,.cms-sug-no{font:12px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0 3px;line-height:1}
+.cms-sug-yes{color:#3a8a3a}.cms-sug-no{color:#c0392b}
+.cms-sug-yes:hover,.cms-sug-no:hover{font-weight:700}</style>
     <section class="cms-room">
       <div class="cms-count"><xsl:value-of select="count(rdf:Description)"/> resources</div>
       <xsl:apply-templates select="rdf:Description"/>
@@ -36,6 +40,22 @@
             <xsl:attribute name="hx-get">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
             <xsl:text>#</xsl:text><xsl:value-of select="."/>
           </a>
+        </xsl:for-each>
+        <!-- Provisional suggestions: a dashed chip with promote (+) / dismiss (x). Each button acts
+             on its own chip (hx-swap outerHTML) so browse context is kept: + returns the promoted
+             tag chip, x returns nothing. `book` + `tag` ride as hx-vals (htmx URL-encodes them). -->
+        <xsl:for-each select="cms:suggestedTag">
+          <span class="cms-sug">
+            <xsl:text>#</xsl:text><xsl:value-of select="."/>
+            <button class="cms-sug-yes" hx-post="/tag/approve" hx-target="closest .cms-sug" hx-swap="outerHTML" title="promote to a tag">
+              <xsl:attribute name="hx-vals">{"book":"<xsl:value-of select="../@rdf:about"/>","tag":"<xsl:value-of select="."/>"}</xsl:attribute>
+              <xsl:text>+</xsl:text>
+            </button>
+            <button class="cms-sug-no" hx-post="/tag/reject" hx-target="closest .cms-sug" hx-swap="outerHTML" title="dismiss">
+              <xsl:attribute name="hx-vals">{"book":"<xsl:value-of select="../@rdf:about"/>","tag":"<xsl:value-of select="."/>"}</xsl:attribute>
+              <xsl:text>x</xsl:text>
+            </button>
+          </span>
         </xsl:for-each>
       </div>
     </article>

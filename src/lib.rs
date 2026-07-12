@@ -23,6 +23,11 @@ pub use native::{build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces
 #[cfg(not(target_family = "wasm"))]
 pub use presentations::Presentations;
 
+// The tag overlays (approved + suggested tags) merged into urn:cms:graph — provisional LLM/OL
+// tag suggestions with a human-authorized promote/dismiss, kept off the regenerated sources.
+#[cfg(not(target_family = "wasm"))]
+pub mod tagstore;
+
 // Graph maintenance (the link-checker) — behind the `maintenance` feature, which adds
 // outbound HTTP. `urn:cms:linkcheck` caches each check for a week.
 #[cfg(feature = "maintenance")]
