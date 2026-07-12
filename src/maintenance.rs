@@ -773,16 +773,20 @@ impl PurgeView {
         )
     }
 
-    /// Execute (Sink): back up, strike, write through the kernel (→ live refresh).
+    /// Execute (Sink): back up, strike, write through the kernel (→ live refresh), and drop the
+    /// purged URLs from the status cache too.
     async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let cache = load_status(&resolved_status_path());
+        let status_path = resolved_status_path();
+        let cache = load_status(&status_path);
         let now = unix_now();
-        let (gone, confirmed, _pending) = buckets(&cache, now);
-        let removable: HashSet<&str> = gone
-            .iter()
-            .chain(&confirmed)
-            .map(|s| s.url.as_str())
-            .collect();
+        // Owned URLs, so the cache borrow is released before we rewrite the cache below.
+        let removable: HashSet<String> = {
+            let (gone, confirmed, _pending) = buckets(&cache, now);
+            gone.iter()
+                .chain(&confirmed)
+                .map(|s| s.url.clone())
+                .collect()
+        };
         if removable.is_empty() {
             return Ok(fragment(
                 "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
@@ -792,10 +796,11 @@ impl PurgeView {
             .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
         let bak = Iri::parse(&self.bak_iri)
             .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
-        // Read the current file through the kernel.
+        // Read the current file through the kernel, strike the matching entries.
         let current = inv.source(&iri).await?;
         let text = String::from_utf8_lossy(&current.bytes).into_owned();
-        let (new_text, removed) = strike(&text, &removable);
+        let refs: HashSet<&str> = removable.iter().map(String::as_str).collect();
+        let (new_text, removed) = strike(&text, &refs);
         // Back up the old content, then write the new — the write cuts the bookmarks golden thread
         // (BookmarkGraph depends on it), so the graph re-derives and the room refreshes live.
         inv.issue(
@@ -807,6 +812,12 @@ impl PurgeView {
                 .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
         )
         .await?;
+        // The review view + indicator read the status cache (not the graph), so drop the purged
+        // URLs from it too — otherwise they'd keep showing as candidates until the next pass prunes
+        // them. Re-load in case a pass wrote it meanwhile.
+        let mut cache = load_status(&status_path);
+        cache.retain(|url, _| !removable.contains(url));
+        save_status(&status_path, &cache);
         Ok(fragment(format!(
             "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
              refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
