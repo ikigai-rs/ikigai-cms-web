@@ -213,6 +213,51 @@ impl Summary {
     }
 }
 
+/// The live run state, written to a small meta file beside the status cache so the in-room
+/// indicator can show progress while a pass runs (the per-URL status blob has no notion of "now
+/// running"). Cheap to write; read on each status poll.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Meta {
+    pub running: bool,
+    pub checked: usize,
+    pub total: usize,
+    /// Unix seconds the last pass finished.
+    #[serde(default)]
+    pub finished_at: u64,
+}
+
+/// The meta file path (beside the status cache).
+fn meta_path(status_path: &std::path::Path) -> PathBuf {
+    status_path.with_file_name("cms-linkcheck-meta.json")
+}
+
+fn write_meta(path: &std::path::Path, meta: &Meta) {
+    if let Ok(bytes) = serde_json::to_vec(meta) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn read_meta(path: &std::path::Path) -> Meta {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// The configured status path (`CMS_LINKSTATUS` or the `$HOME/.ikigai` default) WITHOUT creating
+/// the dir — so a reader (the status view) resolves the same file the pass writes.
+fn resolved_status_path() -> PathBuf {
+    std::env::var("CMS_LINKSTATUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".ikigai")
+                .join("cms-linkstatus.json")
+        })
+}
+
 // ---- the pass endpoint -------------------------------------------------------------------------
 
 /// `urn:cms:linkcheck` — run the link-check pass. Sourcing it lists every bookmark, checks each,
@@ -245,7 +290,19 @@ impl Endpoint for LinkCheckPass {
             .take(limit)
             .collect();
 
-        for (idx, outcome) in check_all(inv, &to_check).await {
+        // Live run state for the in-room indicator.
+        let meta = meta_path(&self.status_path);
+        write_meta(
+            &meta,
+            &Meta {
+                running: true,
+                checked: 0,
+                total: to_check.len(),
+                finished_at: 0,
+            },
+        );
+
+        for (idx, outcome) in check_all(inv, &to_check, &meta).await {
             let (subject, url, title) = to_check[idx];
             let entry = merge(cache.get(url), subject, url, title, &outcome, now);
             cache.insert(url.clone(), entry);
@@ -255,6 +312,15 @@ impl Endpoint for LinkCheckPass {
         cache.retain(|url, _| current.contains(url.as_str()));
 
         save_status(&self.status_path, &cache);
+        write_meta(
+            &meta,
+            &Meta {
+                running: false,
+                checked: to_check.len(),
+                total: to_check.len(),
+                finished_at: now,
+            },
+        );
         let (gone, confirmed, pending) = buckets(&cache, now);
         let report_path = self.status_path.with_file_name("dead-links.org");
         let _ = std::fs::write(report_path, report(&gone, &confirmed, &pending, now));
@@ -329,10 +395,12 @@ async fn list_bookmarks(inv: &Invocation<'_>) -> Result<Vec<(String, String, Str
     Ok(out)
 }
 
-/// Check `items` as parked futures bounded at [`CONCURRENCY`] in flight.
+/// Check `items` as parked futures bounded at [`CONCURRENCY`] in flight, ticking the meta file's
+/// progress so the in-room indicator can update.
 async fn check_all(
     inv: &Invocation<'_>,
     items: &[&(String, String, String)],
+    meta: &std::path::Path,
 ) -> Vec<(usize, Outcome)> {
     let total = items.len();
     let done = AtomicUsize::new(0);
@@ -345,17 +413,19 @@ async fn check_all(
         .map(|(i, it)| (i, it.1.clone()))
         .collect();
     futures::stream::iter(work)
-        .map(|(i, url)| check_one(inv, &done, total, i, url))
+        .map(|(i, url)| check_one(inv, &done, total, meta, i, url))
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await
 }
 
-/// One item's check + progress log.
+/// One item's check + progress log, ticking the meta file every 25 completions (a benign race on
+/// the counter — the indicator is approximate).
 async fn check_one(
     inv: &Invocation<'_>,
     done: &AtomicUsize,
     total: usize,
+    meta: &std::path::Path,
     i: usize,
     url: String,
 ) -> (usize, Outcome) {
@@ -365,6 +435,17 @@ async fn check_one(
         Outcome::Gone(r) => eprintln!("[{n}/{total}] GONE    {url}  ({r})"),
         Outcome::Unreachable(r) => eprintln!("[{n}/{total}] unreach {url}  ({r})"),
         Outcome::Alive => {}
+    }
+    if n.is_multiple_of(25) {
+        write_meta(
+            meta,
+            &Meta {
+                running: true,
+                checked: n,
+                total,
+                finished_at: 0,
+            },
+        );
     }
     (i, outcome)
 }
@@ -489,6 +570,91 @@ fn org_safe(s: &str) -> String {
         .replace(']', ")")
 }
 
+// ---- the in-room status view -------------------------------------------------------------------
+
+/// `urn:cms:linkstatus` — a small HTML fragment for the room's live link-check indicator. While a
+/// pass runs it shows progress (`checking links… 1,240 / 5,373`); otherwise it shows the last
+/// run's tally from the persisted status (`links: 650 gone · 638 unreachable · checked 2h ago`);
+/// nothing before the first run. Reads the meta + status files (`CMS_LINKSTATUS`/default) — it does
+/// no network, so it can live in the serving kernel and be polled by htmx.
+pub struct LinkStatusView;
+
+#[async_trait]
+impl Endpoint for LinkStatusView {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        let status_path = resolved_status_path();
+        let meta = read_meta(&meta_path(&status_path));
+        let cache = load_status(&status_path);
+        let html = status_fragment(&meta, &cache, unix_now());
+        Ok(Representation::new(
+            ReprType::new("text/html").with_param("charset", "utf-8"),
+            html.into_bytes(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "cms-linkstatus"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:linkstatus")
+            .summary("The room's live link-check indicator: a small HTML fragment of the run progress or the last-run tally.")
+            .verb(Verb::Source)
+    }
+}
+
+/// Render the indicator fragment: run progress while a pass is running, else the last-run tally
+/// from the persisted status, else empty (never run).
+fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> String {
+    if meta.running {
+        return format!(
+            "<span class=\"cms-linkcheck running\">checking links… {} / {}</span>",
+            group(meta.checked),
+            group(meta.total)
+        );
+    }
+    if cache.is_empty() {
+        return String::new();
+    }
+    let (gone, confirmed, pending) = buckets(cache, now);
+    let unreachable = confirmed.len() + pending.len();
+    let last = cache.values().map(|s| s.checked_at).max().unwrap_or(0);
+    format!(
+        "<span class=\"cms-linkcheck\">links: {} gone · {} unreachable · checked {}</span>",
+        group(gone.len()),
+        group(unreachable),
+        ago(now, last),
+    )
+}
+
+/// A short "time ago" for the last check.
+fn ago(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    if secs < 90 {
+        "just now".to_string()
+    } else if secs < 5400 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Thousands-separate a count for display (`5373` → `5,373`).
+fn group(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    let bytes = s.as_bytes();
+    for (i, c) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
+}
+
 // ---- kernel assembly ---------------------------------------------------------------------------
 
 /// A maintenance kernel: the CMS graph spaces + the `ikigai-http` outbound endpoints over
@@ -611,6 +777,14 @@ mod tests {
         let cache = load_status(&status_path);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().unwrap().status, "gone");
+
+        // The status indicator resource is mounted in the same kernel and resolves (content comes
+        // from the env/default path, so we only assert it's reachable, not its text).
+        let sreq = Request::new(Verb::Source, Iri::parse("urn:cms:linkstatus").unwrap());
+        assert!(
+            futures::executor::block_on(kernel.issue(sreq, &Capability::root())).is_ok(),
+            "urn:cms:linkstatus resolves"
+        );
     }
 
     fn st(status: &str, first: u64, count: u32) -> Status {
@@ -669,5 +843,41 @@ mod tests {
         assert!(!removable(&st("unreachable", now - 3_600, 2), now));
         assert!(removable(&st("unreachable", now - 86_400, 2), now));
         assert!(!removable(&st("ok", 0, 0), now));
+    }
+
+    #[test]
+    fn the_status_fragment_shows_progress_running_tally_idle_and_nothing_before_a_run() {
+        let now = 3_000_000u64;
+        // Running → progress, thousands-grouped, with the `running` class.
+        let running = status_fragment(
+            &Meta {
+                running: true,
+                checked: 1_240,
+                total: 5_373,
+                finished_at: 0,
+            },
+            &HashMap::new(),
+            now,
+        );
+        assert!(
+            running.contains("checking links… 1,240 / 5,373"),
+            "{running}"
+        );
+        assert!(running.contains("cms-linkcheck running"), "{running}");
+        // Idle with a cache → the tally + "ago" (all entries checked in the same run, 2h ago).
+        let mut cache = HashMap::new();
+        let checked = |status: &str| {
+            let mut s = st(status, now - 7_200, 1);
+            s.checked_at = now - 7_200; // 2h ago
+            s
+        };
+        cache.insert("g".into(), checked("gone"));
+        cache.insert("u".into(), checked("unreachable"));
+        let idle = status_fragment(&Meta::default(), &cache, now);
+        assert!(idle.contains("1 gone"), "{idle}");
+        assert!(idle.contains("1 unreachable"), "{idle}");
+        assert!(idle.contains("2h ago"), "{idle}");
+        // Never run → empty (the CSS hides an empty indicator).
+        assert!(status_fragment(&Meta::default(), &HashMap::new(), now).is_empty());
     }
 }
