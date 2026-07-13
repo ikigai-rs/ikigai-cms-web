@@ -1155,30 +1155,56 @@ impl Endpoint for TagSuggestPass {
             .unwrap_or(5);
         let vocab = tag_vocabulary(inv).await;
         let books = list_untagged_books(inv, limit).await?;
-        let (mut tagged, mut added) = (0usize, 0usize);
+        eprintln!(
+            "[tag-suggest] local LLM is up; {} untagged book(s) to check, {} known tags in vocab",
+            books.len(),
+            vocab.len()
+        );
+        let (mut tagged, mut added, mut via_llm, mut via_fallback) =
+            (0usize, 0usize, 0usize, 0usize);
         for (i, b) in books.iter().enumerate() {
             if i > 0 {
                 futures_timer::Delay::new(OL_SPACING).await;
             }
             let subjects = openlibrary_subjects(inv, &b.isbn, &b.title).await;
             // The LLM maps the noisy OpenLibrary subjects + the book's description onto the user's
-            // vocabulary (coining a new tag when warranted); if the ask fails, fall back to the
-            // deterministic S2 filter so the book still gets *something*.
-            let tags = match llm_tags(inv, b, &subjects, &vocab).await {
-                Some(t) => t,
-                None => filter_subjects(&subjects),
+            // vocabulary (coining a new tag when warranted); if the ask fails or yields nothing,
+            // fall back to the deterministic S2 filter so the book still gets *something*.
+            let (tags, source) = match llm_tags(inv, b, &subjects, &vocab).await {
+                Some(t) => (t, "llm"),
+                None => (filter_subjects(&subjects), "openlibrary-fallback"),
             };
+            // Say where each book's tags come from, and what the LLM was working from — so a run is
+            // legible: LLM-refined vs the deterministic fallback, and the raw OpenLibrary input.
+            let ol = if subjects.is_empty() {
+                "(no OpenLibrary match)".to_string()
+            } else {
+                subjects.join(", ")
+            };
+            let out = if tags.is_empty() {
+                "(no suggestion)".to_string()
+            } else {
+                tags.join(", ")
+            };
+            eprintln!("[tag-suggest] [{source}] \"{}\"", b.title);
+            eprintln!("    OpenLibrary: {ol}");
+            eprintln!("    → {out}");
             if !tags.is_empty() {
                 tagged += 1;
+                if source == "llm" {
+                    via_llm += 1;
+                } else {
+                    via_fallback += 1;
+                }
             }
             for t in &tags {
                 crate::tagstore::add_suggestion(&b.id, t);
                 added += 1;
-                eprintln!("[tag-suggest] {} → +{t}", b.title);
             }
         }
         let line = format!(
-            "tag-suggest: {added} suggestions across {tagged}/{} untagged books checked",
+            "tag-suggest: {added} suggestions across {tagged}/{} books \
+             ({via_llm} via LLM, {via_fallback} via OpenLibrary fallback)",
             books.len()
         );
         Ok(Representation::new(
@@ -1701,6 +1727,10 @@ mod tests {
             .expect("tag-suggest runs");
         let summary = String::from_utf8(repr.bytes).unwrap();
         assert!(summary.contains("2 suggestions"), "summary: {summary}");
+        assert!(
+            summary.contains("1 via LLM"),
+            "source differentiated: {summary}"
+        );
         // The LLM's tags landed (not the raw/deterministic ones), keyed on the book IRI.
         let sug = crate::tagstore::entries(&crate::tagstore::suggestions_path());
         let tags: Vec<&str> = sug.iter().map(|e| e.tag.as_str()).collect();
