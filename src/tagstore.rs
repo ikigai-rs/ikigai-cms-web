@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 
 const DC_SUBJECT: &str = "http://purl.org/dc/elements/1.1/subject";
 const CMS_SUGGESTED: &str = "https://ikigai-rs.dev/ns/cms#suggestedTag";
+/// A tag the human dismissed for a resource — recorded so the tag-suggest pass never re-suggests it
+/// (the negative half of the feedback loop). In `urn:cms:graph` so the pass's SPARQL can exclude a
+/// fully-dismissed book from the candidate set; not rendered.
+const CMS_DISMISSED: &str = "https://ikigai-rs.dev/ns/cms#dismissedTag";
 
 /// `$HOME/.ikigai/{file}` — the ikigai-owned state dir (created if missing), kept out of synced
 /// content. `CMS_TAG_APPROVED` / `CMS_TAG_SUGGESTIONS` override the two files.
@@ -41,6 +45,10 @@ pub fn approved_path() -> PathBuf {
 
 pub fn suggestions_path() -> PathBuf {
     ikigai_path("CMS_TAG_SUGGESTIONS", "cms-tag-suggestions.ttl")
+}
+
+pub fn dismissed_path() -> PathBuf {
+    ikigai_path("CMS_TAG_DISMISSED", "cms-tag-dismissed.ttl")
 }
 
 /// One overlay triple: a resource IRI and the tag literal it carries.
@@ -154,7 +162,9 @@ pub fn approve(iri: &str, tag: &str) -> bool {
     had
 }
 
-/// Dismiss a suggestion: drop it from the suggestions overlay. Returns false if it wasn't present.
+/// Dismiss a suggestion: drop it from the suggestions overlay AND remember the dismissal, so the
+/// tag-suggest pass won't re-suggest it (and a fully-dismissed book drops out of the candidate set).
+/// Returns false if the suggestion wasn't present.
 pub fn reject(iri: &str, tag: &str) -> bool {
     let target = Entry {
         iri: iri.to_string(),
@@ -165,7 +175,35 @@ pub fn reject(iri: &str, tag: &str) -> bool {
     let had = sug.contains(&target);
     sug.retain(|e| *e != target);
     write_entries(&path, &sug, CMS_SUGGESTED);
+    dismiss(iri, tag);
     had
+}
+
+/// Record that `tag` was dismissed for `iri` (idempotent) — the negative feedback signal.
+pub fn dismiss(iri: &str, tag: &str) {
+    let path = dismissed_path();
+    let mut es = entries(&path);
+    let e = Entry {
+        iri: iri.to_string(),
+        tag: tag.to_string(),
+    };
+    if !es.contains(&e) {
+        es.push(e);
+        write_entries(&path, &es, CMS_DISMISSED);
+    }
+}
+
+/// The distinct tags in the approved overlay — the human-curated vocabulary the tag-suggest pass
+/// always feeds the LLM as "strongly prefer these" (so an accepted tag steers future suggestions
+/// from its first acceptance, not only once it becomes frequent).
+pub fn approved_tags() -> Vec<String> {
+    let mut tags: Vec<String> = entries(&approved_path())
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 /// The suggestions overlay as a Turtle string (for the `urn:cms:graph:suggestions` resource).
@@ -176,6 +214,11 @@ pub fn suggestions_turtle() -> String {
 /// The approved overlay as a Turtle string (for the `urn:cms:graph:tags-approved` resource).
 pub fn approved_turtle() -> String {
     serialize(&entries(&approved_path()), DC_SUBJECT)
+}
+
+/// The dismissed overlay as a Turtle string (for the `urn:cms:graph:dismissed` resource).
+pub fn dismissed_turtle() -> String {
+    serialize(&entries(&dismissed_path()), CMS_DISMISSED)
 }
 
 /// Serializes tests that mutate the process-global `CMS_TAG_*` env vars (they'd otherwise clobber
@@ -210,31 +253,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
 
         add_suggestion("urn:cms:book:1", "rust");
         add_suggestion("urn:cms:book:1", "wasm");
         add_suggestion("urn:cms:book:1", "rust"); // idempotent
         assert_eq!(entries(&suggestions_path()).len(), 2);
 
-        // Promote one → it leaves suggestions and lands in approved as dc:subject.
+        // Promote one → it leaves suggestions and lands in approved as dc:subject + curated vocab.
         assert!(approve("urn:cms:book:1", "rust"));
         assert!(!entries(&suggestions_path()).iter().any(|e| e.tag == "rust"));
-        assert!(
-            approved_turtle().contains("#/subject> \"rust\"")
-                || approved_turtle().contains("subject> \"rust\"")
-        );
         assert!(entries(&approved_path())
             .iter()
             .any(|e| e.iri == "urn:cms:book:1" && e.tag == "rust"));
+        assert_eq!(approved_tags(), vec!["rust".to_string()]);
 
-        // Dismiss the other → gone from suggestions, never in approved.
+        // Dismiss the other → gone from suggestions, never in approved, and REMEMBERED as dismissed
+        // (so the pass won't re-suggest it — the negative feedback).
         assert!(reject("urn:cms:book:1", "wasm"));
         assert!(entries(&suggestions_path()).is_empty());
         assert!(!entries(&approved_path()).iter().any(|e| e.tag == "wasm"));
+        assert!(entries(&dismissed_path())
+            .iter()
+            .any(|e| e.iri == "urn:cms:book:1" && e.tag == "wasm"));
         // Re-reject is a no-op that reports "wasn't there".
         assert!(!reject("urn:cms:book:1", "wasm"));
 
         std::env::remove_var("CMS_TAG_SUGGESTIONS");
         std::env::remove_var("CMS_TAG_APPROVED");
+        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 }
