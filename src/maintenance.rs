@@ -1140,26 +1140,41 @@ pub struct TagSuggestPass;
 #[async_trait]
 impl Endpoint for TagSuggestPass {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // GATE (Brian's requirement): only run if the local LLM is up — otherwise no OpenLibrary
+        // calls, nothing written. `urn:llm:ollama:up` is a cheap liveness probe.
+        if !llm_up(inv).await {
+            return Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"tag-suggest: skipped \xe2\x80\x94 local LLM unavailable".to_vec(),
+            ));
+        }
         let limit = inv
             .inline_str("limit")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(5);
+        let vocab = tag_vocabulary(inv).await;
         let books = list_untagged_books(inv, limit).await?;
         let (mut tagged, mut added) = (0usize, 0usize);
-        for (i, (id, title, isbn)) in books.iter().enumerate() {
+        for (i, b) in books.iter().enumerate() {
             if i > 0 {
                 futures_timer::Delay::new(OL_SPACING).await;
             }
-            let subjects = openlibrary_subjects(inv, isbn, title).await;
-            let tags = filter_subjects(&subjects);
+            let subjects = openlibrary_subjects(inv, &b.isbn, &b.title).await;
+            // The LLM maps the noisy OpenLibrary subjects + the book's description onto the user's
+            // vocabulary (coining a new tag when warranted); if the ask fails, fall back to the
+            // deterministic S2 filter so the book still gets *something*.
+            let tags = match llm_tags(inv, b, &subjects, &vocab).await {
+                Some(t) => t,
+                None => filter_subjects(&subjects),
+            };
             if !tags.is_empty() {
                 tagged += 1;
             }
             for t in &tags {
-                crate::tagstore::add_suggestion(id, t);
+                crate::tagstore::add_suggestion(&b.id, t);
                 added += 1;
-                eprintln!("[tag-suggest] {title} → +{t}");
+                eprintln!("[tag-suggest] {} → +{t}", b.title);
             }
         }
         let line = format!(
@@ -1179,8 +1194,9 @@ impl Endpoint for TagSuggestPass {
     fn describe(&self) -> Description {
         Description::new("urn:cms:tag-suggest")
             .summary(
-                "Suggest tags for untagged books from OpenLibrary subjects, writing the suggestions \
-                 overlay for review. ISBN-first, capped + paced.",
+                "Suggest tags for untagged books: OpenLibrary subjects + the book's description, \
+                 refined by the local LLM onto your tag vocabulary, written to the suggestions \
+                 overlay for review. Runs only if the LLM is up. ISBN-first, capped + paced.",
             )
             .verb(Verb::Source)
             .input(
@@ -1192,17 +1208,123 @@ impl Endpoint for TagSuggestPass {
     }
 }
 
-/// `(book IRI, title, isbn)` for untagged books that also have no pending suggestion — title-ordered
-/// (stable), capped at `limit`. Skipping already-suggested books makes re-runs advance, not repeat.
-async fn list_untagged_books(
+/// An untagged book and the context the LLM tags it from.
+struct UntaggedBook {
+    id: String,
+    title: String,
+    isbn: String,
+    author: String,
+    description: String,
+}
+
+/// Whether the local LLM answers a liveness probe. Never errors — unreachable = down = skip.
+async fn llm_up(inv: &Invocation<'_>) -> bool {
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:llm:ollama:up").expect("valid IRI"),
+    );
+    matches!(inv.issue(request).await, Ok(r) if r.bytes == b"true")
+}
+
+/// The user's existing tag vocabulary — the top-200 tags by use, so the LLM prefers established
+/// tags over inventing near-duplicates. Best-effort (empty on error).
+async fn tag_vocabulary(inv: &Invocation<'_>) -> Vec<String> {
+    let query = "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
+         SELECT ?tag (COUNT(?s) AS ?n) WHERE { ?s dc:subject ?tag } \
+         GROUP BY ?tag ORDER BY DESC(?n) LIMIT 200";
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:sparql:select").expect("valid IRI"),
+    )
+    .with_arg("query", ArgRef::Inline(query.as_bytes().to_vec()))
+    .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+    let Ok(repr) = inv.issue(request).await else {
+        return Vec::new();
+    };
+    let json: serde_json::Value =
+        serde_json::from_slice(&repr.bytes).unwrap_or(serde_json::Value::Null);
+    json["results"]["bindings"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["tag"]["value"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ask the LLM for clean tags. `None` on any failure (→ the caller falls back to the S2 filter) or
+/// when the model returns nothing usable.
+async fn llm_tags(
     inv: &Invocation<'_>,
-    limit: usize,
-) -> Result<Vec<(String, String, String)>> {
+    book: &UntaggedBook,
+    subjects: &[String],
+    vocab: &[String],
+) -> Option<Vec<String>> {
+    let system =
+        "You tag books for a personal knowledge base. Reply with ONLY 2-4 short lowercase \
+         topical tags separated by commas — no sentences, no explanation. Prefer tags from the \
+         user's existing list when one fits; coin a new concise tag only when nothing fits or a \
+         clear topic is missing. Never output publisher names, classification codes, or generic \
+         words like \"general\".";
+    let mut prompt = format!("Book: \"{}\"", book.title);
+    if !book.author.is_empty() {
+        prompt.push_str(&format!(" by {}", book.author));
+    }
+    prompt.push('.');
+    if !book.description.is_empty() {
+        let d: String = book.description.chars().take(400).collect();
+        prompt.push_str(&format!("\nDescription: {d}"));
+    }
+    if !subjects.is_empty() {
+        prompt.push_str(&format!("\nOpenLibrary subjects: {}", subjects.join(", ")));
+    }
+    if !vocab.is_empty() {
+        prompt.push_str(&format!("\nExisting tags to prefer: {}", vocab.join(", ")));
+    }
+    prompt.push_str("\nTags:");
+    let request = Request::new(Verb::Source, Iri::parse("urn:llm:ask").expect("valid IRI"))
+        .with_arg("system", ArgRef::Inline(system.as_bytes().to_vec()))
+        .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
+        .with_arg("temperature", ArgRef::Inline(b"0.2".to_vec()))
+        .with_arg("max_tokens", ArgRef::Inline(b"64".to_vec()));
+    let repr = inv.issue(request).await.ok()?;
+    let tags = parse_llm_tags(&String::from_utf8_lossy(&repr.bytes));
+    (!tags.is_empty()).then_some(tags)
+}
+
+/// Parse the model's reply (comma/newline-separated) into clean slug tags: slugify, drop empties /
+/// over-verbose phrases, dedupe, cap at 4.
+fn parse_llm_tags(reply: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in reply.split([',', '\n', ';']) {
+        let slug = slug_tag(part);
+        if slug.len() < 2 || !slug.chars().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if slug.matches('-').count() > 3 {
+            continue;
+        }
+        if !out.contains(&slug) {
+            out.push(slug);
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
+/// Untagged books (no tag, no pending suggestion) with the context the LLM needs — title-ordered
+/// (stable), capped at `limit`. Skipping already-suggested books makes re-runs advance, not repeat.
+async fn list_untagged_books(inv: &Invocation<'_>, limit: usize) -> Result<Vec<UntaggedBook>> {
     let query = format!(
         "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
          PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-         SELECT ?id ?title ?isbn WHERE {{ \
-           ?id a cms:Book ; dc:title ?title . OPTIONAL {{ ?id cms:isbn ?isbn }} \
+         SELECT ?id ?title ?isbn ?author ?description WHERE {{ \
+           ?id a cms:Book ; dc:title ?title . \
+           OPTIONAL {{ ?id cms:isbn ?isbn }} OPTIONAL {{ ?id dc:creator ?author }} \
+           OPTIONAL {{ ?id dc:description ?description }} \
            FILTER NOT EXISTS {{ ?id dc:subject ?sub }} \
            FILTER NOT EXISTS {{ ?id cms:suggestedTag ?sg }} }} ORDER BY ?title LIMIT {limit}"
     );
@@ -1215,6 +1337,7 @@ async fn list_untagged_books(
     let repr = inv.issue(request).await?;
     let json: serde_json::Value =
         serde_json::from_slice(&repr.bytes).unwrap_or(serde_json::Value::Null);
+    let field = |r: &serde_json::Value, k: &str| r[k]["value"].as_str().unwrap_or("").to_string();
     let mut out = Vec::new();
     if let Some(rows) = json["results"]["bindings"].as_array() {
         for r in rows {
@@ -1222,8 +1345,13 @@ async fn list_untagged_books(
             else {
                 continue;
             };
-            let isbn = r["isbn"]["value"].as_str().unwrap_or("").to_string();
-            out.push((id.to_string(), title.to_string(), isbn));
+            out.push(UntaggedBook {
+                id: id.to_string(),
+                title: title.to_string(),
+                isbn: field(r, "isbn"),
+                author: field(r, "author"),
+                description: field(r, "description"),
+            });
         }
     }
     Ok(out)
@@ -1382,7 +1510,17 @@ pub fn maintenance_kernel(
     transport: std::sync::Arc<dyn HttpTransport>,
 ) -> Kernel {
     let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks);
-    spaces.push(std::sync::Arc::new(ikigai_http::space(transport)) as std::sync::Arc<dyn Space>);
+    spaces.push(
+        std::sync::Arc::new(ikigai_http::space(transport.clone())) as std::sync::Arc<dyn Space>
+    );
+    // The local LLM (Ollama, OpenAI-compat) over the SAME transport — `urn:llm:ask` refines the tag
+    // suggestions and `urn:llm:ollama:up` gates the pass. Model is `CMS_LLM_MODEL` (default a small
+    // one, to stay light on memory).
+    let model = std::env::var("CMS_LLM_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+    spaces.push(std::sync::Arc::new(ikigai_llm::space(
+        transport,
+        ikigai_llm::OpenAiConfig::ollama(model),
+    )) as std::sync::Arc<dyn Space>);
     spaces.push(std::sync::Arc::new(
         EndpointSpace::new()
             .bind(
@@ -1447,19 +1585,41 @@ mod tests {
         }
     }
 
-    /// A canned transport returning a fixed 200 body (for the OpenLibrary JSON).
-    struct CannedBody {
-        body: Vec<u8>,
-    }
+    /// A canned transport that routes by URL: the OpenLibrary lookup, the LLM chat completion, and
+    /// the LLM liveness probe (`/models`) each get their own 200 body — so one transport can drive
+    /// the whole tag-suggest pass (probe → OpenLibrary → ask).
+    struct RoutedCanned;
     #[async_trait]
-    impl HttpTransport for CannedBody {
-        async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+    impl HttpTransport for RoutedCanned {
+        async fn send(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            let body: &[u8] = if req.url.contains("openlibrary") {
+                br#"{"ISBN:9781617294556":{"subjects":[{"name":"Rust (Computer program language)"},{"name":"Com051260"}]}}"#
+            } else if req.url.contains("chat/completions") {
+                // The model maps the noisy subjects onto clean tags.
+                br#"{"choices":[{"message":{"content":"rust, systems-programming"}}]}"#
+            } else {
+                b"{}" // the /models liveness probe → 200 → up
+            };
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: self.body.clone(),
+                body: body.to_vec(),
             })
         }
+    }
+
+    #[test]
+    fn parse_llm_tags_slugs_splits_dedupes_and_caps() {
+        let tags = parse_llm_tags("Rust, systems programming; rust\ndistributed systems, networking, extra one two three four five");
+        assert_eq!(
+            tags,
+            vec![
+                "rust".to_string(),
+                "systems-programming".to_string(),
+                "distributed-systems".to_string(),
+                "networking".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1503,17 +1663,13 @@ mod tests {
         assert!(tags.len() <= 4);
     }
 
-    #[test]
-    fn tag_suggest_writes_filtered_openlibrary_subjects_for_an_untagged_book() {
-        let _g = crate::tagstore::env_guard();
+    /// A tempdir with a near-empty bookmarks file (so the graph assembles) and an untagged book
+    /// whose subject IRI carries its ISBN. Returns (dir, zotero path).
+    fn untagged_book_fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
-        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
-        // A (near-empty) bookmarks file at the default path so the graph assembles.
         let bm = dir.path().join("old-org/pinboard-bookmarks.org");
         std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
         std::fs::write(&bm, "* Bookmarks\n").unwrap();
-        // An untagged book (no dc:subject) whose subject IRI carries its ISBN.
         let z = dir.path().join("z.rdf");
         std::fs::write(
             &z,
@@ -1523,29 +1679,73 @@ mod tests {
 </rdf:RDF>"##,
         )
         .unwrap();
-        let body = br#"{"ISBN:9781617294556":{"subjects":[{"name":"Rust (Computer program language)"},{"name":"Com051260"},{"name":"BUSINESS & ECONOMICS"},{"name":"Systems programming"}]}}"#.to_vec();
+        (dir, z)
+    }
+
+    #[test]
+    fn tag_suggest_writes_the_llms_refined_tags_for_an_untagged_book() {
+        let _g = crate::tagstore::env_guard();
+        let (dir, z) = untagged_book_fixture();
+        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
+        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        // RoutedCanned: /models probe → up, OpenLibrary → noisy subjects, chat → "rust, systems-programming".
         let kernel = maintenance_kernel(
             dir.path().to_path_buf(),
             Some(z),
             None,
             dir.path().join("st.json"),
-            Arc::new(CannedBody { body }),
+            Arc::new(RoutedCanned),
         );
         let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
         let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
             .expect("tag-suggest runs");
         let summary = String::from_utf8(repr.bytes).unwrap();
         assert!(summary.contains("2 suggestions"), "summary: {summary}");
-        // Only the clean subjects landed in the suggestions overlay — codes/headers dropped.
+        // The LLM's tags landed (not the raw/deterministic ones), keyed on the book IRI.
         let sug = crate::tagstore::entries(&crate::tagstore::suggestions_path());
         let tags: Vec<&str> = sug.iter().map(|e| e.tag.as_str()).collect();
-        assert!(tags.contains(&"rust-computer-program-language"), "{tags:?}");
+        assert!(tags.contains(&"rust"), "{tags:?}");
         assert!(tags.contains(&"systems-programming"), "{tags:?}");
-        assert_eq!(sug.len(), 2, "junk excluded: {tags:?}");
-        // The suggestion is keyed on the book's urn:cms:book: IRI.
+        assert_eq!(sug.len(), 2, "{tags:?}");
         assert!(
             sug.iter().all(|e| e.iri.starts_with("urn:cms:book:")),
             "{sug:?}"
+        );
+        std::env::remove_var("CMS_TAG_SUGGESTIONS");
+        std::env::remove_var("CMS_TAG_APPROVED");
+    }
+
+    #[test]
+    fn tag_suggest_skips_when_the_llm_is_down() {
+        let _g = crate::tagstore::env_guard();
+        let (dir, z) = untagged_book_fixture();
+        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
+        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        // Every request 503s → the liveness probe reads `false` → the pass no-ops.
+        let sends = Arc::new(AtomicU32::new(0));
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            dir.path().join("st.json"),
+            Arc::new(Canned {
+                status: 503,
+                sends: Arc::clone(&sends),
+            }),
+        );
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
+        let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
+            .expect("tag-suggest runs");
+        assert!(
+            String::from_utf8_lossy(&repr.bytes).contains("skipped"),
+            "should skip when LLM down"
+        );
+        // Nothing written, and no OpenLibrary call was made (only the one liveness probe).
+        assert!(crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty());
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "only the liveness probe ran"
         );
         std::env::remove_var("CMS_TAG_SUGGESTIONS");
         std::env::remove_var("CMS_TAG_APPROVED");

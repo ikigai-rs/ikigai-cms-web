@@ -269,9 +269,10 @@ PREFIX z: <http://www.zotero.org/namespaces/export#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX cms: <https://ikigai-rs.dev/ns/cms#>
-CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug ; cms:isbn ?isbn }
+CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug ; cms:isbn ?isbn ; dc:description ?description }
 WHERE {
   ?book a bib:Book ; dc:title ?title .
+  OPTIONAL { ?book dc:description ?description }
   BIND(IRI(CONCAT("urn:cms:book:", SHA256(STR(?book)))) AS ?id)
   BIND(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title)) AS ?lookup)
   # Zotero keys a book's subject IRI on its ISBN (urn:isbn:…) — surface it so the tag-suggest pass
