@@ -108,6 +108,7 @@ pub fn cms_spaces_with(
         )
         .bind(Exact::new("urn:cms:graph:tags-approved"), ApprovedGraph)
         .bind(Exact::new("urn:cms:graph:suggestions"), SuggestionsGraph)
+        .bind(Exact::new("urn:cms:graph:dismissed"), DismissedGraph)
         .bind(Exact::new("urn:cms:tag-approve"), TagApprove)
         .bind(Exact::new("urn:cms:tag-reject"), TagReject)
         .bind(Exact::new("urn:cms:graph"), CmsGraph);
@@ -431,6 +432,12 @@ impl Endpoint for CmsGraph {
                 Iri::parse("urn:cms:graph:suggestions").expect("valid IRI"),
             ))
             .await?;
+        let dismissed = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:dismissed").expect("valid IRI"),
+            ))
+            .await?;
         let mut turtle = bookmarks.bytes;
         turtle.push(b'\n');
         turtle.extend_from_slice(&bookmark_types.bytes);
@@ -442,6 +449,8 @@ impl Endpoint for CmsGraph {
         turtle.extend_from_slice(&approved.bytes);
         turtle.push(b'\n');
         turtle.extend_from_slice(&suggestions.bytes);
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&dismissed.bytes);
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             turtle,
@@ -503,6 +512,29 @@ impl Endpoint for SuggestionsGraph {
     fn describe(&self) -> Description {
         Description::new("urn:cms:graph:suggestions")
             .summary("The provisional tag-suggestion overlay (cms:suggestedTag) merged into urn:cms:graph.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:dismissed` — the dismissed-tag overlay (`<resource> cms:dismissedTag "tag"`),
+/// read from the persisted store. Merged into `urn:cms:graph` so the tag-suggest pass can exclude a
+/// dismissed book from its candidate set (not rendered). Uncacheable (see [`ApprovedGraph`]).
+struct DismissedGraph;
+
+#[async_trait]
+impl Endpoint for DismissedGraph {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            crate::tagstore::dismissed_turtle().into_bytes(),
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-graph-dismissed"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:dismissed")
+            .summary("The dismissed-tag overlay (cms:dismissedTag) merged into urn:cms:graph.")
             .verb(Verb::Source)
     }
 }
@@ -1263,6 +1295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
         let (_d, kernel) = kernel_over_fixture();
         // The quic bookmark's subject IRI (skolemized) — what an overlay triple targets.
         let json = select(
@@ -1314,6 +1347,7 @@ mod tests {
         );
         std::env::remove_var("CMS_TAG_SUGGESTIONS");
         std::env::remove_var("CMS_TAG_APPROVED");
+        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[test]

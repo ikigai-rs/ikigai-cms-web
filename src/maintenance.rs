@@ -1153,12 +1153,21 @@ impl Endpoint for TagSuggestPass {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(5);
-        let vocab = tag_vocabulary(inv).await;
+        // Two vocabularies for the prompt: the human-CURATED tags (the approved overlay — always fed
+        // as "strongly prefer", so an accepted tag steers suggestions from its first acceptance) and
+        // the COMMON existing tags (top-200 by frequency, minus the curated ones already listed).
+        let curated = crate::tagstore::approved_tags();
+        let common: Vec<String> = tag_vocabulary(inv)
+            .await
+            .into_iter()
+            .filter(|t| !curated.contains(t))
+            .collect();
         let books = list_untagged_books(inv, limit).await?;
         eprintln!(
-            "[tag-suggest] local LLM is up; {} untagged book(s) to check, {} known tags in vocab",
+            "[tag-suggest] local LLM is up; {} untagged book(s) to check, {} curated + {} common tags in vocab",
             books.len(),
-            vocab.len()
+            curated.len(),
+            common.len()
         );
         let (mut tagged, mut added, mut via_llm, mut via_fallback) =
             (0usize, 0usize, 0usize, 0usize);
@@ -1170,7 +1179,7 @@ impl Endpoint for TagSuggestPass {
             // The LLM maps the noisy OpenLibrary subjects + the book's description onto the user's
             // vocabulary (coining a new tag when warranted); if the ask fails or yields nothing,
             // fall back to the deterministic S2 filter so the book still gets *something*.
-            let (tags, source) = match llm_tags(inv, b, &subjects, &vocab).await {
+            let (tags, source) = match llm_tags(inv, b, &subjects, &curated, &common).await {
                 Some(t) => (t, "llm"),
                 None => (filter_subjects(&subjects), "openlibrary-fallback"),
             };
@@ -1285,14 +1294,15 @@ async fn llm_tags(
     inv: &Invocation<'_>,
     book: &UntaggedBook,
     subjects: &[String],
-    vocab: &[String],
+    curated: &[String],
+    common: &[String],
 ) -> Option<Vec<String>> {
     let system =
         "You tag books for a personal knowledge base. Reply with ONLY 2-4 short lowercase \
-         topical tags separated by commas — no sentences, no explanation. Prefer tags from the \
-         user's existing list when one fits; coin a new concise tag only when nothing fits or a \
-         clear topic is missing. Never output publisher names, classification codes, or generic \
-         words like \"general\".";
+         topical tags separated by commas — no sentences, no explanation. STRONGLY prefer the \
+         user's curated tags when one fits; otherwise a common existing tag; coin a new concise \
+         tag only when nothing existing fits or a clear topic is missing. Never output publisher \
+         names, classification codes, or generic words like \"general\".";
     let mut prompt = format!("Book: \"{}\"", book.title);
     if !book.author.is_empty() {
         prompt.push_str(&format!(" by {}", book.author));
@@ -1305,8 +1315,14 @@ async fn llm_tags(
     if !subjects.is_empty() {
         prompt.push_str(&format!("\nOpenLibrary subjects: {}", subjects.join(", ")));
     }
-    if !vocab.is_empty() {
-        prompt.push_str(&format!("\nExisting tags to prefer: {}", vocab.join(", ")));
+    if !curated.is_empty() {
+        prompt.push_str(&format!(
+            "\nYour curated tags (strongly prefer these): {}",
+            curated.join(", ")
+        ));
+    }
+    if !common.is_empty() {
+        prompt.push_str(&format!("\nOther existing tags: {}", common.join(", ")));
     }
     prompt.push_str("\nTags:");
     let request = Request::new(Verb::Source, Iri::parse("urn:llm:ask").expect("valid IRI"))
@@ -1352,7 +1368,8 @@ async fn list_untagged_books(inv: &Invocation<'_>, limit: usize) -> Result<Vec<U
            OPTIONAL {{ ?id cms:isbn ?isbn }} OPTIONAL {{ ?id dc:creator ?author }} \
            OPTIONAL {{ ?id dc:description ?description }} \
            FILTER NOT EXISTS {{ ?id dc:subject ?sub }} \
-           FILTER NOT EXISTS {{ ?id cms:suggestedTag ?sg }} }} ORDER BY ?title LIMIT {limit}"
+           FILTER NOT EXISTS {{ ?id cms:suggestedTag ?sg }} \
+           FILTER NOT EXISTS {{ ?id cms:dismissedTag ?dt }} }} ORDER BY ?title LIMIT {limit}"
     );
     let request = Request::new(
         Verb::Source,
@@ -1714,6 +1731,7 @@ mod tests {
         let (dir, z) = untagged_book_fixture();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
         // RoutedCanned: /models probe → up, OpenLibrary → noisy subjects, chat → "rust, systems-programming".
         let kernel = maintenance_kernel(
             dir.path().to_path_buf(),
@@ -1743,6 +1761,48 @@ mod tests {
         );
         std::env::remove_var("CMS_TAG_SUGGESTIONS");
         std::env::remove_var("CMS_TAG_APPROVED");
+        std::env::remove_var("CMS_TAG_DISMISSED");
+    }
+
+    #[test]
+    fn a_dismissed_book_drops_out_of_the_candidate_set() {
+        let _g = crate::tagstore::env_guard();
+        let (dir, z) = untagged_book_fixture();
+        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
+        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            dir.path().join("st.json"),
+            Arc::new(RoutedCanned),
+        );
+        // Find the book IRI and dismiss a tag on it (as the `x` button does).
+        let sel = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
+            .with_arg(
+                "query",
+                ArgRef::Inline(b"PREFIX cms: <https://ikigai-rs.dev/ns/cms#> SELECT ?id WHERE { ?id a cms:Book } LIMIT 1".to_vec()),
+            )
+            .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+        let repr = futures::executor::block_on(kernel.issue(sel, &Capability::root())).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&repr.bytes).unwrap();
+        let id = v["results"]["bindings"][0]["id"]["value"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::tagstore::reject(&id, "not-a-fit");
+
+        // Now the pass finds no candidate (the sole book is dismissed) — no OpenLibrary/LLM churn.
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
+        let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
+            .expect("tag-suggest runs");
+        let summary = String::from_utf8(repr.bytes).unwrap();
+        assert!(summary.contains("across 0/0"), "book excluded: {summary}");
+        assert!(crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty());
+        std::env::remove_var("CMS_TAG_SUGGESTIONS");
+        std::env::remove_var("CMS_TAG_APPROVED");
+        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[test]
@@ -1751,6 +1811,7 @@ mod tests {
         let (dir, z) = untagged_book_fixture();
         std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
         std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
+        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
         // Every request 503s → the liveness probe reads `false` → the pass no-ops.
         let sends = Arc::new(AtomicU32::new(0));
         let kernel = maintenance_kernel(
@@ -1779,6 +1840,7 @@ mod tests {
         );
         std::env::remove_var("CMS_TAG_SUGGESTIONS");
         std::env::remove_var("CMS_TAG_APPROVED");
+        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[derive(Clone)]
