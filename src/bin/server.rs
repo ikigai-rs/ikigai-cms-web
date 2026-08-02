@@ -10,15 +10,16 @@
 //! can drive it): `/r/{iri}?args` resolves a fragment under the caller's session capability,
 //! `/auth/*` runs the passkey ceremony, and a `cms_session` cookie carries the granted
 //! entitlement between requests. Both faces reuse the one transport-agnostic [`Rp`], so the room
-//! is passkey-gated identically over the wire and over HTTP (`CMS_DEV_OPEN=1` ungates the HTTP
+//! is passkey-gated identically over the wire and over HTTP (`dev_open` ungates the HTTP
 //! face for localhost dev).
 //!
 //! The WebAuthn ceremony binds to the *page* origin (where `navigator.credentials` runs, default
-//! `http://localhost:8080`), configurable via `CMS_RP_ID` / `CMS_RP_ORIGIN`; the
+//! `http://localhost:8080`), configurable via `rp_id` / `rp_origin`; the
 //! `{Passkey → scopes}` store persists through the OS keystore (macOS Keychain via
 //! `ikigai-secret`), not a plaintext file.
 //!
-//! Run: `cargo run --features server --bin cms-server -- [port] [src_dir]`
+//! Run: `cargo run --features server --bin cms-server` — configured by
+//! `~/.config/ikigai/cms.toml` + CLI flags (`--help` lists them); no env vars.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,26 +44,20 @@ const MAX_CALL: usize = 8 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(4433);
-    let src_dir: PathBuf = args
-        .next()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("CMS_SRC_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join("Dropbox/org-mode-files"))
-                .unwrap_or_default()
-        });
-
+    // Configuration = ~/.config/ikigai/cms.toml + CLI flags (flags win); no env vars.
+    let cfg = match ikigai_cms_web::config::load(std::env::args().skip(1)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    // The WebTransport wire port — internal; the page reads it from cert.json.
+    let port = cfg.wire_port;
+    let src_dir = cfg.src_dir.clone();
     // The reading-room PAGE port — cms-server serves `dist/` here itself (no separate
-    // static server). CMS_PORT overrides; default 8080. This is the URL you open in the
-    // browser. The WebTransport port (positional arg 1, 4433) is internal — the page reads
-    // it from cert.json and connects there.
-    let page_port: u16 = std::env::var("CMS_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
+    // static server). This is the URL you open in the browser.
+    let page_port = cfg.page_port;
 
     // The entitlement a verified passkey is granted: read the CMS source jail (the whole
     // room's chain bottoms out in this fs read). The presentations dir is appended once
@@ -70,13 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut entitlement = vec![format!("urn:cap:fs:read:{}", src_dir.display())];
 
     // The relying party. rp_id + page origin default to local dev; the passkey store
-    // persists through the OS keystore (macOS Keychain), not a plaintext file.
-    let rp_id = std::env::var("CMS_RP_ID").unwrap_or_else(|_| "localhost".to_string());
-    // Default the passkey relying-party origin to the page we serve — same host+port — so it
-    // cannot drift from the URL you actually open (the #1 sign-in failure). Override only for
-    // a non-localhost deployment.
-    let rp_origin =
-        std::env::var("CMS_RP_ORIGIN").unwrap_or_else(|_| format!("http://localhost:{page_port}"));
+    // persists through the OS keystore (macOS Keychain), not a plaintext file. The origin
+    // defaults to the page we serve — same host+port — so it cannot drift from the URL you
+    // actually open (the #1 sign-in failure). Override only for a non-localhost deployment.
+    let rp_id = cfg.rp_id.clone();
+    let rp_origin = cfg.rp_origin.clone();
     let rp = Arc::new(Rp::new(
         &rp_id,
         &rp_origin,
@@ -106,9 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write the cert hash where the page can fetch it, so no one pastes `#cert=` by hand.
     // The static server serving `dist/` serves this too; the page reads `cert.json` on
     // load and connects automatically. `#cert=` in the URL still overrides it.
-    let dist = std::env::var_os("CMS_DIST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("dist"));
+    let dist = cfg.dist.clone();
     let cert_json = serde_json::json!({ "cert": hash_hex, "port": port }).to_string();
     match std::fs::write(dist.join("cert.json"), cert_json) {
         Ok(()) => println!(
@@ -121,15 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    // The Zotero library (books): CMS_ZOTERO overrides; else the default location. Only
-    // used if the file exists — otherwise the graph is bookmarks-only.
-    let zotero: Option<PathBuf> = std::env::var_os("CMS_ZOTERO")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join("Dropbox/Documents/Zotero/My Library.rdf"))
-        })
-        .filter(|p| p.exists());
+    // The Zotero library (books): config `zotero` overrides; else the default location if
+    // it exists — otherwise the graph is bookmarks-only.
+    let zotero: Option<PathBuf> = cfg.zotero.clone();
     println!(
         "zotero library: {}",
         zotero
@@ -138,25 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "(none — bookmarks only)".to_string())
     );
 
-    // Lectern presentations (decks): CMS_PRESENTATIONS overrides the root; else the default
-    // repo. Only used if the directory exists. CMS_DECK_BASE is the base URL a static server
-    // exposes that tree at, so a presentation card's link opens the built deck; default
+    // Lectern presentations (decks): config `presentations` overrides the root; else the
+    // default repo if it exists. `deck_base` is the base URL a static server exposes that
+    // tree at, so a presentation card's link opens the built deck; default
     // `http://localhost:8000` (serve the decks with e.g. `python3 -m http.server 8000` in
-    // the presentations dir). Set CMS_DECK_BASE="" for locatable-but-unclickable file:// links.
-    let presentations = std::env::var_os("CMS_PRESENTATIONS")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join("git-personal/lectern-presentations"))
-        })
-        .filter(|p| p.is_dir())
-        .map(|root| {
-            let base = std::env::var("CMS_DECK_BASE")
-                .unwrap_or_else(|_| "http://localhost:8000".to_string());
-            ikigai_cms_web::Presentations {
-                root,
-                base_url: (!base.is_empty()).then_some(base),
-            }
+    // the presentations dir). An empty `deck_base` means file:// links.
+    let presentations = cfg
+        .presentations
+        .clone()
+        .map(|root| ikigai_cms_web::Presentations {
+            root,
+            base_url: cfg.deck_base.clone(),
         });
     println!(
         "presentations: {}",
@@ -175,9 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let entitlement = Arc::new(entitlement);
 
-    // The bookmarks org file, as a sub-path relative to the source jail (CMS_SRC_DIR).
-    // CMS_BOOKMARKS overrides it; unset uses the built-in default (pinboard-bookmarks.org).
-    let bookmarks = std::env::var("CMS_BOOKMARKS").ok();
+    // The bookmarks org file, as a sub-path relative to the source jail (`src_dir`).
+    // Config `bookmarks` overrides it; unset uses the built-in default (pinboard-bookmarks.org).
+    let bookmarks = cfg.bookmarks.clone();
     println!(
         "bookmarks: {}",
         bookmarks
@@ -206,9 +183,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ceremony (`/auth/*`) ourselves — no separate `python3 -m http.server`, the same resolution
     // the wire does, over plain HTTP (so vanilla htmx can drive it). A finished login grants the
     // session the room entitlement; unauthenticated requests resolve public (the gated graph →
-    // nothing). CMS_DEV_OPEN=1 elevates the HTTP face to the full entitlement without login
+    // nothing). `dev_open` elevates the HTTP face to the full entitlement without login
     // (localhost dev only); the wire stays passkey-gated regardless. Default off.
-    let dev_open = std::env::var("CMS_DEV_OPEN").as_deref() == Ok("1");
+    let dev_open = cfg.dev_open;
     if dev_open {
         println!("HTTP resolve face: /r/{{iri}} — DEV-OPEN (ungated; localhost only)");
     }
@@ -224,17 +201,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Optionally run the maintenance passes on recurring `urn:time` jobs, each default-off:
-    // CMS_LINKCHECK=1 → `urn:cms:linkcheck`, CMS_TAGSUGGEST=1 → `urn:cms:tag-suggest` (which itself
+    // `linkcheck` → `urn:cms:linkcheck`, `tagsuggest` → `urn:cms:tag-suggest` (which itself
     // no-ops unless the local LLM is up). Both share one maintenance kernel (CMS graph + outbound
     // HTTP + LLM); the timer fires each daily, and we fire once on startup in the background so a
     // fresh start doesn't wait a day. The registry is held for the process lifetime (the accept loop
     // below never returns), which keeps its timer thread alive.
-    let linkcheck_on = std::env::var("CMS_LINKCHECK").as_deref() == Ok("1");
-    let tagsuggest_on = std::env::var("CMS_TAGSUGGEST").as_deref() == Ok("1");
+    let linkcheck_on = cfg.linkcheck;
+    let tagsuggest_on = cfg.tagsuggest;
     let _maint_registry = if linkcheck_on || tagsuggest_on {
-        let status_path = std::env::var("CMS_LINKSTATUS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| ikigai_cms_web::maintenance::default_status_path());
+        let status_path = cfg
+            .linkstatus
+            .clone()
+            .unwrap_or_else(ikigai_cms_web::maintenance::default_status_path);
         let maint = Arc::new(ikigai_cms_web::maintenance::build_maintenance_kernel(
             src_dir_maint,
             zotero_maint,
@@ -597,7 +575,7 @@ async fn serve_http(
         Ok(l) => l,
         Err(e) => {
             eprintln!("reading-room server: cannot bind localhost:{port}: {e}");
-            eprintln!("  (is the port already in use? set CMS_PORT to a free one)");
+            eprintln!("  (is the port already in use? set page_port in cms.toml, or --page-port)");
             return;
         }
     };

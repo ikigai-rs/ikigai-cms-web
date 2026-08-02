@@ -71,6 +71,8 @@ ikigai-time = { version = "0.1.11", optional = true }
 # subjects onto the user's tag vocabulary; urn:llm:ollama:up gates the pass on the LLM being up.
 # Reuses the same HttpTransport as the link-checker.
 ikigai-llm = { version = "0.7", optional = true }
+# Bin configuration lives in ~/.config/ikigai/cms.toml (+ CLI flags) — never env vars.
+toml = { version = "0.8", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -85,7 +87,7 @@ server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.
-maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde"]
+maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
 
 [[bin]]
 name = "cms-server"
