@@ -386,6 +386,7 @@ mod tests {
             }),
             None,
             crate::tagstore::TagPaths::in_dir(src.path()),
+            None,
         );
         let (repr, _) = Resolver::issue(
             &kernel,

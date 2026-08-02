@@ -36,6 +36,7 @@ pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
         None,
         None,
         crate::tagstore::TagPaths::default_home(),
+        None,
     )
 }
 
@@ -50,6 +51,7 @@ pub fn build_cms_kernel_with(
     presentations: Option<crate::presentations::Presentations>,
     bookmarks: Option<String>,
     tags: crate::tagstore::TagPaths,
+    linkstatus: Option<PathBuf>,
 ) -> Kernel {
     Kernel::new(Arc::new(Fallback::new(cms_spaces_with(
         src_dir,
@@ -57,6 +59,7 @@ pub fn build_cms_kernel_with(
         presentations,
         bookmarks,
         tags,
+        linkstatus,
     ))))
 }
 
@@ -69,6 +72,7 @@ pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Spac
         None,
         None,
         crate::tagstore::TagPaths::default_home(),
+        None,
     )
 }
 
@@ -80,6 +84,7 @@ pub fn cms_spaces_with(
     presentations: Option<crate::presentations::Presentations>,
     bookmarks: Option<String>,
     tags: crate::tagstore::TagPaths,
+    linkstatus: Option<PathBuf>,
 ) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
@@ -185,14 +190,25 @@ pub fn cms_spaces_with(
     // compiled in (it shares that status format); it does no network, so it's safe in the serving
     // kernel.
     #[cfg(feature = "maintenance")]
+    let status_path = linkstatus.unwrap_or_else(crate::maintenance::default_status_file);
+    #[cfg(not(feature = "maintenance"))]
+    let _ = linkstatus;
+    #[cfg(feature = "maintenance")]
     spaces.push(Arc::new(
         EndpointSpace::new()
             .bind(
                 Exact::new("urn:cms:linkstatus"),
-                crate::maintenance::LinkStatusView,
+                crate::maintenance::LinkStatusView {
+                    status_path: status_path.clone(),
+                },
             )
             // urn:cms:review — the suggested-deletes review, rendered via urn:cms:style:review.
-            .bind(Exact::new("urn:cms:review"), crate::maintenance::ReviewView)
+            .bind(
+                Exact::new("urn:cms:review"),
+                crate::maintenance::ReviewView {
+                    status_path: status_path.clone(),
+                },
+            )
             // urn:cms:purge — the reviewed removal of the definitively-dead `gone` set.
             .bind(
                 Exact::new("urn:cms:purge"),
@@ -200,6 +216,7 @@ pub fn cms_spaces_with(
                     set: crate::maintenance::RemovalSet::Gone,
                     bak_iri: format!("{bookmarks_src_purge}.bak"),
                     bookmarks_iri: bookmarks_src_purge.clone(),
+                    status_path: status_path.clone(),
                 },
             )
             // urn:cms:purge-unreachable — the reviewed removal of the durably-unreachable set (its
@@ -210,6 +227,7 @@ pub fn cms_spaces_with(
                     set: crate::maintenance::RemovalSet::DurableUnreachable,
                     bak_iri: format!("{bookmarks_src_purge}.unreach.bak"),
                     bookmarks_iri: bookmarks_src_purge,
+                    status_path,
                 },
             ),
     ) as Arc<dyn Space>);
@@ -1302,6 +1320,7 @@ mod tests {
             None,
             None,
             crate::tagstore::TagPaths::in_dir(dir.path()),
+            None,
         );
         (dir, kernel)
     }
@@ -1506,6 +1525,7 @@ mod tests {
             None,
             None,
             crate::tagstore::TagPaths::in_dir(dir.path()),
+            None,
         );
 
         let off = (PAGE_SIZE * 2).to_string();
@@ -1606,6 +1626,7 @@ mod tests {
             None,
             None,
             crate::tagstore::TagPaths::in_dir(dir.path()),
+            None,
         );
 
         // Page 1: a full page of cards; the pager offers next but not prev.
@@ -1681,6 +1702,7 @@ mod tests {
             None,
             None,
             crate::tagstore::TagPaths::in_dir(dir.path()),
+            None,
         );
 
         // Ascending (the default): Alpha renders before Zulu.
@@ -1749,6 +1771,7 @@ mod tests {
             }),
             None,
             crate::tagstore::TagPaths::in_dir(src.path()),
+            None,
         );
 
         // The type facet lists the deck as a Presentation.
@@ -1824,6 +1847,7 @@ mod tests {
             }),
             None,
             crate::tagstore::TagPaths::in_dir(src.path()),
+            None,
         );
 
         // Unscoped: both the bookmark and the presentation.
@@ -1882,6 +1906,7 @@ mod tests {
             None,
             Some("custom/my-bookmarks.org".to_string()),
             crate::tagstore::TagPaths::in_dir(src.path()),
+            None,
         );
         let html = resolve_html(&kernel, "urn:cms:view:overridden", &[("style", "catalog")]);
         assert!(

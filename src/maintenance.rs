@@ -317,18 +317,15 @@ fn read_meta(path: &std::path::Path) -> Meta {
         .unwrap_or_default()
 }
 
-/// The configured status path (`CMS_LINKSTATUS` or the `$HOME/.ikigai` default) WITHOUT creating
-/// the dir — so a reader (the status view) resolves the same file the pass writes.
-fn resolved_status_path() -> PathBuf {
-    std::env::var("CMS_LINKSTATUS")
+/// The default status file (`$HOME/.ikigai/cms-linkstatus.json`) WITHOUT creating the
+/// dir — the reader-side default; the configured path is threaded to every consumer so a
+/// view always resolves the same file the pass writes.
+pub fn default_status_file() -> PathBuf {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".ikigai")
-                .join("cms-linkstatus.json")
-        })
+        .unwrap_or_default()
+        .join(".ikigai")
+        .join("cms-linkstatus.json")
 }
 
 // ---- the pass endpoint -------------------------------------------------------------------------
@@ -720,16 +717,19 @@ fn org_safe(s: &str) -> String {
 /// `urn:cms:linkstatus` — a small HTML fragment for the room's live link-check indicator. While a
 /// pass runs it shows progress (`checking links… 1,240 / 5,373`); otherwise it shows the last
 /// run's tally from the persisted status (`links: 650 gone · 638 unreachable · checked 2h ago`);
-/// nothing before the first run. Reads the meta + status files (`CMS_LINKSTATUS`/default) — it does
+/// nothing before the first run. Reads the meta + status files (the threaded path) — it does
 /// no network, so it can live in the serving kernel and be polled by htmx.
-pub struct LinkStatusView;
+pub struct LinkStatusView {
+    /// The status file the link-check pass writes (threaded from the same config).
+    pub status_path: PathBuf,
+}
 
 #[async_trait]
 impl Endpoint for LinkStatusView {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
-        let status_path = resolved_status_path();
-        let meta = read_meta(&meta_path(&status_path));
-        let cache = load_status(&status_path);
+        let status_path = &self.status_path;
+        let meta = read_meta(&meta_path(status_path));
+        let cache = load_status(status_path);
         let html = status_fragment(&meta, &cache, unix_now());
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
@@ -779,12 +779,15 @@ fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> St
 /// `unreachable` links rides in the header (they're surfaced but never auto-removed — connection
 /// errors are too unreliable). A view is a query; here the query is the removable set. Read-only —
 /// the authorized purge is a separate action.
-pub struct ReviewView;
+pub struct ReviewView {
+    /// The status file the link-check pass writes (threaded from the same config).
+    pub status_path: PathBuf,
+}
 
 #[async_trait]
 impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let cache = load_status(&resolved_status_path());
+        let cache = load_status(&self.status_path);
         let now = unix_now();
         let (gone, durable, observing) = review_buckets(&cache, now);
         let xml = review_xml(&gone, &durable, observing, now);
@@ -937,6 +940,8 @@ pub struct PurgeView {
     /// The `urn:cms:src:{subpath}.bak` IRI the old content is backed up to. Each set uses its own
     /// backup file so purging one doesn't clobber the other's backup.
     pub bak_iri: String,
+    /// The status file the link-check pass writes (threaded from the same config).
+    pub status_path: PathBuf,
 }
 
 #[async_trait]
@@ -972,7 +977,7 @@ impl Endpoint for PurgeView {
 impl PurgeView {
     /// The confirm prompt (Source): the candidate count + a Confirm/Cancel pair, worded per set.
     fn confirm_html(&self) -> String {
-        let cache = load_status(&resolved_status_path());
+        let cache = load_status(&self.status_path);
         let now = unix_now();
         let n = self.set.candidates(&cache, now).len();
         if n == 0 {
@@ -1001,7 +1006,7 @@ impl PurgeView {
     /// Execute (Sink): back up, strike, write through the kernel (→ live refresh), and drop the
     /// purged URLs from the status cache too.
     async fn execute(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let status_path = resolved_status_path();
+        let status_path = self.status_path.clone();
         let now = unix_now();
         let cache = load_status(&status_path);
         // Owned URLs, so the cache borrow is released before we rewrite the cache below. The
@@ -1571,7 +1576,14 @@ pub fn maintenance_kernel(
     registry: ikigai_llm::Registry,
     llm_provider: &str,
 ) -> Kernel {
-    let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks, tags.clone());
+    let mut spaces = crate::cms_spaces_with(
+        src_dir,
+        zotero,
+        None,
+        bookmarks,
+        tags.clone(),
+        Some(status_path.clone()),
+    );
     spaces.push(
         std::sync::Arc::new(ikigai_http::space(transport.clone())) as std::sync::Arc<dyn Space>
     );
@@ -1643,16 +1655,15 @@ pub fn resolve_llm_provider(
     }
 }
 
-/// The default persisted-status path: `$HOME/.ikigai/cms-linkstatus.json` — the ikigai-owned
-/// state directory (created if missing), kept out of your synced content dirs. `CMS_LINKSTATUS`
-/// overrides it; `dead-links.org` is written beside it.
+/// [`default_status_file`], creating the `$HOME/.ikigai` state directory (kept out of
+/// your synced content dirs) — the writer-side default; `dead-links.org` is written
+/// beside it. The config `linkstatus` key overrides it.
 pub fn default_status_path() -> PathBuf {
-    let dir = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".ikigai");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("cms-linkstatus.json")
+    let file = default_status_file();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    file
 }
 
 /// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
@@ -1934,7 +1945,8 @@ mod tests {
         .unwrap();
         let tags = crate::tagstore::TagPaths::in_dir(dir.path());
         let src = dir.keep();
-        let mut spaces = crate::cms_spaces_with(src, None, None, None, tags);
+        let mut spaces =
+            crate::cms_spaces_with(src, None, None, None, tags, Some(status_path.clone()));
         spaces.push(
             Arc::new(ikigai_http::space(Arc::new(Canned { status, sends }))) as Arc<dyn Space>,
         );
@@ -1962,18 +1974,17 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().unwrap().status, "gone");
 
-        // The status indicator resource is mounted in the same kernel and resolves (content comes
-        // from the env/default path, so we only assert it's reachable, not its text).
+        // The status indicator resource is mounted in the same kernel and resolves (the views
+        // read the SAME threaded status path the pass writes — the point of the threading).
         let sreq = Request::new(Verb::Source, Iri::parse("urn:cms:linkstatus").unwrap());
         assert!(
             futures::executor::block_on(kernel.issue(sreq, &Capability::root())).is_ok(),
             "urn:cms:linkstatus resolves"
         );
 
-        // Point the view endpoints at the same controlled cache the pass wrote, then add a
-        // durably-unreachable entry (old + many runs) and an observing one (too few runs) so the
-        // review exercises BOTH the gone section AND the durable-unreachable section + the note.
-        std::env::set_var("CMS_LINKSTATUS", &status_path);
+        // Add to the same controlled cache the pass wrote a durably-unreachable entry (old +
+        // many runs) and an observing one (too few runs) so the review exercises BOTH the gone
+        // section AND the durable-unreachable section + the note.
         let mut cache = load_status(&status_path);
         let mut durable = st("unreachable", 0, 4); // first_broken at epoch (>7d ago), 4 runs
         durable.url = "http://durable.example".into();

@@ -172,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         presentations,
         bookmarks,
         cfg.tags.clone(),
+        cfg.linkstatus.clone(),
     ));
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
