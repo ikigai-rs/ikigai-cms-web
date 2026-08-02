@@ -12,7 +12,7 @@ use ikigai_core::{
 };
 
 /// The default bookmarks file, as a path within the CMS source jail (`urn:cms:src:*`,
-/// relative to the jail root). Overridable via `CMS_BOOKMARKS` (see the `cms-server` bin).
+/// relative to the jail root). Overridable via the `bookmarks` config key / `--bookmarks`.
 const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
 
 /// Compose the CMS kernel over `src_dir` (the jail root for `urn:cms:src:*`) and an
@@ -30,39 +30,56 @@ const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
 /// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
 pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
-    build_cms_kernel_with(src_dir, zotero, None, None)
+    build_cms_kernel_with(
+        src_dir,
+        zotero,
+        None,
+        None,
+        crate::tagstore::TagPaths::default_home(),
+    )
 }
 
 /// [`build_cms_kernel`] plus lectern presentations (`urn:cms:graph:presentations`): the
 /// decks under the configured root join the graph as `cms:Presentation` resources. `None`
 /// = no decks. `bookmarks` overrides the bookmarks file sub-path (relative to the jail
-/// root); `None` uses [`DEFAULT_BOOKMARKS`].
+/// root); `None` uses [`DEFAULT_BOOKMARKS`]. `tags` names the overlay store the tag
+/// endpoints read and write.
 pub fn build_cms_kernel_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     presentations: Option<crate::presentations::Presentations>,
     bookmarks: Option<String>,
+    tags: crate::tagstore::TagPaths,
 ) -> Kernel {
     Kernel::new(Arc::new(Fallback::new(cms_spaces_with(
         src_dir,
         zotero,
         presentations,
         bookmarks,
+        tags,
     ))))
 }
 
 /// The spaces the CMS kernel is composed of, exposed so a maintenance kernel can add HTTP
 /// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings.
 pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Space>> {
-    cms_spaces_with(src_dir, zotero, None, None)
+    cms_spaces_with(
+        src_dir,
+        zotero,
+        None,
+        None,
+        crate::tagstore::TagPaths::default_home(),
+    )
 }
 
-/// [`cms_spaces`] plus the presentations config and an optional bookmarks sub-path override.
+/// [`cms_spaces`] plus the presentations config, an optional bookmarks sub-path override,
+/// and the tag-overlay store paths.
 pub fn cms_spaces_with(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     presentations: Option<crate::presentations::Presentations>,
     bookmarks: Option<String>,
+    tags: crate::tagstore::TagPaths,
 ) -> Vec<Arc<dyn Space>> {
     // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
     // never with std::fs — so the derived graph is golden-threaded to them.
@@ -106,11 +123,23 @@ pub fn cms_spaces_with(
                 config: presentations,
             },
         )
-        .bind(Exact::new("urn:cms:graph:tags-approved"), ApprovedGraph)
-        .bind(Exact::new("urn:cms:graph:suggestions"), SuggestionsGraph)
-        .bind(Exact::new("urn:cms:graph:dismissed"), DismissedGraph)
-        .bind(Exact::new("urn:cms:tag-approve"), TagApprove)
-        .bind(Exact::new("urn:cms:tag-reject"), TagReject)
+        .bind(
+            Exact::new("urn:cms:graph:tags-approved"),
+            ApprovedGraph { tags: tags.clone() },
+        )
+        .bind(
+            Exact::new("urn:cms:graph:suggestions"),
+            SuggestionsGraph { tags: tags.clone() },
+        )
+        .bind(
+            Exact::new("urn:cms:graph:dismissed"),
+            DismissedGraph { tags: tags.clone() },
+        )
+        .bind(
+            Exact::new("urn:cms:tag-approve"),
+            TagApprove { tags: tags.clone() },
+        )
+        .bind(Exact::new("urn:cms:tag-reject"), TagReject { tags })
         .bind(Exact::new("urn:cms:graph"), CmsGraph);
     // The reading-room views — each IS a query, rendered as an htmx HTML fragment:
     // `urn:cms:view:{tag}` (cards for a tag), `urn:cms:search` (cards whose title
@@ -474,14 +503,16 @@ impl Endpoint for CmsGraph {
 /// `urn:cms:graph:tags-approved` — the approved-tag overlay (`<resource> dc:subject "tag"`), read
 /// from the persisted store. Uncacheable: a promote rewrites the file outside the kernel's fs
 /// thread, so it must be re-read (the whole graph is uncacheable for the same reason).
-struct ApprovedGraph;
+struct ApprovedGraph {
+    tags: crate::tagstore::TagPaths,
+}
 
 #[async_trait]
 impl Endpoint for ApprovedGraph {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
-            crate::tagstore::approved_turtle().into_bytes(),
+            self.tags.approved_turtle().into_bytes(),
         ))
     }
     fn name(&self) -> &str {
@@ -496,14 +527,16 @@ impl Endpoint for ApprovedGraph {
 
 /// `urn:cms:graph:suggestions` — the provisional-suggestion overlay (`<resource> cms:suggestedTag
 /// "tag"`), read from the persisted store. Uncacheable (see [`ApprovedGraph`]).
-struct SuggestionsGraph;
+struct SuggestionsGraph {
+    tags: crate::tagstore::TagPaths,
+}
 
 #[async_trait]
 impl Endpoint for SuggestionsGraph {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
-            crate::tagstore::suggestions_turtle().into_bytes(),
+            self.tags.suggestions_turtle().into_bytes(),
         ))
     }
     fn name(&self) -> &str {
@@ -519,14 +552,16 @@ impl Endpoint for SuggestionsGraph {
 /// `urn:cms:graph:dismissed` — the dismissed-tag overlay (`<resource> cms:dismissedTag "tag"`),
 /// read from the persisted store. Merged into `urn:cms:graph` so the tag-suggest pass can exclude a
 /// dismissed book from its candidate set (not rendered). Uncacheable (see [`ApprovedGraph`]).
-struct DismissedGraph;
+struct DismissedGraph {
+    tags: crate::tagstore::TagPaths,
+}
 
 #[async_trait]
 impl Endpoint for DismissedGraph {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
-            crate::tagstore::dismissed_turtle().into_bytes(),
+            self.tags.dismissed_turtle().into_bytes(),
         ))
     }
     fn name(&self) -> &str {
@@ -542,14 +577,16 @@ impl Endpoint for DismissedGraph {
 /// `urn:cms:tag-approve` (Sink) — promote a suggested tag to a real `dc:subject`, returning the
 /// promoted tag as a normal chip so the `+` button swaps its pending chip for this in place (the
 /// resource now carries a real tag, and the overlay write makes it browsable under that tag).
-struct TagApprove;
+struct TagApprove {
+    tags: crate::tagstore::TagPaths,
+}
 
 #[async_trait]
 impl Endpoint for TagApprove {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let book = inv.inline_str("book")?.to_string();
         let tag = inv.inline_str("tag")?.to_string();
-        crate::tagstore::approve(&book, &tag);
+        self.tags.approve(&book, &tag);
         let t = html_escape(&tag);
         let html = format!(
             "<a class=\"cms-tag\" hx-target=\"#room\" hx-get=\"/r/urn:cms:view:{t}\">#{t}</a>"
@@ -573,14 +610,16 @@ impl Endpoint for TagApprove {
 
 /// `urn:cms:tag-reject` (Sink) — dismiss a suggestion, returning nothing so the `x` button removes
 /// its pending chip.
-struct TagReject;
+struct TagReject {
+    tags: crate::tagstore::TagPaths,
+}
 
 #[async_trait]
 impl Endpoint for TagReject {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let book = inv.inline_str("book")?.to_string();
         let tag = inv.inline_str("tag")?.to_string();
-        crate::tagstore::reject(&book, &tag);
+        self.tags.reject(&book, &tag);
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
             Vec::new(),
@@ -1256,7 +1295,14 @@ mod tests {
             std::fs::write(&z, ZOTERO_FIXTURE).unwrap();
             z
         });
-        let kernel = build_cms_kernel(dir.path().to_path_buf(), zotero);
+        // Tag overlays in the same tempdir — hermetic, never the developer's real ~/.ikigai.
+        let kernel = build_cms_kernel_with(
+            dir.path().to_path_buf(),
+            zotero,
+            None,
+            None,
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+        );
         (dir, kernel)
     }
 
@@ -1291,12 +1337,9 @@ mod tests {
 
     #[test]
     fn a_suggested_tag_renders_with_plus_x_and_approve_promotes_it() {
-        let _g = crate::tagstore::env_guard();
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
-        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
-        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
         let (_d, kernel) = kernel_over_fixture();
+        // The same overlay store the fixture kernel was built over (see `fixture_kernel`).
+        let tags = crate::tagstore::TagPaths::in_dir(_d.path());
         // The quic bookmark's subject IRI (skolemized) — what an overlay triple targets.
         let json = select(
             &kernel,
@@ -1310,7 +1353,7 @@ mod tests {
 
         // Seed a suggestion on it, then render the quic view: the card shows a pending chip whose
         // +/x buttons carry the book IRI (proving the CONSTRUCT join + `../@rdf:about` in xrust).
-        crate::tagstore::add_suggestion(&s, "networking-suggested");
+        tags.add_suggestion(&s, "networking-suggested");
         let html = view(&kernel, "quic", "catalog");
         assert!(html.contains("networking-suggested"), "chip text: {html}");
         assert!(html.contains("/tag/approve"), "promote button: {html}");
@@ -1336,18 +1379,15 @@ mod tests {
             "promoted chip: {chip}"
         );
         assert!(
-            crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty(),
+            crate::tagstore::entries(&tags.suggestions).is_empty(),
             "suggestion left the suggestions overlay"
         );
         assert!(
-            crate::tagstore::entries(&crate::tagstore::approved_path())
+            crate::tagstore::entries(&tags.approved)
                 .iter()
                 .any(|e| e.iri == s && e.tag == "networking-suggested"),
             "suggestion landed in the approved overlay"
         );
-        std::env::remove_var("CMS_TAG_SUGGESTIONS");
-        std::env::remove_var("CMS_TAG_APPROVED");
-        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[test]
@@ -1460,7 +1500,13 @@ mod tests {
             ));
         }
         std::fs::write(&bm, org).unwrap();
-        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+        let kernel = build_cms_kernel_with(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            None,
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+        );
 
         let off = (PAGE_SIZE * 2).to_string();
         let p3 = resolve_html(
@@ -1554,7 +1600,13 @@ mod tests {
             ));
         }
         std::fs::write(&bm, org).unwrap();
-        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+        let kernel = build_cms_kernel_with(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            None,
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+        );
 
         // Page 1: a full page of cards; the pager offers next but not prev.
         let p1 = resolve_html(&kernel, "urn:cms:view:paged", &[("style", "catalog")]);
@@ -1623,7 +1675,13 @@ mod tests {
              ** [[https://m.example][Mike]]\n   :PROPERTIES:\n   :TAGS: sorted\n   :END:\n",
         )
         .unwrap();
-        let kernel = build_cms_kernel(dir.path().to_path_buf(), None);
+        let kernel = build_cms_kernel_with(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            None,
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+        );
 
         // Ascending (the default): Alpha renders before Zulu.
         let asc = resolve_html(
@@ -1690,6 +1748,7 @@ mod tests {
                 base_url: None,
             }),
             None,
+            crate::tagstore::TagPaths::in_dir(src.path()),
         );
 
         // The type facet lists the deck as a Presentation.
@@ -1764,6 +1823,7 @@ mod tests {
                 base_url: None,
             }),
             None,
+            crate::tagstore::TagPaths::in_dir(src.path()),
         );
 
         // Unscoped: both the bookmark and the presentation.
@@ -1821,6 +1881,7 @@ mod tests {
             None,
             None,
             Some("custom/my-bookmarks.org".to_string()),
+            crate::tagstore::TagPaths::in_dir(src.path()),
         );
         let html = resolve_html(&kernel, "urn:cms:view:overridden", &[("style", "catalog")]);
         assert!(

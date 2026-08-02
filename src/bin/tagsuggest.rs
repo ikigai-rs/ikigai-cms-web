@@ -33,6 +33,7 @@ async fn main() {
         cfg.zotero,
         cfg.bookmarks,
         status_path,
+        cfg.tags,
         cfg.llm_provider,
     ) {
         Ok(k) => k,
