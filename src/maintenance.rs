@@ -1135,14 +1135,18 @@ const OL_SPACING: Duration = Duration::from_secs(2);
 /// turns the subjects into clean candidate tags, and writes them to the suggestions overlay for
 /// your `+`/`x` review. Capped per run (`limit`, default 5) and paced — gentle by design. The LLM
 /// residual that maps these onto your vocabulary (and coins better ones) is S3.
-pub struct TagSuggestPass;
+pub struct TagSuggestPass {
+    /// The `urn:llm:{provider}:*` backend the pass asks and probes — a name from the
+    /// registry (`~/.config/ikigai/llm.json`), resolved by [`resolve_llm_provider`].
+    provider: String,
+}
 
 #[async_trait]
 impl Endpoint for TagSuggestPass {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         // GATE (Brian's requirement): only run if the local LLM is up — otherwise no OpenLibrary
-        // calls, nothing written. `urn:llm:ollama:up` is a cheap liveness probe.
-        if !llm_up(inv).await {
+        // calls, nothing written. `urn:llm:{provider}:up` is a cheap liveness probe.
+        if !llm_up(inv, &self.provider).await {
             return Ok(Representation::new(
                 ReprType::new("text/plain"),
                 b"tag-suggest: skipped \xe2\x80\x94 local LLM unavailable".to_vec(),
@@ -1179,10 +1183,11 @@ impl Endpoint for TagSuggestPass {
             // The LLM maps the noisy OpenLibrary subjects + the book's description onto the user's
             // vocabulary (coining a new tag when warranted); if the ask fails or yields nothing,
             // fall back to the deterministic S2 filter so the book still gets *something*.
-            let (tags, source) = match llm_tags(inv, b, &subjects, &curated, &common).await {
-                Some(t) => (t, "llm"),
-                None => (filter_subjects(&subjects), "openlibrary-fallback"),
-            };
+            let (tags, source) =
+                match llm_tags(inv, &self.provider, b, &subjects, &curated, &common).await {
+                    Some(t) => (t, "llm"),
+                    None => (filter_subjects(&subjects), "openlibrary-fallback"),
+                };
             // Say where each book's tags come from, and what the LLM was working from — so a run is
             // legible: LLM-refined vs the deterministic fallback, and the raw OpenLibrary input.
             let ol = if subjects.is_empty() {
@@ -1253,11 +1258,11 @@ struct UntaggedBook {
 }
 
 /// Whether the local LLM answers a liveness probe. Never errors — unreachable = down = skip.
-async fn llm_up(inv: &Invocation<'_>) -> bool {
-    let request = Request::new(
-        Verb::Source,
-        Iri::parse("urn:llm:ollama:up").expect("valid IRI"),
-    );
+async fn llm_up(inv: &Invocation<'_>, provider: &str) -> bool {
+    let Ok(iri) = Iri::parse(format!("urn:llm:{provider}:up")) else {
+        return false;
+    };
+    let request = Request::new(Verb::Source, iri);
     matches!(inv.issue(request).await, Ok(r) if r.bytes == b"true")
 }
 
@@ -1292,6 +1297,7 @@ async fn tag_vocabulary(inv: &Invocation<'_>) -> Vec<String> {
 /// when the model returns nothing usable.
 async fn llm_tags(
     inv: &Invocation<'_>,
+    provider: &str,
     book: &UntaggedBook,
     subjects: &[String],
     curated: &[String],
@@ -1325,11 +1331,16 @@ async fn llm_tags(
         prompt.push_str(&format!("\nOther existing tags: {}", common.join(", ")));
     }
     prompt.push_str("\nTags:");
-    let request = Request::new(Verb::Source, Iri::parse("urn:llm:ask").expect("valid IRI"))
-        .with_arg("system", ArgRef::Inline(system.as_bytes().to_vec()))
-        .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
-        .with_arg("temperature", ArgRef::Inline(b"0.2".to_vec()))
-        .with_arg("max_tokens", ArgRef::Inline(b"64".to_vec()));
+    // Route to the pass's provider explicitly (not the `urn:llm:ask` facade) so the
+    // configured choice — not the registry's default — answers.
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse(format!("urn:llm:{provider}:ask")).ok()?,
+    )
+    .with_arg("system", ArgRef::Inline(system.as_bytes().to_vec()))
+    .with_arg("prompt", ArgRef::Inline(prompt.into_bytes()))
+    .with_arg("temperature", ArgRef::Inline(b"0.2".to_vec()))
+    .with_arg("max_tokens", ArgRef::Inline(b"64".to_vec()));
     let repr = inv.issue(request).await.ok()?;
     let tags = parse_llm_tags(&String::from_utf8_lossy(&repr.bytes));
     (!tags.is_empty()).then_some(tags)
@@ -1551,29 +1562,78 @@ pub fn maintenance_kernel(
     bookmarks: Option<String>,
     status_path: PathBuf,
     transport: std::sync::Arc<dyn HttpTransport>,
+    registry: ikigai_llm::Registry,
+    llm_provider: &str,
 ) -> Kernel {
     let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks);
     spaces.push(
         std::sync::Arc::new(ikigai_http::space(transport.clone())) as std::sync::Arc<dyn Space>
     );
-    // The local LLM (Ollama, OpenAI-compat) over the SAME transport — `urn:llm:ask` refines the tag
-    // suggestions and `urn:llm:ollama:up` gates the pass. Model is `CMS_LLM_MODEL` (default a small
-    // one, to stay light on memory).
-    let model = std::env::var("CMS_LLM_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
-    spaces.push(std::sync::Arc::new(ikigai_llm::space(
-        transport,
-        ikigai_llm::OpenAiConfig::ollama(model),
-    )) as std::sync::Arc<dyn Space>);
+    // The LLM backends over the SAME transport, every registry provider bound at
+    // `urn:llm:{provider}:*`; the tag-suggest pass asks and probes `llm_provider`'s.
+    spaces
+        .push(std::sync::Arc::new(ikigai_llm::space(transport, registry))
+            as std::sync::Arc<dyn Space>);
     spaces.push(std::sync::Arc::new(
         EndpointSpace::new()
             .bind(
                 Exact::new("urn:cms:linkcheck"),
                 LinkCheckPass { status_path },
             )
-            .bind(Exact::new("urn:cms:tag-suggest"), TagSuggestPass),
+            .bind(
+                Exact::new("urn:cms:tag-suggest"),
+                TagSuggestPass {
+                    provider: llm_provider.to_string(),
+                },
+            ),
     ) as std::sync::Arc<dyn Space>);
     Kernel::new(std::sync::Arc::new(Fallback::new(spaces)))
         .with_clock(std::sync::Arc::new(SystemClock))
+}
+
+/// The compiled-in registry when no `llm.json` exists: a local Ollama, small model.
+pub fn default_llm_registry() -> ikigai_llm::Registry {
+    ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2"))
+}
+
+/// The LLM registry from the config home (`~/.config/ikigai/llm.json`) when present —
+/// a malformed file fails loud — else [`default_llm_registry`].
+pub fn llm_registry() -> std::result::Result<ikigai_llm::Registry, String> {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => llm_registry_at(&home.join(".config/ikigai/llm.json")),
+        None => Ok(default_llm_registry()),
+    }
+}
+
+fn llm_registry_at(path: &std::path::Path) -> std::result::Result<ikigai_llm::Registry, String> {
+    if !path.is_file() {
+        return Ok(default_llm_registry());
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    ikigai_llm::Registry::from_json(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Resolve which provider the passes use: an explicit choice (cms.toml `llm_provider`)
+/// must name a registry provider — fail loud, never silently fall back; unset means the
+/// registry's own default.
+pub fn resolve_llm_provider(
+    registry: &ikigai_llm::Registry,
+    explicit: Option<&str>,
+) -> std::result::Result<String, String> {
+    match explicit {
+        Some(p) if registry.providers.iter().any(|c| c.provider == p) => Ok(p.to_string()),
+        Some(p) => Err(format!(
+            "llm_provider {p}: not in the registry (have: {})",
+            registry
+                .providers
+                .iter()
+                .map(|c| c.provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        None => Ok(registry.default.clone()),
+    }
 }
 
 /// The default persisted-status path: `$HOME/.ikigai/cms-linkstatus.json` — the ikigai-owned
@@ -1588,20 +1648,27 @@ pub fn default_status_path() -> PathBuf {
     dir.join("cms-linkstatus.json")
 }
 
-/// [`maintenance_kernel`] over the real reqwest transport. Must be built inside a tokio runtime.
+/// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
+/// registry. Must be built inside a tokio runtime. Errors (fail loud) on a malformed
+/// `llm.json` or an `llm_provider` the registry doesn't know.
 pub fn build_maintenance_kernel(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     bookmarks: Option<String>,
     status_path: PathBuf,
-) -> Kernel {
-    maintenance_kernel(
+    llm_provider: Option<String>,
+) -> std::result::Result<Kernel, String> {
+    let registry = llm_registry()?;
+    let provider = resolve_llm_provider(&registry, llm_provider.as_deref())?;
+    Ok(maintenance_kernel(
         src_dir,
         zotero,
         bookmarks,
         status_path,
         std::sync::Arc::new(ReqwestTransport::new()),
-    )
+        registry,
+        &provider,
+    ))
 }
 
 #[cfg(test)]
@@ -1739,6 +1806,8 @@ mod tests {
             None,
             dir.path().join("st.json"),
             Arc::new(RoutedCanned),
+            default_llm_registry(),
+            "ollama",
         );
         let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
         let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
@@ -1777,6 +1846,8 @@ mod tests {
             None,
             dir.path().join("st.json"),
             Arc::new(RoutedCanned),
+            default_llm_registry(),
+            "ollama",
         );
         // Find the book IRI and dismiss a tag on it (as the `x` button does).
         let sel = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
@@ -1823,6 +1894,8 @@ mod tests {
                 status: 503,
                 sends: Arc::clone(&sends),
             }),
+            default_llm_registry(),
+            "ollama",
         );
         let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
         let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
@@ -2184,5 +2257,42 @@ mod tests {
         assert!(out.contains("live.example"), "kept: {out}");
         assert!(out.contains(":ID: 2"), "kept entry's drawer stays: {out}");
         assert!(out.contains("* Bookmarks"), "parent heading stays: {out}");
+    }
+
+    #[test]
+    fn llm_registry_loads_the_file_fails_loud_and_defaults_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent → the compiled default (ollama, small model).
+        let reg = llm_registry_at(&dir.path().join("llm.json")).expect("default");
+        assert_eq!(reg.default, "ollama");
+        // Present + valid → the file's providers.
+        let good = dir.path().join("good.json");
+        std::fs::write(
+            &good,
+            r#"{ "default": "mlx", "providers": {
+                 "mlx": { "base_url": "http://localhost:8080/v1", "model": "llama-70b" },
+                 "ollama": { "base_url": "http://localhost:11434/v1", "model": "llama3.2:3b" } } }"#,
+        )
+        .unwrap();
+        let reg = llm_registry_at(&good).expect("parses");
+        assert_eq!(reg.default, "mlx");
+        assert_eq!(reg.providers.len(), 2);
+        // Present + malformed → fail loud, naming the file.
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{ nope").unwrap();
+        let err = llm_registry_at(&bad).unwrap_err();
+        assert!(err.contains("bad.json"), "names the file: {err}");
+    }
+
+    #[test]
+    fn llm_provider_explicit_must_exist_unset_takes_the_default() {
+        let reg = default_llm_registry();
+        assert_eq!(resolve_llm_provider(&reg, None).expect("default"), "ollama");
+        assert_eq!(
+            resolve_llm_provider(&reg, Some("ollama")).expect("named"),
+            "ollama"
+        );
+        let err = resolve_llm_provider(&reg, Some("mlx")).unwrap_err();
+        assert!(err.contains("mlx") && err.contains("ollama"), "{err}");
     }
 }

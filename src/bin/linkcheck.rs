@@ -28,7 +28,19 @@ async fn main() {
         cfg.bookmarks.as_deref().unwrap_or("(default)"),
         status_path.display()
     );
-    let kernel = build_maintenance_kernel(cfg.src_dir, cfg.zotero, cfg.bookmarks, status_path);
+    let kernel = match build_maintenance_kernel(
+        cfg.src_dir,
+        cfg.zotero,
+        cfg.bookmarks,
+        status_path,
+        cfg.llm_provider,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let mut req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
     if let Some(limit) = cfg.limit {
         req = req.with_arg("limit", ArgRef::Inline(limit.into_bytes()));

@@ -46,6 +46,9 @@ struct Raw {
     tagsuggest: Option<bool>,
     /// The link-status cache path (default: the maintenance module's).
     linkstatus: Option<String>,
+    /// Which `llm.json` provider the maintenance passes use (default: that registry's
+    /// own default). Validated against the registry at kernel build, not here.
+    llm_provider: Option<String>,
 }
 
 /// The resolved configuration the bins consume.
@@ -66,6 +69,7 @@ pub struct CmsConfig {
     pub linkcheck: bool,
     pub tagsuggest: bool,
     pub linkstatus: Option<PathBuf>,
+    pub llm_provider: Option<String>,
     /// Flag-only (`--limit N`): cap a maintenance pass's fan-out. Never in the file.
     pub limit: Option<String>,
 }
@@ -162,6 +166,7 @@ fn apply_flags(raw: &mut Raw, args: &[String]) -> Result<(), String> {
             "--rp-origin" => raw.rp_origin = Some(value),
             "--dist" => raw.dist = Some(value),
             "--linkstatus" => raw.linkstatus = Some(value),
+            "--llm-provider" => raw.llm_provider = Some(value),
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -232,6 +237,7 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         linkcheck: raw.linkcheck.unwrap_or(false),
         tagsuggest: raw.tagsuggest.unwrap_or(false),
         linkstatus: raw.linkstatus.map(|s| expand(home, &s)),
+        llm_provider: raw.llm_provider,
         limit: None,
     })
 }
@@ -282,6 +288,7 @@ config: ~/.config/ikigai/cms.toml — flags override it, one run at a time
   --linkcheck              run the daily link-check pass
   --tagsuggest             run the daily tag-suggest pass
   --linkstatus <file>      link-status cache path
+  --llm-provider <name>    llm.json provider for the maintenance passes
   --limit <n>              cap a maintenance pass (cms-linkcheck / cms-tag-suggest)";
 
 #[cfg(test)]
