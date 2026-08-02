@@ -33,6 +33,11 @@ pub mod tagstore;
 #[cfg(feature = "maintenance")]
 pub mod maintenance;
 
+// Bin configuration: ~/.config/ikigai/cms.toml + CLI flags (no env vars). Behind
+// `maintenance` — the feature every bin has (`server` includes it).
+#[cfg(feature = "maintenance")]
+pub mod config;
+
 // The server-side WebAuthn relying party (rung 3b) — behind the `server` feature with
 // the rest of the native server stack.
 #[cfg(feature = "server")]

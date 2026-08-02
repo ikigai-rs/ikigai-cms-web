@@ -37,15 +37,28 @@ CMS server, the reading-room UI, and a server-verified relying party.
 ./build-wasm.sh
 
 # 2. start the server — it serves the page (dist/) AND the WebTransport wire, one process
-cargo run --features server --bin cms-server -- 4433 ~/Dropbox/org-mode-files
+cargo run --features server --bin cms-server
 
 # 3. open the reading room (the server prints the URL):
-#    http://localhost:8080          (set CMS_PORT to change the page port)
+#    http://localhost:8080          (set page_port to change the page port)
 ```
 
-The `4433` positional arg is the internal WebTransport port (the page reads it from
-`cert.json`); `CMS_PORT` (default 8080) is the page URL you open. The RP origin defaults
-to that page origin, so the passkey can't drift from the URL you open.
+Configuration is the config home plus CLI flags — **never environment variables**:
+`~/.config/ikigai/cms.toml` states the durable posture, a flag (`--help` lists them)
+overrides it for one run, and a config file that doesn't parse fails loud. Example:
+
+```toml
+# ~/.config/ikigai/cms.toml
+page_port = 8090                  # the URL you open (default 8080)
+wire_port = 4434                  # internal WebTransport port (default 4433)
+src_dir   = "~/Dropbox/org-mode-files"
+bookmarks = "bookmarks-src.org"   # sub-path under src_dir
+dist      = "~/git-personal/ikigai-cms-web/dist"
+```
+
+`wire_port` is internal (the page reads it from `cert.json`); `page_port` is the page
+URL you open. The RP origin defaults to that page origin, so the passkey can't drift
+from the URL you open.
 
 The page opens a WebTransport connection to `cms-server`. **The room is gated by a
 passkey** (rung 3): the server resolves under a public ceiling until a verified passkey
@@ -55,7 +68,7 @@ in** — the WebAuthn ceremony rides over the wire as `urn:auth:*`, the server (
 sign-in the reading room loads; clicking a tag chip re-queries the graph. The passkey
 store persists through the OS keystore — the **macOS Keychain** (via `ikigai-secret`), a
 dev file store elsewhere — not a plaintext file. The RP origin defaults to
-`http://localhost:8080` (override with `CMS_RP_ORIGIN`/`CMS_RP_ID`).
+`http://localhost:{page_port}` (override with `rp_origin`/`rp_id`).
 
 Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any browser once WebTransport
 went Baseline in March 2026 — but the local page uses `serverCertificateHashes` to trust
