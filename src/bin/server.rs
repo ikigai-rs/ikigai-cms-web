@@ -213,12 +213,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .linkstatus
             .clone()
             .unwrap_or_else(ikigai_cms_web::maintenance::default_status_path);
-        let maint = Arc::new(ikigai_cms_web::maintenance::build_maintenance_kernel(
+        // Fail loud: a maintenance pass was asked for, so a bad llm.json or an unknown
+        // llm_provider must stop the server, never silently run the wrong model.
+        let maint = match ikigai_cms_web::maintenance::build_maintenance_kernel(
             src_dir_maint,
             zotero_maint,
             bookmarks_maint,
             status_path,
-        ));
+            cfg.llm_provider.clone(),
+        ) {
+            Ok(k) => Arc::new(k),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
         let registry = ikigai_time::JobRegistry::new(Arc::new(ikigai_time::ThreadTimer))
             .with_capability(Capability::root());
         registry.set_resolver(Arc::clone(&maint) as Arc<dyn Resolver>);

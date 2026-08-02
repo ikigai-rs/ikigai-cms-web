@@ -54,6 +54,8 @@ wire_port = 4434                  # internal WebTransport port (default 4433)
 src_dir   = "~/Dropbox/org-mode-files"
 bookmarks = "bookmarks-src.org"   # sub-path under src_dir
 dist      = "~/git-personal/ikigai-cms-web/dist"
+llm_provider = "mlx"              # which ~/.config/ikigai/llm.json provider the
+                                  # maintenance passes use (default: its default)
 ```
 
 `wire_port` is internal (the page reads it from `cert.json`); `page_port` is the page

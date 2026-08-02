@@ -28,7 +28,19 @@ async fn main() {
             .unwrap_or_else(|| "(none — no books)".into())
     );
     let status_path = cfg.linkstatus.unwrap_or_else(default_status_path);
-    let kernel = build_maintenance_kernel(cfg.src_dir, cfg.zotero, cfg.bookmarks, status_path);
+    let kernel = match build_maintenance_kernel(
+        cfg.src_dir,
+        cfg.zotero,
+        cfg.bookmarks,
+        status_path,
+        cfg.llm_provider,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let mut req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
     if let Some(limit) = cfg.limit {
         req = req.with_arg("limit", ArgRef::Inline(limit.into_bytes()));
