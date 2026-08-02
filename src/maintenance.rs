@@ -1139,6 +1139,8 @@ pub struct TagSuggestPass {
     /// The `urn:llm:{provider}:*` backend the pass asks and probes — a name from the
     /// registry (`~/.config/ikigai/llm.json`), resolved by [`resolve_llm_provider`].
     provider: String,
+    /// The overlay store the pass reads (curated vocabulary) and writes (suggestions).
+    tags: crate::tagstore::TagPaths,
 }
 
 #[async_trait]
@@ -1160,7 +1162,7 @@ impl Endpoint for TagSuggestPass {
         // Two vocabularies for the prompt: the human-CURATED tags (the approved overlay — always fed
         // as "strongly prefer", so an accepted tag steers suggestions from its first acceptance) and
         // the COMMON existing tags (top-200 by frequency, minus the curated ones already listed).
-        let curated = crate::tagstore::approved_tags();
+        let curated = self.tags.approved_tags();
         let common: Vec<String> = tag_vocabulary(inv)
             .await
             .into_iter()
@@ -1212,7 +1214,7 @@ impl Endpoint for TagSuggestPass {
                 }
             }
             for t in &tags {
-                crate::tagstore::add_suggestion(&b.id, t);
+                self.tags.add_suggestion(&b.id, t);
                 added += 1;
             }
         }
@@ -1556,16 +1558,20 @@ fn slug_tag(s: &str) -> String {
 /// outbound endpoints over `transport` + the `urn:cms:linkcheck` and `urn:cms:tag-suggest` passes,
 /// with a system clock so cacheable reads honor their deadlines. `transport` is injectable so a
 /// test can supply a canned one.
+// Flat by design: each arg mirrors one resolved config value, and a test injects its own
+// transport/registry — bundling them would just add an intermediate struct nobody else uses.
+#[allow(clippy::too_many_arguments)]
 pub fn maintenance_kernel(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
     bookmarks: Option<String>,
     status_path: PathBuf,
+    tags: crate::tagstore::TagPaths,
     transport: std::sync::Arc<dyn HttpTransport>,
     registry: ikigai_llm::Registry,
     llm_provider: &str,
 ) -> Kernel {
-    let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks);
+    let mut spaces = crate::cms_spaces_with(src_dir, zotero, None, bookmarks, tags.clone());
     spaces.push(
         std::sync::Arc::new(ikigai_http::space(transport.clone())) as std::sync::Arc<dyn Space>
     );
@@ -1584,6 +1590,7 @@ pub fn maintenance_kernel(
                 Exact::new("urn:cms:tag-suggest"),
                 TagSuggestPass {
                     provider: llm_provider.to_string(),
+                    tags,
                 },
             ),
     ) as std::sync::Arc<dyn Space>);
@@ -1656,6 +1663,7 @@ pub fn build_maintenance_kernel(
     zotero: Option<PathBuf>,
     bookmarks: Option<String>,
     status_path: PathBuf,
+    tags: crate::tagstore::TagPaths,
     llm_provider: Option<String>,
 ) -> std::result::Result<Kernel, String> {
     let registry = llm_registry()?;
@@ -1665,6 +1673,7 @@ pub fn build_maintenance_kernel(
         zotero,
         bookmarks,
         status_path,
+        tags,
         std::sync::Arc::new(ReqwestTransport::new()),
         registry,
         &provider,
@@ -1794,17 +1803,15 @@ mod tests {
 
     #[test]
     fn tag_suggest_writes_the_llms_refined_tags_for_an_untagged_book() {
-        let _g = crate::tagstore::env_guard();
         let (dir, z) = untagged_book_fixture();
-        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
-        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
-        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
         // RoutedCanned: /models probe → up, OpenLibrary → noisy subjects, chat → "rust, systems-programming".
         let kernel = maintenance_kernel(
             dir.path().to_path_buf(),
             Some(z),
             None,
             dir.path().join("st.json"),
+            tags.clone(),
             Arc::new(RoutedCanned),
             default_llm_registry(),
             "ollama",
@@ -1819,32 +1826,27 @@ mod tests {
             "source differentiated: {summary}"
         );
         // The LLM's tags landed (not the raw/deterministic ones), keyed on the book IRI.
-        let sug = crate::tagstore::entries(&crate::tagstore::suggestions_path());
-        let tags: Vec<&str> = sug.iter().map(|e| e.tag.as_str()).collect();
-        assert!(tags.contains(&"rust"), "{tags:?}");
-        assert!(tags.contains(&"systems-programming"), "{tags:?}");
-        assert_eq!(sug.len(), 2, "{tags:?}");
+        let sug = crate::tagstore::entries(&tags.suggestions);
+        let landed: Vec<&str> = sug.iter().map(|e| e.tag.as_str()).collect();
+        assert!(landed.contains(&"rust"), "{landed:?}");
+        assert!(landed.contains(&"systems-programming"), "{landed:?}");
+        assert_eq!(sug.len(), 2, "{landed:?}");
         assert!(
             sug.iter().all(|e| e.iri.starts_with("urn:cms:book:")),
             "{sug:?}"
         );
-        std::env::remove_var("CMS_TAG_SUGGESTIONS");
-        std::env::remove_var("CMS_TAG_APPROVED");
-        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[test]
     fn a_dismissed_book_drops_out_of_the_candidate_set() {
-        let _g = crate::tagstore::env_guard();
         let (dir, z) = untagged_book_fixture();
-        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
-        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
-        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
         let kernel = maintenance_kernel(
             dir.path().to_path_buf(),
             Some(z),
             None,
             dir.path().join("st.json"),
+            tags.clone(),
             Arc::new(RoutedCanned),
             default_llm_registry(),
             "ollama",
@@ -1862,7 +1864,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        crate::tagstore::reject(&id, "not-a-fit");
+        tags.reject(&id, "not-a-fit");
 
         // Now the pass finds no candidate (the sole book is dismissed) — no OpenLibrary/LLM churn.
         let req = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
@@ -1870,19 +1872,13 @@ mod tests {
             .expect("tag-suggest runs");
         let summary = String::from_utf8(repr.bytes).unwrap();
         assert!(summary.contains("across 0/0"), "book excluded: {summary}");
-        assert!(crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty());
-        std::env::remove_var("CMS_TAG_SUGGESTIONS");
-        std::env::remove_var("CMS_TAG_APPROVED");
-        std::env::remove_var("CMS_TAG_DISMISSED");
+        assert!(crate::tagstore::entries(&tags.suggestions).is_empty());
     }
 
     #[test]
     fn tag_suggest_skips_when_the_llm_is_down() {
-        let _g = crate::tagstore::env_guard();
         let (dir, z) = untagged_book_fixture();
-        std::env::set_var("CMS_TAG_SUGGESTIONS", dir.path().join("s.ttl"));
-        std::env::set_var("CMS_TAG_APPROVED", dir.path().join("a.ttl"));
-        std::env::set_var("CMS_TAG_DISMISSED", dir.path().join("d.ttl"));
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
         // Every request 503s → the liveness probe reads `false` → the pass no-ops.
         let sends = Arc::new(AtomicU32::new(0));
         let kernel = maintenance_kernel(
@@ -1890,6 +1886,7 @@ mod tests {
             Some(z),
             None,
             dir.path().join("st.json"),
+            tags.clone(),
             Arc::new(Canned {
                 status: 503,
                 sends: Arc::clone(&sends),
@@ -1905,15 +1902,12 @@ mod tests {
             "should skip when LLM down"
         );
         // Nothing written, and no OpenLibrary call was made (only the one liveness probe).
-        assert!(crate::tagstore::entries(&crate::tagstore::suggestions_path()).is_empty());
+        assert!(crate::tagstore::entries(&tags.suggestions).is_empty());
         assert_eq!(
             sends.load(Ordering::SeqCst),
             1,
             "only the liveness probe ran"
         );
-        std::env::remove_var("CMS_TAG_SUGGESTIONS");
-        std::env::remove_var("CMS_TAG_APPROVED");
-        std::env::remove_var("CMS_TAG_DISMISSED");
     }
 
     #[derive(Clone)]
@@ -1938,8 +1932,9 @@ mod tests {
             "* Bookmarks\n** [[https://sci.example][Science]]\n   :PROPERTIES:\n   :TAGS: science\n   :END:\n",
         )
         .unwrap();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
         let src = dir.keep();
-        let mut spaces = crate::cms_spaces_with(src, None, None, None);
+        let mut spaces = crate::cms_spaces_with(src, None, None, None, tags);
         spaces.push(
             Arc::new(ikigai_http::space(Arc::new(Canned { status, sends }))) as Arc<dyn Space>,
         );

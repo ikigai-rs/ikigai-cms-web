@@ -171,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         zotero,
         presentations,
         bookmarks,
+        cfg.tags.clone(),
     ));
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
@@ -220,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             zotero_maint,
             bookmarks_maint,
             status_path,
+            cfg.tags.clone(),
             cfg.llm_provider.clone(),
         ) {
             Ok(k) => Arc::new(k),

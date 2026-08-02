@@ -385,6 +385,7 @@ mod tests {
                 base_url: base_url.map(str::to_string),
             }),
             None,
+            crate::tagstore::TagPaths::in_dir(src.path()),
         );
         let (repr, _) = Resolver::issue(
             &kernel,

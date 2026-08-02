@@ -49,6 +49,12 @@ struct Raw {
     /// Which `llm.json` provider the maintenance passes use (default: that registry's
     /// own default). Validated against the registry at kernel build, not here.
     llm_provider: Option<String>,
+    /// The approved-tag overlay path (default `~/.ikigai/cms-tags-approved.ttl`).
+    tags_approved: Option<String>,
+    /// The tag-suggestions overlay path (default `~/.ikigai/cms-tag-suggestions.ttl`).
+    tags_suggestions: Option<String>,
+    /// The dismissed-tag overlay path (default `~/.ikigai/cms-tag-dismissed.ttl`).
+    tags_dismissed: Option<String>,
 }
 
 /// The resolved configuration the bins consume.
@@ -70,6 +76,9 @@ pub struct CmsConfig {
     pub tagsuggest: bool,
     pub linkstatus: Option<PathBuf>,
     pub llm_provider: Option<String>,
+    /// The tag-overlay store (approved / suggestions / dismissed), resolved to explicit
+    /// paths — threaded into the kernels so nothing reads process-global state.
+    pub tags: crate::tagstore::TagPaths,
     /// Flag-only (`--limit N`): cap a maintenance pass's fan-out. Never in the file.
     pub limit: Option<String>,
 }
@@ -167,6 +176,9 @@ fn apply_flags(raw: &mut Raw, args: &[String]) -> Result<(), String> {
             "--dist" => raw.dist = Some(value),
             "--linkstatus" => raw.linkstatus = Some(value),
             "--llm-provider" => raw.llm_provider = Some(value),
+            "--tags-approved" => raw.tags_approved = Some(value),
+            "--tags-suggestions" => raw.tags_suggestions = Some(value),
+            "--tags-dismissed" => raw.tags_dismissed = Some(value),
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -212,6 +224,19 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         || home.join("git-personal/lectern-presentations"),
     )?;
 
+    // The tag-overlay store: the ikigai state dir by default, each file overridable
+    // (they're outputs — created on first write, so no existence probe).
+    let mut tags = crate::tagstore::TagPaths::in_state_dir(home);
+    if let Some(s) = raw.tags_approved {
+        tags.approved = expand(home, &s);
+    }
+    if let Some(s) = raw.tags_suggestions {
+        tags.suggestions = expand(home, &s);
+    }
+    if let Some(s) = raw.tags_dismissed {
+        tags.dismissed = expand(home, &s);
+    }
+
     let page_port = raw.page_port.unwrap_or(8080);
     Ok(CmsConfig {
         wire_port: raw.wire_port.unwrap_or(4433),
@@ -238,6 +263,7 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         tagsuggest: raw.tagsuggest.unwrap_or(false),
         linkstatus: raw.linkstatus.map(|s| expand(home, &s)),
         llm_provider: raw.llm_provider,
+        tags,
         limit: None,
     })
 }
@@ -289,6 +315,9 @@ config: ~/.config/ikigai/cms.toml — flags override it, one run at a time
   --tagsuggest             run the daily tag-suggest pass
   --linkstatus <file>      link-status cache path
   --llm-provider <name>    llm.json provider for the maintenance passes
+  --tags-approved <file>   approved-tag overlay (default ~/.ikigai/cms-tags-approved.ttl)
+  --tags-suggestions <file> tag-suggestions overlay (default ~/.ikigai/cms-tag-suggestions.ttl)
+  --tags-dismissed <file>  dismissed-tag overlay (default ~/.ikigai/cms-tag-dismissed.ttl)
   --limit <n>              cap a maintenance pass (cms-linkcheck / cms-tag-suggest)";
 
 #[cfg(test)]
@@ -336,6 +365,36 @@ mod tests {
         let cfg = load_args(home.path(), &["--page-port", "9001"]).expect("flag load");
         assert_eq!(cfg.page_port, 9001);
         assert_eq!(cfg.wire_port, 4434); // file value survives beside the flag
+    }
+
+    #[test]
+    fn tag_overlay_paths_default_to_the_state_dir_and_override_per_file() {
+        let home = fake_home();
+        let cfg = load_args(home.path(), &[]).expect("defaults load");
+        assert_eq!(
+            cfg.tags.approved,
+            home.path().join(".ikigai/cms-tags-approved.ttl")
+        );
+        assert_eq!(
+            cfg.tags.suggestions,
+            home.path().join(".ikigai/cms-tag-suggestions.ttl")
+        );
+        assert_eq!(
+            cfg.tags.dismissed,
+            home.path().join(".ikigai/cms-tag-dismissed.ttl")
+        );
+
+        // A file key moves one overlay; a flag moves another; the third keeps its default.
+        let dir = home.path().join(".config/ikigai");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cms.toml"), "tags_approved = \"~/tags/a.ttl\"\n").unwrap();
+        let cfg = load_args(home.path(), &["--tags-suggestions", "~/tags/s.ttl"]).expect("load");
+        assert_eq!(cfg.tags.approved, home.path().join("tags/a.ttl"));
+        assert_eq!(cfg.tags.suggestions, home.path().join("tags/s.ttl"));
+        assert_eq!(
+            cfg.tags.dismissed,
+            home.path().join(".ikigai/cms-tag-dismissed.ttl")
+        );
     }
 
     #[test]
