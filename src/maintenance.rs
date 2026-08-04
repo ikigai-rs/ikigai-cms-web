@@ -431,9 +431,13 @@ fn unix_now() -> u64 {
 }
 
 /// `(subject IRI, url, title)` for every bookmark carrying an http(s) `dc:identifier`, deduped.
+/// Constrained to `cms:Bookmark` — books carry SYNTHETIC OpenLibrary-search identifiers and
+/// presentations carry deck-server links; checking either is pointless (generated, can't rot)
+/// and hammers one host per type (a real OL connection-block, seen live 2026-08-01).
 async fn list_bookmarks(inv: &Invocation<'_>) -> Result<Vec<(String, String, String)>> {
     let query = "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-         SELECT ?s ?u ?t WHERE { ?s dc:identifier ?u . \
+         PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
+         SELECT ?s ?u ?t WHERE { ?s a cms:Bookmark ; dc:identifier ?u . \
          FILTER(STRSTARTS(STR(?u), \"http\")) OPTIONAL { ?s dc:title ?t } }";
     let request = Request::new(
         Verb::Source,
@@ -1955,6 +1959,46 @@ mod tests {
             LinkCheckPass { status_path },
         )) as Arc<dyn Space>);
         Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(clock))
+    }
+
+    #[test]
+    fn the_pass_never_checks_a_books_synthetic_identifier() {
+        let (dir, z) = untagged_book_fixture();
+        // One real bookmark beside the book — the only URL the pass may touch. The book's
+        // graph entry carries a synthetic OpenLibrary-search dc:identifier; checking it is
+        // pointless and hammers one host per book (seen live: OL dropped the connections).
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::write(&bm, "* Bookmarks\n** [[https://sci.example][Science]]\n").unwrap();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
+        let status_path = dir.path().join("st.json");
+        let sends = Arc::new(AtomicU32::new(0));
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            status_path.clone(),
+            tags,
+            Arc::new(Canned {
+                status: 200,
+                sends: Arc::clone(&sends),
+            }),
+            default_llm_registry(),
+            "ollama",
+        );
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
+        futures::executor::block_on(kernel.issue(req, &Capability::root())).expect("pass runs");
+        // A 200 HEAD needs no confirming GET, so one checkable URL = exactly one send.
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "only the bookmark URL is fetched — never the book's OpenLibrary link"
+        );
+        let cache = load_status(&status_path);
+        assert!(
+            cache.keys().all(|u| !u.contains("openlibrary")),
+            "no OL entry in the status cache: {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
