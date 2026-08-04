@@ -113,6 +113,39 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
+/// A definitive DNS no-such-host, tagged by the transport so the classifier can treat it
+/// as permanent. Substring-matched because `HttpTransport` errors are strings and get
+/// wrapped in more text on their way up.
+const NXDOMAIN_MARKER: &str = "[nxdomain]";
+
+/// Stringify a reqwest send error with its full cause chain (reqwest's own Display hides
+/// the why), tagging EAI_NONAME-style resolution failures with [`NXDOMAIN_MARKER`].
+/// "temporary failure in name resolution" (EAI_AGAIN — a resolver hiccup, the domain may
+/// be fine) is deliberately NOT tagged: only no-such-host is permanent.
+fn send_error_string(e: reqwest::Error) -> String {
+    let mut chain = Vec::new();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = src {
+        chain.push(err.to_string());
+        src = err.source();
+    }
+    let all = chain.join(": ");
+    let lower = all.to_lowercase();
+    let no_such_host = [
+        "nodename nor servname",     // macOS EAI_NONAME
+        "name or service not known", // glibc EAI_NONAME
+        "no such host",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+        && !lower.contains("temporary failure");
+    if no_such_host {
+        format!("{NXDOMAIN_MARKER} {all}")
+    } else {
+        all
+    }
+}
+
 async fn do_request(
     client: &reqwest::Client,
     req: HttpRequest,
@@ -126,7 +159,7 @@ async fn do_request(
     if !req.body.is_empty() {
         builder = builder.body(req.body);
     }
-    let response = builder.send().await.map_err(|e| e.to_string())?;
+    let response = builder.send().await.map_err(send_error_string)?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -567,8 +600,20 @@ async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
                 Outcome::Unreachable(format!("unexpected: {}", String::from_utf8_lossy(other)))
             }
         },
-        Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
+        Err(e) if e.is_transient() => transport_outcome(e.to_string()),
         Err(_) => Outcome::Alive,
+    }
+}
+
+/// A transient transport failure is usually `unreachable` — observed across runs before
+/// it ever becomes purge-eligible. A tagged definitive DNS no-such-host is the exception:
+/// the domain is gone NOW, and no observation period earns it back. (The purge itself
+/// stays human-confirmed and backup-first, so the fast path only skips the 7-day wait.)
+fn transport_outcome(text: String) -> Outcome {
+    if text.contains(NXDOMAIN_MARKER) {
+        Outcome::Gone("domain no longer resolves (NXDOMAIN)".to_string())
+    } else {
+        Outcome::Unreachable(text)
     }
 }
 
@@ -587,7 +632,7 @@ async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
     match inv.issue(request).await {
         Ok(_) => Outcome::Alive,
         Err(Error::NotFound(_)) => Outcome::Gone("HTTP 404/410 (GET-confirmed)".to_string()),
-        Err(e) if e.is_transient() => Outcome::Unreachable(e.to_string()),
+        Err(e) if e.is_transient() => transport_outcome(e.to_string()),
         Err(_) => Outcome::Alive,
     }
 }
@@ -990,7 +1035,10 @@ impl PurgeView {
                 .to_string();
         }
         let what = match self.set {
-            RemovalSet::Gone => format!("<b>{}</b> definitively-dead (404/410) links", group(n)),
+            RemovalSet::Gone => format!(
+                "<b>{}</b> definitively-dead (404/410 or NXDOMAIN) links",
+                group(n)
+            ),
             RemovalSet::DurableUnreachable => format!(
                 "<b>{}</b> durably-unreachable links (repeatedly couldn't connect across ≥3 checks \
                  over ≥7 days — almost all dead domains, but a rare persistently-slow site could \
@@ -1959,6 +2007,54 @@ mod tests {
             LinkCheckPass { status_path },
         )) as Arc<dyn Space>);
         Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(clock))
+    }
+
+    /// A transport whose every send fails with the given error string.
+    struct Failing(&'static str);
+    #[async_trait]
+    impl HttpTransport for Failing {
+        async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    #[test]
+    fn a_tagged_nxdomain_is_gone_on_the_first_run_a_plain_failure_observes() {
+        // The marker fast-paths to `gone` (reason names NXDOMAIN) on run ONE — no 7-day wait.
+        let dir = tempfile::tempdir().unwrap();
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(&bm, "* Bookmarks\n** [[https://dead.example][Dead]]\n").unwrap();
+        let status_path = dir.path().join("st.json");
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            status_path.clone(),
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+            Arc::new(Failing(
+                "error sending request: [nxdomain] failed to lookup address information: \
+                 nodename nor servname provided, or not known",
+            )),
+            default_llm_registry(),
+            "ollama",
+        );
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
+        futures::executor::block_on(kernel.issue(req, &Capability::root())).expect("pass runs");
+        let s = load_status(&status_path);
+        let entry = s.values().next().expect("one entry");
+        assert_eq!(entry.status, "gone", "reason: {}", entry.reason);
+        assert!(
+            entry.reason.contains("NXDOMAIN"),
+            "reason: {}",
+            entry.reason
+        );
+
+        // An untagged transport failure stays `unreachable` (the observation path).
+        assert!(matches!(
+            transport_outcome("error sending request: connection refused".into()),
+            Outcome::Unreachable(_)
+        ));
     }
 
     #[test]
