@@ -209,7 +209,22 @@ enum Outcome {
     Alive,
     Gone(String),
     Unreachable(String),
+    /// The transport reported a definitive DNS no-such-host. NOT trusted from one
+    /// sighting — a resolver under the load of a full pass intermittently answers
+    /// EAI_NONAME for names that exist (seen live: simonstl.com, rawkode.com flagged
+    /// while resolving fine). [`merge`] promotes it to `gone` only when a PRIOR run,
+    /// at least [`NXDOMAIN_CONFIRM_GAP_SECS`] earlier, also saw NXDOMAIN.
+    NxDomain,
 }
+
+/// Two NXDOMAIN sightings this far apart confirm a dead domain. Hours, not days: one
+/// sick-resolver episode can't confirm itself, but the daily pass confirms overnight —
+/// still ~6 days faster than the durable-unreachable observation window.
+const NXDOMAIN_CONFIRM_GAP_SECS: u64 = 4 * 60 * 60;
+
+/// The reason recorded for an unconfirmed first sighting; its presence in the PRIOR
+/// status is what lets the second sighting confirm.
+const NXDOMAIN_REASON: &str = "domain did not resolve (NXDOMAIN)";
 
 /// Whether a status is auto-removable evidence-wise. **Only a definitive `gone` (HTTP 404/410)
 /// qualifies.** `unreachable` (a connection/timeout/DNS error) is NEVER auto-removable on a single
@@ -560,6 +575,9 @@ async fn check_one(
     match &outcome {
         Outcome::Gone(r) => eprintln!("[{n}/{total}] GONE    {url}  ({r})"),
         Outcome::Unreachable(r) => eprintln!("[{n}/{total}] unreach {url}  ({r})"),
+        Outcome::NxDomain => {
+            eprintln!("[{n}/{total}] nxdom   {url}  (unconfirmed until a later run agrees)")
+        }
         Outcome::Alive => {}
     }
     (i, outcome)
@@ -611,7 +629,7 @@ async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
 /// stays human-confirmed and backup-first, so the fast path only skips the 7-day wait.)
 fn transport_outcome(text: String) -> Outcome {
     if text.contains(NXDOMAIN_MARKER) {
-        Outcome::Gone("domain no longer resolves (NXDOMAIN)".to_string())
+        Outcome::NxDomain
     } else {
         Outcome::Unreachable(text)
     }
@@ -660,6 +678,20 @@ fn merge(
         Outcome::Alive => return base("ok", String::new(), 0, 0),
         Outcome::Gone(r) => ("gone", r.clone()),
         Outcome::Unreachable(r) => ("unreachable", r.clone()),
+        Outcome::NxDomain => {
+            let confirmed = prev.is_some_and(|p| {
+                p.reason.contains("NXDOMAIN")
+                    && now.saturating_sub(p.checked_at) >= NXDOMAIN_CONFIRM_GAP_SECS
+            });
+            if confirmed {
+                (
+                    "gone",
+                    "domain no longer resolves (NXDOMAIN, confirmed across runs)".to_string(),
+                )
+            } else {
+                ("unreachable", NXDOMAIN_REASON.to_string())
+            }
+        }
     };
     let still_broken = prev.map(|p| p.status != "ok" && p.first_broken_at > 0);
     let (first, count) = match (still_broken, prev) {
@@ -2019,8 +2051,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_nxdomain_is_gone_on_the_first_run_a_plain_failure_observes() {
-        // The marker fast-paths to `gone` (reason names NXDOMAIN) on run ONE — no 7-day wait.
+    fn nxdomain_needs_a_gapped_second_sighting_before_gone() {
+        // Run ONE through the whole pass: a tagged DNS failure parks as `unreachable`
+        // with the NXDOMAIN reason — never straight to `gone` (a loaded resolver answers
+        // EAI_NONAME for live names; seen flagging simonstl.com while it resolved fine).
         let dir = tempfile::tempdir().unwrap();
         let bm = dir.path().join("old-org/pinboard-bookmarks.org");
         std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
@@ -2041,16 +2075,41 @@ mod tests {
         );
         let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
         futures::executor::block_on(kernel.issue(req, &Capability::root())).expect("pass runs");
-        let s = load_status(&status_path);
-        let entry = s.values().next().expect("one entry");
-        assert_eq!(entry.status, "gone", "reason: {}", entry.reason);
+        let entry = load_status(&status_path)
+            .into_values()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.status, "unreachable", "reason: {}", entry.reason);
         assert!(
             entry.reason.contains("NXDOMAIN"),
             "reason: {}",
             entry.reason
         );
 
-        // An untagged transport failure stays `unreachable` (the observation path).
+        // A second sighting INSIDE the gap still doesn't confirm (one sick-resolver
+        // episode can't confirm itself)…
+        let now = entry.checked_at + NXDOMAIN_CONFIRM_GAP_SECS - 1;
+        let soon = merge(Some(&entry), "s", "http://x", "X", &Outcome::NxDomain, now);
+        assert_eq!(soon.status, "unreachable");
+
+        // …but past the gap the second sighting confirms `gone`, and sustained-deadness
+        // tracking carried through (count 2, first_broken preserved).
+        let now = entry.checked_at + NXDOMAIN_CONFIRM_GAP_SECS;
+        let confirmed = merge(Some(&entry), "s", "http://x", "X", &Outcome::NxDomain, now);
+        assert_eq!(confirmed.status, "gone", "reason: {}", confirmed.reason);
+        assert!(
+            confirmed.reason.contains("confirmed"),
+            "{}",
+            confirmed.reason
+        );
+        assert_eq!(confirmed.broken_count, 2);
+        assert_eq!(confirmed.first_broken_at, entry.first_broken_at);
+
+        // A prior NON-dns failure never fast-paths: NXDOMAIN after plain unreachable
+        // restarts the confirmation, and a plain failure stays on the observation path.
+        let plain = st("unreachable", 0, 3);
+        let after_plain = merge(Some(&plain), "s", "http://x", "X", &Outcome::NxDomain, now);
+        assert_eq!(after_plain.status, "unreachable");
         assert!(matches!(
             transport_outcome("error sending request: connection refused".into()),
             Outcome::Unreachable(_)
