@@ -219,6 +219,18 @@ pub fn cms_spaces_with(
                     status_path: status_path.clone(),
                 },
             )
+            // urn:cms:purge-domains — the reviewed removal of the confirmed-NXDOMAIN set. Its own
+            // set (not folded into `gone`) because a name gone from DNS is different evidence from
+            // a 404 on a live server, and the bulk button has to say which one it means.
+            .bind(
+                Exact::new("urn:cms:purge-domains"),
+                crate::maintenance::PurgeView {
+                    set: crate::maintenance::RemovalSet::NxDomain,
+                    bak_iri: format!("{bookmarks_src_purge}.domains.bak"),
+                    bookmarks_iri: bookmarks_src_purge.clone(),
+                    status_path: status_path.clone(),
+                },
+            )
             // urn:cms:purge-unreachable — the reviewed removal of the durably-unreachable set (its
             // own backup file so it doesn't clobber the `gone` purge's backup).
             .bind(
@@ -226,6 +238,25 @@ pub fn cms_spaces_with(
                 crate::maintenance::PurgeView {
                     set: crate::maintenance::RemovalSet::DurableUnreachable,
                     bak_iri: format!("{bookmarks_src_purge}.unreach.bak"),
+                    bookmarks_iri: bookmarks_src_purge.clone(),
+                    status_path: status_path.clone(),
+                },
+            )
+            // The per-card decisions on a single link — the one-offs the classes can't cover.
+            .bind(
+                Exact::new("urn:cms:link-remove"),
+                crate::maintenance::LinkAction {
+                    decision: crate::maintenance::LinkDecision::Remove,
+                    bak_iri: format!("{bookmarks_src_purge}.one.bak"),
+                    bookmarks_iri: bookmarks_src_purge.clone(),
+                    status_path: status_path.clone(),
+                },
+            )
+            .bind(
+                Exact::new("urn:cms:link-keep"),
+                crate::maintenance::LinkAction {
+                    decision: crate::maintenance::LinkDecision::Keep,
+                    bak_iri: format!("{bookmarks_src_purge}.one.bak"),
                     bookmarks_iri: bookmarks_src_purge,
                     status_path,
                 },

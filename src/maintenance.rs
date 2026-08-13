@@ -65,15 +65,28 @@ pub struct ReqwestTransport {
     handle: Handle,
 }
 
+/// The whole-request budget. Patient on purpose: a genuinely dead host fails fast (DNS/refused in
+/// <1s regardless of this), so it only matters for slow-but-alive sites (old edu/personal servers).
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The budget for the connection phase alone (DNS + TCP + TLS). **This exists to make the
+/// classification honest, not to fail faster** — it is what separates "nobody answered the door"
+/// from "we got in and then were stonewalled". Without it both shapes surface as the same
+/// untyped whole-request timeout: measured against a SYN black hole (a routed host silently
+/// dropping the connect), reqwest reports `is_connect() == false, is_timeout() == true` — byte for
+/// byte the same error a bot-walled edge produces after a *completed* TLS handshake. With it, the
+/// black hole reports `is_connect() == true` and can be told apart. Set well inside
+/// [`TOTAL_TIMEOUT`] so a slow-but-live server still gets the remaining budget to answer — strictly
+/// more room than the old flat 20s gave it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
 impl ReqwestTransport {
     /// A client with a per-request timeout and a polite user-agent (redirects followed by
     /// default). Panics if not called within a tokio runtime — it needs a handle to spawn onto.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            // Patient on purpose: a genuinely dead host fails fast (DNS/refused in <1s regardless of
-            // this), so the timeout only matters for slow-but-alive sites (old edu/personal servers).
-            // 20s gives them room to answer instead of being false-flagged unreachable.
-            .timeout(Duration::from_secs(20))
+            .timeout(TOTAL_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent("ikigai-cms-linkcheck")
             // Every bookmark is a different host, so a per-host idle keep-alive pool is useless and
             // harmful: it accumulates hundreds of open connections and starves DNS/sockets, which
@@ -118,10 +131,47 @@ impl HttpTransport for ReqwestTransport {
 /// wrapped in more text on their way up.
 const NXDOMAIN_MARKER: &str = "[nxdomain]";
 
+/// A failure that happened **after we reached a server** — see [`reached_a_server`]. Tagged here
+/// because only the transport still holds the typed `reqwest::Error`; by the time the classifier
+/// sees it, it is a string that has been wrapped in more text.
+const REFUSED_MARKER: &str = "[refused]";
+
+/// Connect-phase failure text that proves a server was actually *there*: something completed (or
+/// deliberately aborted) a TLS handshake with us. A machine that presents a certificate — even an
+/// expired one, even one for the wrong name — is demonstrably up, so its URL is unverified, not
+/// dead. Everything else in the connect phase (DNS, `tcp connect error: …`, the connect deadline)
+/// means we never reached a server at all.
+const TLS_SHAPES: [&str; 5] = [
+    "invalid peer certificate",
+    "received fatal alert",
+    "handshake",
+    "corrupt message",
+    "tls",
+];
+
+/// Did this failure happen on a connection to a server that actually answered the door?
+///
+/// The connect phase is the dividing line, and `reqwest` types it for us. `is_connect()` covers
+/// DNS + TCP + TLS: within it, only the TLS shapes ([`TLS_SHAPES`]) prove a server was reached.
+/// **Anything past the connect phase happened on an established connection** — a reset, an HTTP/2
+/// protocol error, a redirect loop, or a stall that burned the whole-request budget after the
+/// handshake had already completed. That last one is the bot-mitigation case (measured against
+/// washingtonpost.com: connect succeeds, then nothing comes back, HEAD and GET alike), and it is
+/// why the fallthrough here is `true`: past connect, the evidence is about the gatekeeper, and
+/// where the signal is ambiguous we would rather let a dead link linger than delete a live one.
+fn reached_a_server(e: &reqwest::Error, lower: &str) -> bool {
+    if e.is_connect() {
+        TLS_SHAPES.iter().any(|m| lower.contains(m))
+    } else {
+        true
+    }
+}
+
 /// Stringify a reqwest send error with its full cause chain (reqwest's own Display hides
-/// the why), tagging EAI_NONAME-style resolution failures with [`NXDOMAIN_MARKER`].
+/// the why), tagging it for the classifier: [`NXDOMAIN_MARKER`] for an EAI_NONAME-style
+/// resolution failure, [`REFUSED_MARKER`] for a failure past the door ([`reached_a_server`]).
 /// "temporary failure in name resolution" (EAI_AGAIN — a resolver hiccup, the domain may
-/// be fine) is deliberately NOT tagged: only no-such-host is permanent.
+/// be fine) is deliberately NOT tagged nxdomain: only no-such-host is permanent.
 fn send_error_string(e: reqwest::Error) -> String {
     let mut chain = Vec::new();
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
@@ -141,6 +191,8 @@ fn send_error_string(e: reqwest::Error) -> String {
         && !lower.contains("temporary failure");
     if no_such_host {
         format!("{NXDOMAIN_MARKER} {all}")
+    } else if reached_a_server(&e, &lower) {
+        format!("{REFUSED_MARKER} {all}")
     } else {
         all
     }
@@ -190,7 +242,9 @@ pub struct Status {
     pub url: String,
     pub subject: String,
     pub title: String,
-    /// `ok` | `gone` | `unreachable`.
+    /// `ok` | `gone` | `nxdomain` | `unreachable` | `refused` — see [`Outcome`], whose variants
+    /// these name one-for-one. The three broken kinds are three different *kinds of evidence*,
+    /// never collapsed: only `gone` and `nxdomain` are evidence the thing is dead.
     pub status: String,
     #[serde(default)]
     pub reason: String,
@@ -202,17 +256,40 @@ pub struct Status {
     /// How many consecutive runs it has checked broken.
     #[serde(default)]
     pub broken_count: u32,
+    /// Unix seconds the human said **keep** — reviewed and decided, stop offering it. 0 = undecided.
+    /// It is the escape hatch for a link the checker cannot verify but the human can (a bot-walled
+    /// publisher opens fine in a browser), so it has to outlive the runs: [`merge`] carries it
+    /// across every later pass, it drops the URL out of every review bucket and every removal set,
+    /// and it demotes the URL to a weekly background re-check instead of an every-run one.
+    #[serde(default)]
+    pub kept_at: u64,
 }
 
-/// The outcome of one check.
+/// The outcome of one check — **three kinds of broken, because they are three kinds of evidence**.
+///
+/// A dead resource and a closed door look the same to a client that only records "it failed", and
+/// that conflation is what made the review unusable: nine runs of being turned away at the edge
+/// rendered as "dead for 9d", which reads as a verdict. So the split is by *what the failure is
+/// evidence about* — the resource, or the gatekeeper in front of it.
 enum Outcome {
     Alive,
+    /// A GET-confirmed 404/410: the server is up and says this page is not there.
     Gone(String),
+    /// **Evidence about the resource**: nothing answered the door. No route, connection refused, a
+    /// connect-phase deadline, a resolver failure short of NXDOMAIN. Purge-eligible only after
+    /// sustained repetition ([`durably_unreachable`]), and only by human authorization.
     Unreachable(String),
+    /// **Evidence about the gatekeeper**: a server WAS reached — it completed (or explicitly
+    /// aborted) a handshake with us — and then never produced an HTTP answer. Edge bot-mitigation
+    /// dropping the request, a TLS certificate we reject, a reset, an HTTP/2 protocol error, a
+    /// redirect loop. The host is demonstrably up, so this says *nothing* about whether the page
+    /// still exists: **a `Refused` link is never a removal candidate at any age**. It is reported
+    /// as unverified, and only a human can retire it.
+    Refused(String),
     /// The transport reported a definitive DNS no-such-host. NOT trusted from one
     /// sighting — a resolver under the load of a full pass intermittently answers
     /// EAI_NONAME for names that exist (seen live: simonstl.com, rawkode.com flagged
-    /// while resolving fine). [`merge`] promotes it to `gone` only when a PRIOR run,
+    /// while resolving fine). [`merge`] promotes it to `nxdomain` only when a PRIOR run,
     /// at least [`NXDOMAIN_CONFIRM_GAP_SECS`] earlier, also saw NXDOMAIN.
     NxDomain,
 }
@@ -231,9 +308,23 @@ const NXDOMAIN_REASON: &str = "domain did not resolve (NXDOMAIN)";
 /// check: those failures are too unreliable — a rate-limiting CDN, a DNS hiccup, or the checker
 /// throttling its own machine can all fake one. Unreachable links become removable only after
 /// *sustained* confirmation ([`durably_unreachable`]), and even then only via the reviewed, human-
-/// authorized unreachable purge — never automatically.
+/// authorized unreachable purge — never automatically. `refused` never qualifies at any age.
 pub fn removable(s: &Status) -> bool {
     s.status == "gone"
+}
+
+/// Whether the *domain* is gone: a two-sighting-confirmed NXDOMAIN (see [`merge`]). Stronger
+/// evidence than a 404 and much easier to act on in bulk — a 404 says one page left a live server,
+/// this says the name no longer resolves at all — so it is its own reviewed set
+/// ([`RemovalSet::NxDomain`]) rather than being folded in with the 404s.
+pub fn dead_domain(s: &Status) -> bool {
+    s.status == "nxdomain"
+}
+
+/// Whether the human has already decided to keep this URL. A kept link is out of every review
+/// bucket and every removal set, permanently — the decision is the point.
+fn kept(s: &Status) -> bool {
+    s.kept_at > 0
 }
 
 /// Runs an `unreachable` must fail the patient re-check, and time it must stay broken, before it is
@@ -252,10 +343,14 @@ pub fn durably_unreachable(s: &Status, now: u64) -> bool {
         && now.saturating_sub(s.first_broken_at) >= DURABLE_SECS
 }
 
-/// Which reviewed set a [`PurgeView`] strikes — the two are separate authorized actions with
-/// separate confidence levels (definitive vs sustained-heuristic), never conflated.
+/// Which reviewed set a [`PurgeView`] strikes — three separate authorized actions with three
+/// separate confidence levels (the domain is gone / this page is gone / it has stayed
+/// unreachable), never conflated. `refused` is deliberately absent: it is not a removal set.
 #[derive(Clone, Copy)]
 pub enum RemovalSet {
+    /// The domain no longer resolves: NXDOMAIN, confirmed by two sightings ≥
+    /// [`NXDOMAIN_CONFIRM_GAP_SECS`] apart (see [`dead_domain`]).
+    NxDomain,
     /// Definitively dead: HTTP 404/410, GET-confirmed.
     Gone,
     /// Durably unreachable: failed the patient re-check across ≥[`DURABLE_RUNS`] runs over
@@ -264,11 +359,14 @@ pub enum RemovalSet {
 }
 
 impl RemovalSet {
-    /// The candidate URLs from the status cache for this set.
+    /// The candidate URLs from the status cache for this set — never a link the human has already
+    /// decided to [`kept`].
     fn candidates(self, cache: &HashMap<String, Status>, now: u64) -> HashSet<String> {
         cache
             .values()
+            .filter(|s| !kept(s))
             .filter(|s| match self {
+                RemovalSet::NxDomain => dead_domain(s),
                 RemovalSet::Gone => removable(s),
                 RemovalSet::DurableUnreachable => durably_unreachable(s, now),
             })
@@ -279,6 +377,7 @@ impl RemovalSet {
     /// The bound purge IRI (also the endpoint's describe subject).
     fn iri(self) -> &'static str {
         match self {
+            RemovalSet::NxDomain => "urn:cms:purge-domains",
             RemovalSet::Gone => "urn:cms:purge",
             RemovalSet::DurableUnreachable => "urn:cms:purge-unreachable",
         }
@@ -287,22 +386,36 @@ impl RemovalSet {
     /// The `POST` route the confirm button submits to.
     fn route(self) -> &'static str {
         match self {
+            RemovalSet::NxDomain => "/purge-domains",
             RemovalSet::Gone => "/purge",
             RemovalSet::DurableUnreachable => "/purge-unreachable",
         }
     }
 }
 
-/// Load the persisted status cache (empty if absent/unreadable).
+/// Load the persisted status cache (empty if absent/unreadable), normalizing legacy entries.
 pub fn load_status(path: &std::path::Path) -> HashMap<String, Status> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<Vec<Status>>(&bytes)
             .unwrap_or_default()
             .into_iter()
+            .map(migrate)
             .map(|s| (s.url.clone(), s))
             .collect(),
         Err(_) => HashMap::new(),
     }
+}
+
+/// Bring a persisted entry onto the current vocabulary. Confirmed NXDOMAIN used to be written as
+/// `gone`, back when `gone` was the only definitive bucket; it is now its own status and its own
+/// removal set. Reclassifying on read (rather than waiting for the next pass to re-check the URL)
+/// matters because the *counts* are what the human acts on: without this the review would offer
+/// hundreds of dead domains under a button labelled "404/410" until the next full pass landed.
+fn migrate(mut s: Status) -> Status {
+    if s.status == "gone" && s.reason.contains("NXDOMAIN") {
+        s.status = "nxdomain".to_string();
+    }
+    s
 }
 
 fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) {
@@ -316,15 +429,18 @@ fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) {
 /// The one-line summary a pass returns (and the shape the in-room indicator reads).
 pub struct Summary {
     pub checked: usize,
+    pub nxdomain: usize,
     pub gone: usize,
     pub unreachable: usize,
+    pub refused: usize,
 }
 
 impl Summary {
     fn line(&self) -> String {
         format!(
-            "link-check: {} gone (removable) · {} unreachable (flagged) · checked {}",
-            self.gone, self.unreachable, self.checked
+            "link-check: {} dead domains · {} gone (removable) · {} unreachable (flagged) · \
+             {} refused at the edge (unverified) · checked {}",
+            self.nxdomain, self.gone, self.unreachable, self.refused, self.checked
         )
     }
 }
@@ -392,9 +508,13 @@ impl Endpoint for LinkCheckPass {
         let bookmarks = list_bookmarks(inv).await?;
         let mut cache = load_status(&self.status_path);
 
-        let fresh_ok = |url: &str| {
+        // A URL is skipped this run if it was ok within the week — or if the human has decided to
+        // keep it, which demotes it from "re-check every run" (what broken links get) to the same
+        // weekly background curiosity an ok link gets. That matters in wall-clock terms: a kept
+        // bot-walled link costs a full TOTAL_TIMEOUT stall every single pass otherwise.
+        let fresh = |url: &str| {
             matches!(cache.get(url), Some(s)
-                if s.status == "ok" && now.saturating_sub(s.checked_at) < WEEK_SECS)
+                if (s.status == "ok" || kept(s)) && now.saturating_sub(s.checked_at) < WEEK_SECS)
         };
         // Optional `limit` — check at most N of the non-fresh URLs (handy for a subset run).
         let limit = inv
@@ -404,7 +524,7 @@ impl Endpoint for LinkCheckPass {
             .unwrap_or(usize::MAX);
         let to_check: Vec<&(String, String, String)> = bookmarks
             .iter()
-            .filter(|(_, url, _)| !fresh_ok(url))
+            .filter(|(_, url, _)| !fresh(url))
             .take(limit)
             .collect();
 
@@ -438,11 +558,13 @@ impl Endpoint for LinkCheckPass {
             },
         );
         write_report(&self.status_path, &cache, now);
-        let (gone, unreachable) = buckets(&cache);
+        let b = buckets(&cache, now);
         let summary = Summary {
             checked: to_check.len(),
-            gone: gone.len(),
-            unreachable: unreachable.len(),
+            nxdomain: b.nxdomain.len(),
+            gone: b.gone.len(),
+            unreachable: b.durable.len() + b.observing.len(),
+            refused: b.refused.len(),
         };
         Ok(Representation::new(
             ReprType::new("text/plain"),
@@ -575,6 +697,7 @@ async fn check_one(
     match &outcome {
         Outcome::Gone(r) => eprintln!("[{n}/{total}] GONE    {url}  ({r})"),
         Outcome::Unreachable(r) => eprintln!("[{n}/{total}] unreach {url}  ({r})"),
+        Outcome::Refused(r) => eprintln!("[{n}/{total}] refused {url}  ({r})"),
         Outcome::NxDomain => {
             eprintln!("[{n}/{total}] nxdom   {url}  (unconfirmed until a later run agrees)")
         }
@@ -586,8 +709,10 @@ async fn check_one(
 /// One reachability check, retrying a transient failure once after a short backoff — so a
 /// rate-limited or DNS-hiccup request that fails on the first try gets a second chance to come back
 /// `ok` instead of being flagged unreachable. Only `Unreachable` is transient; `Gone`/`Alive` are
-/// final. The delay is via `futures-timer`, so it works whether the pass is driven by tokio or by
-/// the `urn:time` timer thread.
+/// final, and so is `Refused`: a door that was shut in our face is not a coin flip, and retrying it
+/// costs another whole [`TOTAL_TIMEOUT`] stall for an answer we already have. The delay is via
+/// `futures-timer`, so it works whether the pass is driven by tokio or by the `urn:time` timer
+/// thread.
 async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
     match check_once(inv, url).await {
         Outcome::Unreachable(_) => {
@@ -623,16 +748,40 @@ async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
     }
 }
 
-/// A transient transport failure is usually `unreachable` — observed across runs before
-/// it ever becomes purge-eligible. A tagged definitive DNS no-such-host is the exception:
-/// the domain is gone NOW, and no observation period earns it back. (The purge itself
-/// stays human-confirmed and backup-first, so the fast path only skips the 7-day wait.)
+/// Read the transport's tag off a transient failure. A tagged definitive DNS no-such-host says the
+/// domain is gone NOW and no observation period earns it back (the purge itself stays
+/// human-confirmed and backup-first, so the fast path only skips the 7-day wait); a tagged
+/// [`REFUSED_MARKER`] says we reached a server that would not answer, which is never evidence of
+/// death; anything else is a plain couldn't-connect, observed across runs before it can ever become
+/// purge-eligible.
 fn transport_outcome(text: String) -> Outcome {
     if text.contains(NXDOMAIN_MARKER) {
         Outcome::NxDomain
+    } else if text.contains(REFUSED_MARKER) {
+        Outcome::Refused(clean_reason(&text))
     } else {
-        Outcome::Unreachable(text)
+        Outcome::Unreachable(clean_reason(&text))
     }
+}
+
+/// Tidy a transport error for human eyes. The classifier's markers are an internal channel between
+/// the transport and [`transport_outcome`] — they must not reach the card, where they read as
+/// noise; likewise the wrapper prefixes the error picks up on its way up through the kernel. What
+/// is left is the part that actually says what happened, which is what the review is for.
+fn clean_reason(text: &str) -> String {
+    let mut r = text
+        .replace(NXDOMAIN_MARKER, "")
+        .replace(REFUSED_MARKER, "");
+    for prefix in [
+        "unavailable: ",
+        "http transport: ",
+        "error sending request: ",
+    ] {
+        while let Some(rest) = r.trim_start().strip_prefix(prefix) {
+            r = rest.to_string();
+        }
+    }
+    r.trim().to_string()
 }
 
 /// A HEAD said 404/410 — but HEAD is unreliable (plenty of live servers reject it with a 404 while
@@ -664,6 +813,10 @@ fn merge(
     outcome: &Outcome,
     now: u64,
 ) -> Status {
+    // A `keep` is a decision about the LINK, not about this check, so it rides through every later
+    // outcome — including a recovery to ok and a later 404. Losing it here is the one way the
+    // escape hatch could silently stop working, so it is carried in the constructor itself.
+    let kept_at = prev.map(|p| p.kept_at).unwrap_or(0);
     let base = |status: &str, reason: String, first: u64, count: u32| Status {
         url: url.to_string(),
         subject: subject.to_string(),
@@ -673,11 +826,13 @@ fn merge(
         checked_at: now,
         first_broken_at: first,
         broken_count: count,
+        kept_at,
     };
     let (status, reason) = match outcome {
         Outcome::Alive => return base("ok", String::new(), 0, 0),
         Outcome::Gone(r) => ("gone", r.clone()),
         Outcome::Unreachable(r) => ("unreachable", r.clone()),
+        Outcome::Refused(r) => ("refused", r.clone()),
         Outcome::NxDomain => {
             let confirmed = prev.is_some_and(|p| {
                 p.reason.contains("NXDOMAIN")
@@ -685,7 +840,7 @@ fn merge(
             });
             if confirmed {
                 (
-                    "gone",
+                    "nxdomain",
                     "domain no longer resolves (NXDOMAIN, confirmed across runs)".to_string(),
                 )
             } else {
@@ -701,60 +856,80 @@ fn merge(
     base(status, reason, first, count)
 }
 
-/// Partition into (gone, unreachable), each sorted by URL. `gone` is the removable set;
-/// `unreachable` is flagged for the human but never auto-removed (see [`removable`]).
-fn buckets(cache: &HashMap<String, Status>) -> (Vec<&Status>, Vec<&Status>) {
-    let (mut gone, mut unreachable) = (Vec::new(), Vec::new());
-    for s in cache.values() {
+/// The broken links split by *what kind of evidence* stands behind them — the one partition the
+/// review, the org worksheet, the indicator and the purge sets all speak. Sorted by URL. Links the
+/// human has already [`kept`] appear in none of them: that decision is final.
+struct Buckets<'a> {
+    /// Confirmed-NXDOMAIN: the domain itself is gone. Removable in bulk.
+    nxdomain: Vec<&'a Status>,
+    /// GET-confirmed 404/410: the page is gone from a live server. Removable in bulk.
+    gone: Vec<&'a Status>,
+    /// Unreachable long enough to be offered for the reviewed purge ([`durably_unreachable`]).
+    durable: Vec<&'a Status>,
+    /// Unreachable, but not yet sustained — tracked, not offered.
+    observing: Vec<&'a Status>,
+    /// Reached a server that refused to answer. **Never removable**, at any age — reported so the
+    /// human can judge it, since only a human can (open it in a browser and look).
+    refused: Vec<&'a Status>,
+}
+
+fn buckets<'a>(cache: &'a HashMap<String, Status>, now: u64) -> Buckets<'a> {
+    let mut b = Buckets {
+        nxdomain: Vec::new(),
+        gone: Vec::new(),
+        durable: Vec::new(),
+        observing: Vec::new(),
+        refused: Vec::new(),
+    };
+    for s in cache.values().filter(|s| !kept(s)) {
         match s.status.as_str() {
-            "gone" => gone.push(s),
-            "unreachable" => unreachable.push(s),
+            "nxdomain" => b.nxdomain.push(s),
+            "gone" => b.gone.push(s),
+            "refused" => b.refused.push(s),
+            "unreachable" if durably_unreachable(s, now) => b.durable.push(s),
+            "unreachable" => b.observing.push(s),
             _ => {}
         }
     }
-    for v in [&mut gone, &mut unreachable] {
+    for v in [
+        &mut b.nxdomain,
+        &mut b.gone,
+        &mut b.durable,
+        &mut b.observing,
+        &mut b.refused,
+    ] {
         v.sort_by(|a, b| a.url.cmp(&b.url));
     }
-    (gone, unreachable)
+    b
 }
 
-/// Partition into (gone, durably-unreachable, under-observation), each sorted by URL — the three
-/// removal/flag categories the review and the org worksheet both speak.
-fn dead_buckets(
-    cache: &HashMap<String, Status>,
-    now: u64,
-) -> (Vec<&Status>, Vec<&Status>, Vec<&Status>) {
-    let (gone, unreachable) = buckets(cache);
-    let (durable, observing): (Vec<&Status>, Vec<&Status>) = unreachable
-        .into_iter()
-        .partition(|s| durably_unreachable(s, now));
-    (gone, durable, observing)
-}
-
-/// The three review buckets for the in-room view: `gone`, durably-`unreachable`, and the *count*
-/// still under observation (tracked but not offered for removal, so a count suffices there).
-fn review_buckets(
-    cache: &HashMap<String, Status>,
-    now: u64,
-) -> (Vec<&Status>, Vec<&Status>, usize) {
-    let (gone, durable, observing) = dead_buckets(cache, now);
-    (gone, durable, observing.len())
+/// How a broken link's *duration* may be spoken about. Time only compounds evidence you already
+/// have: nine days of confirmed 404s is nine days dead, but nine days of being turned away at the
+/// edge is nine repetitions of "I was refused at the door" — the renderer must not upgrade that to
+/// a verdict. So only the two confirmed-dead statuses get to say "dead"; the rest say what actually
+/// happened and are labelled unverified.
+fn age_phrase(status: &str, days: u64) -> String {
+    match status {
+        "gone" => format!("dead {days}d"),
+        "nxdomain" => format!("domain gone {days}d"),
+        "refused" => format!("unverified — refused at the edge for {days}d"),
+        _ => format!("unverified — unreachable for {days}d"),
+    }
 }
 
 /// (Re)write the `dead-links.org` worksheet beside the status cache from the *current* cache — so
 /// it stays in step with the room. Called at the end of every pass AND right after a purge (the
 /// purge prunes the cache, so regenerating here keeps the worksheet from lagging the removal).
 fn write_report(status_path: &std::path::Path, cache: &HashMap<String, Status>, now: u64) {
-    let (gone, durable, observing) = dead_buckets(cache, now);
     let path = status_path.with_file_name("dead-links.org");
-    let _ = std::fs::write(path, report(&gone, &durable, &observing, now));
+    let _ = std::fs::write(path, report(&buckets(cache, now), now));
 }
 
-/// The human-readable review as an org file, one section per category so the worksheet tells the
-/// same story as the room: removable `gone`, removal-eligible durable-`unreachable`, and the
-/// `unreachable` still under observation (not yet eligible).
-fn report(gone: &[&Status], durable: &[&Status], observing: &[&Status], now: u64) -> String {
-    let mut s = String::from("#+TITLE: Dead bookmarks — link check\n\n");
+/// The human-readable review as an org file, one section per **kind of evidence** so the worksheet
+/// tells the same story as the room — and, critically, so the two confirmed-dead sections are not
+/// filed next to the two unverified ones under a heading that calls them all dead.
+fn report(b: &Buckets<'_>, now: u64) -> String {
+    let mut s = String::from("#+TITLE: Broken bookmarks — link check\n\n");
     let mut section = |title: &str, items: &[&Status], note: &str| {
         s.push_str(&format!("* {title}: {}\n", items.len()));
         if !note.is_empty() {
@@ -762,27 +937,44 @@ fn report(gone: &[&Status], durable: &[&Status], observing: &[&Status], now: u64
         }
         for it in items {
             s.push_str(&format!("** [[{}][{}]]\n", it.url, org_safe(&it.title)));
-            let dead_days = now.saturating_sub(it.first_broken_at) / 86_400;
+            let days = now.saturating_sub(it.first_broken_at) / 86_400;
             s.push_str(&format!(
-                "   {} · {} · dead {}d · checked {}×\n",
+                "   {} · {} · {} · checked {}×\n",
                 it.status,
                 org_safe(&it.reason),
-                dead_days,
+                age_phrase(&it.status, days),
                 it.broken_count
             ));
         }
         s.push('\n');
     };
-    section("Gone — removable", gone, "HTTP 404/410: definitively dead");
+    section(
+        "Dead domains — removable",
+        &b.nxdomain,
+        "the domain itself no longer resolves (NXDOMAIN, confirmed by two sightings ≥4h apart)",
+    );
+    section(
+        "Gone — removable",
+        &b.gone,
+        "HTTP 404/410, GET-confirmed: the server is up and says the page is not there",
+    );
     section(
         "Unreachable, durable — removal-eligible",
-        durable,
+        &b.durable,
         "couldn't connect across ≥3 checks over ≥7 days — offered for the reviewed unreachable purge",
     );
     section(
         "Unreachable, under observation — not yet eligible",
-        observing,
+        &b.observing,
         "connection/timeout/DNS errors, but not yet sustained (need 3 failed checks over a week)",
+    );
+    section(
+        "Refused at the edge — UNVERIFIED, never removable",
+        &b.refused,
+        "a server answered the door and then refused to answer the request (bot mitigation, a \
+         rejected TLS certificate, a reset, a redirect loop). The host is up, so this says nothing \
+         about whether the page still exists — however long it has gone on. Open one in a browser: \
+         if it loads, press Keep in the reading room and it stops coming back.",
     );
     s
 }
@@ -845,12 +1037,14 @@ fn status_fragment(meta: &Meta, cache: &HashMap<String, Status>, now: u64) -> St
     if cache.is_empty() {
         return String::new();
     }
-    let (gone, unreachable) = buckets(cache);
+    // Two numbers, split on the line that matters: what we have evidence is dead, and what merely
+    // failed to answer us. Summing them into one "broken" count is what the review was doing wrong.
+    let b = buckets(cache, now);
     let last = cache.values().map(|s| s.checked_at).max().unwrap_or(0);
     format!(
-        "<span class=\"cms-linkcheck\">links: {} gone · {} unreachable · checked {}</span>",
-        group(gone.len()),
-        group(unreachable.len()),
+        "<span class=\"cms-linkcheck\">links: {} dead · {} unverified · checked {}</span>",
+        group(b.nxdomain.len() + b.gone.len()),
+        group(b.durable.len() + b.observing.len() + b.refused.len()),
         ago(now, last),
     )
 }
@@ -870,8 +1064,7 @@ impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let cache = load_status(&self.status_path);
         let now = unix_now();
-        let (gone, durable, observing) = review_buckets(&cache, now);
-        let xml = review_xml(&gone, &durable, observing, now);
+        let xml = review_xml(&buckets(&cache, now), now);
         let req = Request::new(
             Verb::Source,
             Iri::parse("urn:xslt:transform").expect("valid IRI"),
@@ -902,50 +1095,79 @@ impl Endpoint for ReviewView {
     }
 }
 
-/// Build the review doc (`urn:cms:review#`): a `<section>` per removal category (each carrying its
-/// own purge action + call-to-action), plus a `<note>` for the count still under observation. Each
-/// section is emitted only when non-empty, so the xrust stylesheet needs no conditionals — it just
-/// renders whatever sections exist (and `<empty/>` when there are none at all).
-fn review_xml(gone: &[&Status], durable: &[&Status], observing: usize, now: u64) -> String {
+/// Build the review doc (`urn:cms:review#`): a `<section>` per **removal** set (each carrying its
+/// own purge action + call-to-action), then a `<flagged>` block per unverified category (same
+/// cards, deliberately NO bulk action — nothing here has evidence behind it), plus a `<note>` for
+/// the count still under observation. Each block is emitted only when non-empty, so the xrust
+/// stylesheet needs no conditionals — it just renders whatever exists (and `<empty/>` when the
+/// removal sets are all empty).
+fn review_xml(b: &Buckets<'_>, now: u64) -> String {
     let mut s = String::from("<review xmlns=\"urn:cms:review#\">");
-    if gone.is_empty() && durable.is_empty() {
+    if b.nxdomain.is_empty() && b.gone.is_empty() && b.durable.is_empty() {
         s.push_str("<empty/>");
     } else {
-        if !gone.is_empty() {
+        if !b.nxdomain.is_empty() {
             section_xml(
                 &mut s,
-                gone,
+                &b.nxdomain,
                 now,
                 &format!(
-                    "{} removable — definitively dead (HTTP 404/410)",
-                    group(gone.len())
+                    "{} dead domains — the name no longer resolves (NXDOMAIN, confirmed)",
+                    group(b.nxdomain.len())
+                ),
+                RemovalSet::NxDomain.iri(),
+                "Remove Dead Domains…",
+            );
+        }
+        if !b.gone.is_empty() {
+            section_xml(
+                &mut s,
+                &b.gone,
+                now,
+                &format!(
+                    "{} removable — the page is gone from a live server (HTTP 404/410)",
+                    group(b.gone.len())
                 ),
                 RemovalSet::Gone.iri(),
                 "Purge dead links…",
             );
         }
-        if !durable.is_empty() {
+        if !b.durable.is_empty() {
             section_xml(
                 &mut s,
-                durable,
+                &b.durable,
                 now,
                 &format!(
                     "{} durably unreachable — failed ≥3 checks over ≥7 days",
-                    group(durable.len())
+                    group(b.durable.len())
                 ),
                 RemovalSet::DurableUnreachable.iri(),
                 "Purge unreachable…",
             );
         }
     }
-    if observing > 0 {
+    if !b.refused.is_empty() {
+        flagged_xml(
+            &mut s,
+            &b.refused,
+            now,
+            &format!(
+                "{} refused at the edge — UNVERIFIED, not removal candidates. A server answered \
+                 the door and then refused the request (bot mitigation, a rejected certificate, a \
+                 reset). The host is up, so however long this has gone on it is not evidence the \
+                 page is gone. Open one: if it loads, press keep.",
+                group(b.refused.len())
+            ),
+        );
+    }
+    if !b.observing.is_empty() {
         s.push_str("<note>");
         xml_text(
             &mut s,
             &format!(
                 "{} more unreachable under observation — not yet eligible (need 3 failed checks \
                  over a week).",
-                group(observing)
+                group(b.observing.len())
             ),
         );
         s.push_str("</note>");
@@ -955,7 +1177,7 @@ fn review_xml(gone: &[&Status], durable: &[&Status], observing: usize, now: u64)
 }
 
 /// Emit one `<section>` (header label + purge action + call-to-action) wrapping its item cards. The
-/// section `kind` (for card colour) is the items' shared status — `gone` or `unreachable`.
+/// section `kind` (for card colour) is the items' shared status.
 fn section_xml(s: &mut String, items: &[&Status], now: u64, label: &str, action: &str, cta: &str) {
     s.push_str("<section kind=\"");
     xml_attr(s, &items[0].status);
@@ -966,19 +1188,44 @@ fn section_xml(s: &mut String, items: &[&Status], now: u64, label: &str, action:
     s.push_str("\" cta=\"");
     xml_attr(s, cta);
     s.push_str("\">");
+    items_xml(s, items, now);
+    s.push_str("</section>");
+}
+
+/// Emit one `<flagged>` block: the same cards under a header with **no bulk action**. A separate
+/// element rather than a `<section>` with an empty action, because the stylesheet has no
+/// conditionals — the absence of a purge button has to be structural.
+fn flagged_xml(s: &mut String, items: &[&Status], now: u64, label: &str) {
+    s.push_str("<flagged kind=\"");
+    xml_attr(s, &items[0].status);
+    s.push_str("\" label=\"");
+    xml_attr(s, label);
+    s.push_str("\">");
+    items_xml(s, items, now);
+    s.push_str("</flagged>");
+}
+
+/// The item cards shared by both block kinds. `age` is the server-phrased duration (see
+/// [`age_phrase`]) — the stylesheet must not be the thing that decides whether "9d" means dead.
+/// `enc` is the percent-encoded URL for the per-card action routes, so the stylesheet never has to
+/// escape a URL into JSON (xrust has no string functions).
+fn items_xml(s: &mut String, items: &[&Status], now: u64) {
     for it in items {
         let days = now.saturating_sub(it.first_broken_at) / 86_400;
         s.push_str("<item status=\"");
         xml_attr(s, &it.status);
         s.push_str("\" reason=\"");
         xml_attr(s, &it.reason);
-        s.push_str(&format!("\" days=\"{days}\" url=\""));
+        s.push_str("\" age=\"");
+        xml_attr(s, &age_phrase(&it.status, days));
+        s.push_str("\" enc=\"");
+        xml_attr(s, &url_encode(&it.url));
+        s.push_str("\" url=\"");
         xml_attr(s, &it.url);
         s.push_str("\" title=\"");
         xml_attr(s, &it.title);
         s.push_str("\"/>");
     }
-    s.push_str("</section>");
 }
 
 /// Escape a value for an XML double-quoted attribute.
@@ -1037,6 +1284,7 @@ impl Endpoint for PurgeView {
 
     fn name(&self) -> &str {
         match self.set {
+            RemovalSet::NxDomain => "cms-purge-domains",
             RemovalSet::Gone => "cms-purge",
             RemovalSet::DurableUnreachable => "cms-purge-unreachable",
         }
@@ -1067,8 +1315,16 @@ impl PurgeView {
                 .to_string();
         }
         let what = match self.set {
+            RemovalSet::NxDomain => format!(
+                "<b>{}</b> links whose <b>domain no longer resolves</b> (NXDOMAIN, confirmed by two \
+                 sightings at least 4h apart — the name is gone from DNS, not just the page)",
+                group(n)
+            ),
+            // Deliberately narrow: this button used to claim NXDOMAIN too, which made it the
+            // single big red button for two quite different kinds of evidence.
             RemovalSet::Gone => format!(
-                "<b>{}</b> definitively-dead (404/410 or NXDOMAIN) links",
+                "<b>{}</b> links the server <b>answered 404/410</b> for (GET-confirmed — the host \
+                 is up and says the page is not there)",
                 group(n)
             ),
             RemovalSet::DurableUnreachable => format!(
@@ -1136,6 +1392,123 @@ impl PurgeView {
              refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
             group(removed)
         )))
+    }
+}
+
+// ---- the per-card decisions ---------------------------------------------------------------------
+
+/// Which single-link decision a [`LinkAction`] applies. These exist because classification can only
+/// ever get the *classes* right, and a collection accumulates one-offs — a link the checker cannot
+/// verify but a human can settle in two seconds by opening it.
+#[derive(Clone, Copy)]
+pub enum LinkDecision {
+    /// Strike this one URL from the bookmarks file — same backup-first, write-through-the-kernel
+    /// path the bulk purges use, just with a candidate set of exactly one.
+    Remove,
+    /// Reviewed and kept: never offer this URL again. Persisted as `kept_at` in the status cache
+    /// so it survives every later pass (see [`Status::kept_at`] and [`merge`]).
+    Keep,
+}
+
+/// `urn:cms:link-remove` / `urn:cms:link-keep` (Sink, arg `url`) — the per-card actions on the
+/// review. Both are single-URL, both idempotent: doing it twice is not an error, it is a no-op with
+/// the same answer, which is what a button on a page the user may double-click has to be.
+pub struct LinkAction {
+    pub decision: LinkDecision,
+    /// The `urn:cms:src:{subpath}` IRI of the bookmarks file (what `BookmarkGraph` reads).
+    pub bookmarks_iri: String,
+    /// The `urn:cms:src:{subpath}.bak` IRI this action backs up to — its own file, so a one-off
+    /// removal never clobbers a bulk purge's backup (each set keeps its own).
+    pub bak_iri: String,
+    /// The status file the link-check pass writes (threaded from the same config).
+    pub status_path: PathBuf,
+}
+
+#[async_trait]
+impl Endpoint for LinkAction {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let url = inv.inline_str("url")?.to_string();
+        match self.decision {
+            LinkDecision::Remove => self.remove(inv, &url).await,
+            LinkDecision::Keep => Ok(self.keep(&url)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self.decision {
+            LinkDecision::Remove => "cms-link-remove",
+            LinkDecision::Keep => "cms-link-keep",
+        }
+    }
+
+    fn describe(&self) -> Description {
+        let d = match self.decision {
+            LinkDecision::Remove => Description::new("urn:cms:link-remove")
+                .summary(
+                    "Strike one reviewed URL from the bookmarks file (Sink executes). Backs the \
+                     file up first, then writes through the kernel so the graph re-derives.",
+                )
+                // It writes the bookmarks file (and its backup) through the fs resource.
+                .requires("urn:cap:fs:write:*"),
+            // Keep touches only the status cache (the same std::fs file the pass itself owns and
+            // writes uncapped), never the bookmarks file — so it declares no fs grant. Declaring
+            // one it doesn't enforce would make the manifold lie in the more dangerous direction.
+            LinkDecision::Keep => Description::new("urn:cms:link-keep").summary(
+                "Mark one URL reviewed-and-kept (Sink executes): it leaves every review bucket \
+                 and every removal set, permanently, and drops to a weekly background re-check.",
+            ),
+        };
+        d.verb(Verb::Sink)
+            .input(ikigai_core::ArgSpec::new("url").summary("the bookmark URL to act on"))
+    }
+}
+
+impl LinkAction {
+    /// Remove one URL: back up, strike, write through the kernel (→ live refresh), drop it from the
+    /// status cache, regenerate the worksheet. A URL that isn't in the file strikes nothing and
+    /// writes nothing — an identical rewrite would cut the golden thread for no reason — but still
+    /// reports success, because from the caller's side the link is gone either way.
+    async fn remove(&self, inv: &Invocation<'_>, url: &str) -> Result<Representation> {
+        let iri = Iri::parse(&self.bookmarks_iri)
+            .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
+        let bak = Iri::parse(&self.bak_iri)
+            .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
+        let current = inv.source(&iri).await?;
+        let text = String::from_utf8_lossy(&current.bytes).into_owned();
+        let one: HashSet<&str> = std::iter::once(url).collect();
+        let (new_text, removed) = strike(&text, &one);
+        if removed > 0 {
+            inv.issue(
+                Request::new(Verb::Sink, bak)
+                    .with_arg("content", ArgRef::Inline(text.into_bytes())),
+            )
+            .await?;
+            inv.issue(
+                Request::new(Verb::Sink, iri)
+                    .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
+            )
+            .await?;
+        }
+        let mut cache = load_status(&self.status_path);
+        cache.remove(url);
+        save_status(&self.status_path, &cache);
+        write_report(&self.status_path, &cache, unix_now());
+        Ok(fragment(
+            "<span class=\"cms-card-done removed\">removed</span>".to_string(),
+        ))
+    }
+
+    /// Keep one URL: stamp `kept_at` in the status cache and regenerate the worksheet. A URL with no
+    /// cache entry is already invisible to the review, so there is nothing to stamp and nothing to
+    /// fail about — the answer is the same either way.
+    fn keep(&self, url: &str) -> Representation {
+        let mut cache = load_status(&self.status_path);
+        if let Some(s) = cache.get_mut(url) {
+            s.kept_at = unix_now();
+        }
+        save_status(&self.status_path, &cache);
+        write_report(&self.status_path, &cache, unix_now());
+        fragment("<span class=\"cms-card-done kept\">kept</span>".to_string())
     }
 }
 
@@ -2041,13 +2414,284 @@ mod tests {
         Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(clock))
     }
 
-    /// A transport whose every send fails with the given error string.
-    struct Failing(&'static str);
+    /// A transport whose every send fails with the given error string, counting the attempts (so a
+    /// test can assert what the pass DIDN'T check, not just what it recorded).
+    struct Failing {
+        text: &'static str,
+        sends: Arc<AtomicU32>,
+    }
+
+    impl Failing {
+        fn new(text: &'static str) -> Self {
+            Failing {
+                text,
+                sends: Arc::new(AtomicU32::new(0)),
+            }
+        }
+
+        fn counted(text: &'static str, sends: Arc<AtomicU32>) -> Self {
+            Failing { text, sends }
+        }
+    }
+
     #[async_trait]
     impl HttpTransport for Failing {
         async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
-            Err(self.0.to_string())
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Err(self.text.to_string())
         }
+    }
+
+    /// A kernel over a fixture bookmarks file whose every fetch fails with `err`.
+    fn failing_kernel(
+        dir: &std::path::Path,
+        bookmarks: &str,
+        err: &'static str,
+        sends: Arc<AtomicU32>,
+    ) -> (Kernel, PathBuf) {
+        let bm = dir.join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        std::fs::write(&bm, bookmarks).unwrap();
+        let status_path = dir.join("st.json");
+        let kernel = maintenance_kernel(
+            dir.to_path_buf(),
+            None,
+            None,
+            status_path.clone(),
+            crate::tagstore::TagPaths::in_dir(dir),
+            Arc::new(Failing::counted(err, sends)),
+            default_llm_registry(),
+            "ollama",
+        );
+        (kernel, status_path)
+    }
+
+    fn run_pass(kernel: &Kernel) {
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
+        futures::executor::block_on(kernel.issue(req, &Capability::root())).expect("pass runs");
+    }
+
+    fn sink_url(kernel: &Kernel, iri: &str, url: &str) -> String {
+        let req = Request::new(Verb::Sink, Iri::parse(iri).unwrap())
+            .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()));
+        let repr = futures::executor::block_on(kernel.issue(req, &Capability::root()))
+            .unwrap_or_else(|e| panic!("{iri} resolves: {e}"));
+        String::from_utf8_lossy(&repr.bytes).into_owned()
+    }
+
+    /// The transport tag a bot-walled edge produces: the connection was established, then nothing
+    /// came back (measured against washingtonpost.com — see [`reached_a_server`]).
+    const REFUSED_ERR: &str = "error sending request: [refused] operation timed out";
+
+    #[test]
+    fn a_refused_link_is_reported_as_unverified_and_never_offered_for_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kernel, status_path) = failing_kernel(
+            dir.path(),
+            "* Bookmarks\n** [[https://walled.example][Walled]]\n",
+            REFUSED_ERR,
+            Arc::new(AtomicU32::new(0)),
+        );
+        run_pass(&kernel);
+        let entry = load_status(&status_path)
+            .into_values()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.status, "refused", "reason: {}", entry.reason);
+
+        // The worksheet says what happened, and does NOT say dead.
+        let org = std::fs::read_to_string(status_path.with_file_name("dead-links.org")).unwrap();
+        assert!(org.contains("Refused at the edge"), "{org}");
+        assert!(org.contains("refused at the edge for"), "{org}");
+        assert!(
+            !org.contains("· dead "),
+            "a refused link must never be rendered as dead: {org}"
+        );
+
+        // The room renders it as a flagged card with per-card actions — and offers no purge at all,
+        // since the only broken link here is one nothing can be concluded about.
+        let rreq = Request::new(Verb::Source, Iri::parse("urn:cms:review").unwrap());
+        let rrepr = futures::executor::block_on(kernel.issue(rreq, &Capability::root()))
+            .expect("review resolves");
+        let html = String::from_utf8_lossy(&rrepr.bytes);
+        assert!(html.contains("https://walled.example"), "{html}");
+        assert!(html.contains("refused at the edge for"), "{html}");
+        assert!(
+            !html.contains("/r/urn:cms:purge"),
+            "no purge button anywhere: {html}"
+        );
+        assert!(html.contains("/link/remove?url="), "{html}");
+        assert!(html.contains("/link/keep?url="), "{html}");
+        // The classifier's internal marker is not something Brian should ever read on a card.
+        assert!(!html.contains("[refused]"), "marker leaked: {html}");
+        assert!(!entry.reason.contains("[refused]"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn a_kept_link_survives_the_next_full_pass() {
+        // The escape hatch has to outlive the runs, or it is not an escape hatch: the WaPo case is
+        // precisely a link that will keep failing the check forever while being perfectly alive.
+        let dir = tempfile::tempdir().unwrap();
+        let sends = Arc::new(AtomicU32::new(0));
+        let (kernel, status_path) = failing_kernel(
+            dir.path(),
+            "* Bookmarks\n** [[https://walled.example][Walled]]\n** [[https://other.example][Other]]\n",
+            REFUSED_ERR,
+            Arc::clone(&sends),
+        );
+        run_pass(&kernel);
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "both checked on run 1");
+
+        assert!(sink_url(&kernel, "urn:cms:link-keep", "https://walled.example").contains("kept"));
+        let kept_stamp = load_status(&status_path)["https://walled.example"].kept_at;
+        assert!(kept_stamp > 0, "keep is persisted");
+
+        // Run 2 immediately: the kept link is demoted to the weekly background re-check, so it is
+        // not even fetched — the point being that a kept bot-walled link stops costing a stall.
+        sends.store(0, Ordering::SeqCst);
+        run_pass(&kernel);
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "only the undecided link is re-checked"
+        );
+
+        // Age BOTH entries past the week so run 3 genuinely re-checks the kept one and folds a
+        // fresh outcome over it — the path where the decision could actually be lost.
+        let mut cache = load_status(&status_path);
+        let stale = unix_now().saturating_sub(2 * WEEK_SECS);
+        for s in cache.values_mut() {
+            s.checked_at = stale;
+        }
+        save_status(&status_path, &cache);
+        sends.store(0, Ordering::SeqCst);
+        run_pass(&kernel);
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "both re-checked on run 3");
+
+        let after = load_status(&status_path);
+        let kept = &after["https://walled.example"];
+        assert_eq!(
+            kept.kept_at, kept_stamp,
+            "the keep survived a full re-check"
+        );
+        assert_eq!(kept.status, "refused", "and it is still checked honestly");
+
+        // It stays out of the review and the worksheet; the undecided one stays in.
+        let rreq = Request::new(Verb::Source, Iri::parse("urn:cms:review").unwrap());
+        let html = String::from_utf8_lossy(
+            &futures::executor::block_on(kernel.issue(rreq, &Capability::root()))
+                .expect("review resolves")
+                .bytes,
+        )
+        .into_owned();
+        assert!(
+            !html.contains("walled.example"),
+            "kept link is gone: {html}"
+        );
+        assert!(html.contains("other.example"), "the other remains: {html}");
+        let org = std::fs::read_to_string(status_path.with_file_name("dead-links.org")).unwrap();
+        assert!(!org.contains("walled.example"), "{org}");
+        assert!(org.contains("other.example"), "{org}");
+    }
+
+    #[test]
+    fn per_card_remove_strikes_one_url_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kernel, status_path) = failing_kernel(
+            dir.path(),
+            "* Bookmarks\n** [[https://drop.example][Drop]]\n   :PROPERTIES:\n   :TAGS: x\n   :END:\n** [[https://stay.example][Stay]]\n",
+            REFUSED_ERR,
+            Arc::new(AtomicU32::new(0)),
+        );
+        run_pass(&kernel);
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+
+        assert!(
+            sink_url(&kernel, "urn:cms:link-remove", "https://drop.example").contains("removed")
+        );
+        let text = std::fs::read_to_string(&bm).unwrap();
+        assert!(!text.contains("drop.example"), "struck: {text}");
+        assert!(!text.contains(":TAGS: x"), "drawer went with it: {text}");
+        assert!(text.contains("stay.example"), "the other survives: {text}");
+        assert!(!load_status(&status_path).contains_key("https://drop.example"));
+        // A backup of the pre-removal content exists, on its OWN file (a one-off removal must not
+        // clobber a bulk purge's backup).
+        let bak =
+            std::fs::read_to_string(dir.path().join("old-org/pinboard-bookmarks.org.one.bak"))
+                .expect("backup written");
+        assert!(bak.contains("drop.example"), "{bak}");
+
+        // Doing it again is a no-op with the same answer — a button the user may double-click.
+        assert!(
+            sink_url(&kernel, "urn:cms:link-remove", "https://drop.example").contains("removed")
+        );
+        assert_eq!(std::fs::read_to_string(&bm).unwrap(), text, "unchanged");
+        // Keeping a URL that isn't in the cache at all is likewise not an error.
+        assert!(
+            sink_url(&kernel, "urn:cms:link-keep", "https://never-seen.example").contains("kept")
+        );
+    }
+
+    #[test]
+    fn a_confirmed_dead_domain_is_its_own_reviewed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kernel, status_path) = failing_kernel(
+            dir.path(),
+            "* Bookmarks\n** [[https://nx.example][NX]]\n",
+            "error sending request: [nxdomain] nodename nor servname provided, or not known",
+            Arc::new(AtomicU32::new(0)),
+        );
+        run_pass(&kernel);
+        // Legacy shape: confirmed NXDOMAIN used to be persisted as `gone`. Reading it must
+        // reclassify, or the 404 button would silently offer hundreds of dead domains.
+        let mut cache = load_status(&status_path);
+        let e = cache.get_mut("https://nx.example").unwrap();
+        e.status = "gone".into();
+        e.reason = "domain no longer resolves (NXDOMAIN, confirmed across runs)".into();
+        save_status(&status_path, &cache);
+        let reloaded = load_status(&status_path);
+        assert_eq!(reloaded["https://nx.example"].status, "nxdomain");
+
+        let now = unix_now();
+        assert!(RemovalSet::NxDomain
+            .candidates(&reloaded, now)
+            .contains("https://nx.example"));
+        assert!(
+            RemovalSet::Gone.candidates(&reloaded, now).is_empty(),
+            "the 404 set must not claim a dead domain"
+        );
+
+        // Its confirm prompt is its own action on its own route, and the 404 prompt no longer
+        // claims to cover NXDOMAIN.
+        let dreq = Request::new(Verb::Source, Iri::parse("urn:cms:purge-domains").unwrap());
+        let dhtml = String::from_utf8_lossy(
+            &futures::executor::block_on(kernel.issue(dreq, &Capability::root()))
+                .expect("dead-domain confirm resolves")
+                .bytes,
+        )
+        .into_owned();
+        assert!(dhtml.contains("hx-post=\"/purge-domains\""), "{dhtml}");
+        assert!(dhtml.contains("domain no longer resolves"), "{dhtml}");
+        let greq = Request::new(Verb::Source, Iri::parse("urn:cms:purge").unwrap());
+        let ghtml = String::from_utf8_lossy(
+            &futures::executor::block_on(kernel.issue(greq, &Capability::root()))
+                .expect("gone confirm resolves")
+                .bytes,
+        )
+        .into_owned();
+        assert!(!ghtml.contains("NXDOMAIN"), "{ghtml}");
+
+        // Executing it strikes the domain and backs up to its own file.
+        let xreq = Request::new(Verb::Sink, Iri::parse("urn:cms:purge-domains").unwrap());
+        futures::executor::block_on(kernel.issue(xreq, &Capability::root()))
+            .expect("dead-domain purge executes");
+        let text =
+            std::fs::read_to_string(dir.path().join("old-org/pinboard-bookmarks.org")).unwrap();
+        assert!(!text.contains("nx.example"), "{text}");
+        assert!(dir
+            .path()
+            .join("old-org/pinboard-bookmarks.org.domains.bak")
+            .is_file());
     }
 
     #[test]
@@ -2066,7 +2710,7 @@ mod tests {
             None,
             status_path.clone(),
             crate::tagstore::TagPaths::in_dir(dir.path()),
-            Arc::new(Failing(
+            Arc::new(Failing::new(
                 "error sending request: [nxdomain] failed to lookup address information: \
                  nodename nor servname provided, or not known",
             )),
@@ -2092,11 +2736,11 @@ mod tests {
         let soon = merge(Some(&entry), "s", "http://x", "X", &Outcome::NxDomain, now);
         assert_eq!(soon.status, "unreachable");
 
-        // …but past the gap the second sighting confirms `gone`, and sustained-deadness
+        // …but past the gap the second sighting confirms the domain is gone, and sustained-deadness
         // tracking carried through (count 2, first_broken preserved).
         let now = entry.checked_at + NXDOMAIN_CONFIRM_GAP_SECS;
         let confirmed = merge(Some(&entry), "s", "http://x", "X", &Outcome::NxDomain, now);
-        assert_eq!(confirmed.status, "gone", "reason: {}", confirmed.reason);
+        assert_eq!(confirmed.status, "nxdomain", "reason: {}", confirmed.reason);
         assert!(
             confirmed.reason.contains("confirmed"),
             "{}",
@@ -2272,7 +2916,20 @@ mod tests {
             checked_at: first + (count as u64).saturating_sub(1) * 86_400,
             first_broken_at: first,
             broken_count: count,
+            kept_at: 0,
         }
+    }
+
+    /// A cache keyed the way the real one is (by URL), from entries whose url is already set.
+    fn cache_of(items: Vec<Status>) -> HashMap<String, Status> {
+        items.into_iter().map(|s| (s.url.clone(), s)).collect()
+    }
+
+    /// `st` with a distinct URL, so several can share one cache.
+    fn st_at(url: &str, status: &str, first: u64, count: u32) -> Status {
+        let mut s = st(status, first, count);
+        s.url = url.into();
+        s
     }
 
     #[test]
@@ -2317,6 +2974,66 @@ mod tests {
         assert!(removable(&st("gone", 0, 1)));
         assert!(!removable(&st("unreachable", 0, 9)));
         assert!(!removable(&st("ok", 0, 0)));
+        // A confirmed dead domain is its own kind of removable, NOT part of the 404 set — the two
+        // buttons must never offer each other's links.
+        assert!(dead_domain(&st("nxdomain", 0, 2)));
+        assert!(!removable(&st("nxdomain", 0, 2)));
+        assert!(!dead_domain(&st("gone", 0, 1)));
+    }
+
+    #[test]
+    fn refused_is_never_removable_at_any_age_or_by_any_set() {
+        // The whole point of the third status: a host that answered the door and then refused the
+        // request is evidence about the GATEKEEPER. No amount of repetition converts that into
+        // evidence that the page is gone, so no set may ever offer it.
+        let now = 400 * 86_400u64;
+        let ancient = st("refused", 0, 400); // 400 failed checks over 400 days
+        assert!(!removable(&ancient));
+        assert!(!dead_domain(&ancient));
+        assert!(!durably_unreachable(&ancient, now));
+        let cache = cache_of(vec![ancient]);
+        for set in [
+            RemovalSet::NxDomain,
+            RemovalSet::Gone,
+            RemovalSet::DurableUnreachable,
+        ] {
+            assert!(
+                set.candidates(&cache, now).is_empty(),
+                "a refused link reached a removal set"
+            );
+        }
+        // It IS surfaced, though — flagged, not hidden.
+        assert_eq!(buckets(&cache, now).refused.len(), 1);
+    }
+
+    #[test]
+    fn a_kept_link_is_out_of_every_bucket_and_every_removal_set() {
+        let now = 400 * 86_400u64;
+        let mut kept_gone = st_at("http://kept", "gone", 0, 9);
+        kept_gone.kept_at = now - 86_400;
+        let cache = cache_of(vec![kept_gone, st_at("http://open", "gone", 0, 9)]);
+        // Kept is a decision about the LINK, so it outranks even a confirmed 404.
+        assert_eq!(RemovalSet::Gone.candidates(&cache, now).len(), 1);
+        assert!(RemovalSet::Gone
+            .candidates(&cache, now)
+            .contains("http://open"));
+        let b = buckets(&cache, now);
+        assert_eq!(b.gone.len(), 1, "the kept link left the review");
+        assert_eq!(b.gone[0].url, "http://open");
+    }
+
+    #[test]
+    fn duration_only_says_dead_when_the_evidence_does() {
+        // The renderer must not upgrade repetition into a verdict — the bug that made the review
+        // unusable was `unreachable` for 9 days rendering as "dead 9d".
+        assert_eq!(age_phrase("gone", 9), "dead 9d");
+        assert_eq!(age_phrase("nxdomain", 9), "domain gone 9d");
+        for unverified in ["refused", "unreachable"] {
+            let phrase = age_phrase(unverified, 9);
+            assert!(phrase.contains("unverified"), "{phrase}");
+            assert!(!phrase.contains("dead"), "{phrase}");
+        }
+        assert!(age_phrase("refused", 9).contains("refused at the edge for 9d"));
     }
 
     #[test]
@@ -2365,9 +3082,12 @@ mod tests {
         };
         cache.insert("g".into(), checked("gone"));
         cache.insert("u".into(), checked("unreachable"));
+        cache.insert("r".into(), checked("refused"));
+        // Two numbers, split on the evidence line: one confirmed dead, two that merely failed to
+        // answer us. Summing them into a single "broken" count is what overstated the review.
         let idle = status_fragment(&Meta::default(), &cache, now);
-        assert!(idle.contains("1 gone"), "{idle}");
-        assert!(idle.contains("1 unreachable"), "{idle}");
+        assert!(idle.contains("1 dead"), "{idle}");
+        assert!(idle.contains("2 unverified"), "{idle}");
         assert!(idle.contains("2h ago"), "{idle}");
         // Never run → empty (the CSS hides an empty indicator).
         assert!(status_fragment(&Meta::default(), &HashMap::new(), now).is_empty());
@@ -2403,29 +3123,58 @@ mod tests {
     #[test]
     fn review_xml_emits_sections_per_set_escaped_or_an_empty_marker() {
         let now = 3_000_000u64;
-        let mut g = st("gone", now - 172_800, 1); // 2 days
-        g.url = "https://x/?a=1&b=2".into();
+        let mut g = st_at("https://x/?a=1&b=2", "gone", now - 172_800, 1); // 2 days
         g.title = "A \"quoted\" <title>".into();
         g.reason = "HTTP 404/410 (gone)".into();
-        let u = st("unreachable", now - 10 * 86_400, 4);
-        let xml = review_xml(&[&g], &[&u], 638, now);
-        // Two sections, each with its own purge action; the observing count rides in a note.
+        let cache = cache_of(vec![
+            g,
+            st_at("http://nx", "nxdomain", now - 172_800, 2),
+            st_at("http://durable", "unreachable", now - 10 * 86_400, 4),
+            st_at("http://observing", "unreachable", now - 86_400, 1),
+            st_at("http://refused", "refused", now - 9 * 86_400, 9),
+        ]);
+        let xml = review_xml(&buckets(&cache, now), now);
+        // Three removal sections, each with its OWN purge action — the dead-domain set is no
+        // longer folded in behind the 404 button.
+        assert!(xml.contains("action=\"urn:cms:purge-domains\""), "{xml}");
         assert!(xml.contains("action=\"urn:cms:purge\""), "{xml}");
         assert!(
             xml.contains("action=\"urn:cms:purge-unreachable\""),
             "{xml}"
         );
+        // The refused class renders as a `flagged` block: same cards, NO bulk action anywhere in it.
+        assert!(xml.contains("<flagged"), "{xml}");
+        let flagged = xml.split("<flagged").nth(1).unwrap();
+        let flagged = flagged.split("</flagged>").next().unwrap();
+        assert!(
+            !flagged.contains("action="),
+            "the refused block must offer no purge: {flagged}"
+        );
+        assert!(flagged.contains("refused at the edge for 9d"), "{flagged}");
+        // The observing count rides in a note; each card carries its pre-phrased age + encoded URL.
         assert!(xml.contains("<note>"), "{xml}");
-        assert!(xml.contains("638 more unreachable"), "{xml}");
+        assert!(xml.contains("1 more unreachable"), "{xml}");
         assert!(xml.contains("status=\"gone\""), "{xml}");
-        assert!(xml.contains("days=\"2\""), "{xml}");
+        assert!(xml.contains("age=\"dead 2d\""), "{xml}");
+        assert!(
+            xml.contains("enc=\"https%3A%2F%2Fx%2F%3Fa%3D1%26b%3D2\""),
+            "{xml}"
+        );
         // Attribute values are XML-escaped.
         assert!(xml.contains("a=1&amp;b=2"), "{xml}");
         assert!(xml.contains("&quot;quoted&quot; &lt;title&gt;"), "{xml}");
-        // No candidates at all → the empty marker (and no note when nothing observing).
-        let empty = review_xml(&[], &[], 0, now);
+        // No removal candidates at all → the empty marker (and no note when nothing observing) —
+        // but a refused-only cache still renders its flagged block beside the empty marker, since
+        // "nothing to remove" is not "nothing to look at".
+        let empty = review_xml(&buckets(&HashMap::new(), now), now);
         assert!(empty.contains("<empty/>"), "{empty}");
         assert!(!empty.contains("<note>"), "{empty}");
+        let only_refused = cache_of(vec![st_at("http://r", "refused", now - 86_400, 1)]);
+        let xml = review_xml(&buckets(&only_refused, now), now);
+        assert!(
+            xml.contains("<empty/>") && xml.contains("<flagged"),
+            "{xml}"
+        );
     }
 
     #[test]
