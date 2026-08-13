@@ -18,7 +18,11 @@ crate-type = ["cdylib", "rlib"]
 ikigai-core = "0.1.46"
 # The on-wire Call/Reply codec — the SAME bytes ikigai-ipc/quic speak. The server
 # encodes/decodes it natively; the browser's wire codec does it in wasm.
-ikigai-wire = "0.1"
+# 0.1.10 is a REAL floor, not caution: `handle` matches `Call::IssueTraced`, which
+# protocol v3 added and 0.1.9 does not have. A bare "0.1" resolved to 0.1.9 under the
+# old lock, so `cargo build` (locked) and `cargo install --path` (fresh) compiled
+# different source and disagreed about what existed.
+ikigai-wire = "0.1.10"
 serde_json = "1"
 
 # The native kernel + server. Gated off wasm — the browser links only the wire codec,
