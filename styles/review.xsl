@@ -21,7 +21,7 @@
     <style>
       .cms-review-head{color:var(--mut,#888);font-size:13px;margin:14px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
       .cms-review{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:6px}
-      .cms-dead-card{border:1px solid var(--line,rgba(128,128,128,.35));border-left-width:3px;border-radius:12px;padding:12px 14px}
+      .cms-dead-card{border:1px solid var(--line,rgba(128,128,128,.35));border-left-width:3px;border-radius:12px;padding:12px 14px;min-width:0}
       .cms-dead-card.gone{border-left-color:#c0392b}
       .cms-dead-card.nxdomain{border-left-color:#8e2f8e}
       .cms-dead-card.unreachable{border-left-color:#c07a1f}
@@ -31,9 +31,9 @@
       .cms-dead-badge.nxdomain{color:#8e2f8e}
       .cms-dead-badge.unreachable{color:#c07a1f}
       .cms-dead-badge.refused{color:#2b7bb9}
-      .cms-dead-title{display:block;color:inherit;text-decoration:none;font-size:14px;font-weight:500;line-height:1.4}
+      .cms-dead-title{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;color:inherit;text-decoration:none;font-size:14px;font-weight:500;line-height:1.4;overflow-wrap:anywhere}
       .cms-dead-title:hover{text-decoration:underline}
-      .cms-dead-url{display:block;color:var(--mut,#888);font-size:11px;word-break:break-all;margin:2px 0}
+      .cms-dead-url{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:var(--mut,#888);font-size:11px;word-break:break-all;margin:2px 0}
       .cms-dead-meta{color:var(--mut,#888);font-size:12px}
       .cms-review-empty{color:var(--mut,#888);font-size:.95rem;padding:6px 0}
       .cms-review-note{color:var(--mut,#888);font-size:12px;padding:8px 0;font-style:italic}
