@@ -663,6 +663,13 @@ async fn handle_http(
         }
     }
     let sid = req.cookies.get("cms_session").map(String::as_str);
+    // The action routes take their argument in the query (`/link/keep?url=…`), so they match on the
+    // path alone. A bookmark URL cannot ride in an htmx `hx-vals` body here: the review is rendered
+    // by an XSLT engine with no string functions, which cannot escape an arbitrary URL into JSON.
+    let (path, query) = req
+        .target
+        .split_once('?')
+        .unwrap_or((req.target.as_str(), ""));
 
     let (status, ctype, out, set_cookie) = if let Some(route) = req.target.strip_prefix("/auth/") {
         http_auth(
@@ -675,8 +682,17 @@ async fn handle_http(
             entitlement,
             dev_open,
         )
-    } else if req.target == "/purge" && req.method == "POST" {
+    } else if path == "/purge" && req.method == "POST" {
         let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge");
+        (s, c, b, None)
+    } else if path == "/purge-domains" && req.method == "POST" {
+        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-domains");
+        (s, c, b, None)
+    } else if path == "/link/remove" && req.method == "POST" {
+        let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-remove", query);
+        (s, c, b, None)
+    } else if path == "/link/keep" && req.method == "POST" {
+        let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-keep", query);
         (s, c, b, None)
     } else if req.target == "/tag/approve" && req.method == "POST" {
         let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-approve", &body);
@@ -684,7 +700,7 @@ async fn handle_http(
     } else if req.target == "/tag/reject" && req.method == "POST" {
         let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-reject", &body);
         (s, c, b, None)
-    } else if req.target == "/purge-unreachable" && req.method == "POST" {
+    } else if path == "/purge-unreachable" && req.method == "POST" {
         let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-unreachable");
         (s, c, b, None)
     } else if let Some(target) = req.target.strip_prefix("/r/") {
@@ -757,6 +773,50 @@ fn handle_purge(
             "200 OK",
             "text/html; charset=utf-8",
             format!("<p class=\"cms-error\">purge failed: {e}</p>").into_bytes(),
+        ),
+    }
+}
+
+/// `POST /link/{remove,keep}?url=…` — the per-card decision on ONE reviewed link. Same
+/// authorization and elevation as the bulk purge (signed-in or `dev_open`, run as `root` because
+/// the room's session capability is deliberately read-only). No confirm step: the blast radius is a
+/// single URL, the file is backed up first, and both actions are idempotent.
+fn handle_link(
+    kernel: &Kernel,
+    auth: &HttpAuth,
+    sid: Option<&str>,
+    dev_open: bool,
+    iri: &str,
+    query: &str,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let authed = dev_open
+        || sid.is_some_and(|s| {
+            auth.sessions
+                .lock()
+                .unwrap()
+                .get(s)
+                .is_some_and(|sess| sess.scopes.is_some())
+        });
+    if !authed {
+        return (
+            "200 OK",
+            "text/html; charset=utf-8",
+            b"<span class=\"cms-error\">Sign in to curate links.</span>".to_vec(),
+        );
+    }
+    let url = query
+        .split('&')
+        .find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == "url"))
+        .map(|(_, v)| percent_decode(v))
+        .unwrap_or_default();
+    let req = Request::new(Verb::Sink, Iri::parse(iri).expect("valid IRI"))
+        .with_arg("url", ArgRef::Inline(url.into_bytes()));
+    match Resolver::issue_as(kernel, req, &Capability::root()) {
+        Ok((repr, _)) => ("200 OK", "text/html; charset=utf-8", repr.bytes),
+        Err(e) => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            format!("<span class=\"cms-error\">link action failed: {e}</span>").into_bytes(),
         ),
     }
 }
