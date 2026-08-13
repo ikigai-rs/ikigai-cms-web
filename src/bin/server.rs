@@ -1030,6 +1030,13 @@ fn handle(
             Reply::Cached(Resolver::is_cached(kernel, &req, &session.ceiling))
         }
         Ok(Call::Entries) => Reply::Entries(Resolver::entries(kernel)),
+        // Traced resolution (wire v3+) is not offered by this face: the browser has no
+        // trace surface to render spans into, and honouring it would mean recording a
+        // trace nothing consumes. Refuse in words the caller can act on rather than
+        // silently answering an untraced Resolved, which would look like it worked.
+        Ok(Call::IssueTraced(..)) => {
+            Reply::Error("traced resolution is not offered by the reading room".to_string())
+        }
         Err(e) => Reply::Error(format!("undecodable call: {e}")),
     };
     encode(&reply).unwrap_or_default()
@@ -1039,7 +1046,19 @@ fn handle(
 fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
     match Resolver::issue_as(kernel, request, cap) {
         Ok((representation, status)) => Reply::Resolved(representation, status),
-        Err(e) => Reply::Error(e),
+        // FLATTENED ON PURPOSE, not for want of a better variant. wire v7 added
+        // `Reply::ErrorTyped(WireError)` and every other server in the ecosystem now
+        // sends it — but THIS reply is decoded by our own wasm client, whose
+        // `decode_reply` matches `Reply::Error` and funnels every other variant into
+        // "unexpected reply kind". Sending the typed form would replace every legible
+        // error in the reading room with that string. Worse, the wasm bundle is
+        // gitignored and built locally, so server and client do not ship together: a
+        // server-only change reaches a deployed dist/ built at some earlier date.
+        // Moving to ErrorTyped means teaching wire_client::decode_reply the variant
+        // and rebuilding the bundle IN THE SAME DEPLOY — worth doing (a denial could
+        // then render differently from a not-found), but it is that change, not this
+        // one.
+        Err(e) => Reply::Error(e.to_string()),
     }
 }
 
