@@ -21,6 +21,7 @@
 //! Nothing here downloads or proxies a byte of the library: the overlay links to Zotero's own web
 //! reader and the browser's existing session does the authenticating.
 
+use crate::isbn::keys as isbn_keys;
 use async_trait::async_trait;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, Error, Invocation, Iri, ReprType, Representation,
@@ -489,57 +490,6 @@ fn norm_word(s: &str) -> String {
         .collect()
 }
 
-/// Every ISBN in a raw field, as canonical ISBN-13 keys.
-///
-/// Both sides need this and for different reasons. The API's `ISBN` field is free text and often
-/// holds several. The export is worse: its subject IRIs are hyphenated (`urn:isbn:978-3-319-23093-1`)
-/// and **463 of them carry two to five ISBNs joined by percent-encoded spaces**, because the whole
-/// field was pasted into the IRI. Comparing those raw strings matches almost nothing.
-///
-/// ISBN-10s are converted to their ISBN-13 form so an export listing the 10 and an API record
-/// listing the 13 still meet.
-fn isbn_keys(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in raw.replace("%20", " ").split([' ', ',', ';', '\t', '\n']) {
-        let digits: String = part
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
-        let key = match digits.len() {
-            13 if digits.chars().all(|c| c.is_ascii_digit()) => Some(digits),
-            10 => isbn10_to_13(&digits),
-            _ => None,
-        };
-        if let Some(k) = key {
-            if !out.contains(&k) {
-                out.push(k);
-            }
-        }
-    }
-    out
-}
-
-/// ISBN-10 → ISBN-13: prefix `978` and recompute the check digit. `None` if it isn't a plausible
-/// ISBN-10 (nine digits plus a digit-or-X check).
-fn isbn10_to_13(s: &str) -> Option<String> {
-    let body: &str = s.get(..9)?;
-    if !body.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let check = s.chars().nth(9)?;
-    if !check.is_ascii_digit() && check != 'X' {
-        return None;
-    }
-    let twelve = format!("978{body}");
-    let sum: u32 = twelve
-        .chars()
-        .enumerate()
-        .map(|(i, c)| c.to_digit(10).unwrap_or(0) * if i % 2 == 0 { 1 } else { 3 })
-        .sum();
-    Some(format!("{twelve}{}", (10 - sum % 10) % 10))
-}
-
 // ---- the graph side ----------------------------------------------------------------------------
 
 /// Every book in the graph, with what matching needs. Ordered so a run is reproducible.
@@ -629,30 +579,6 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn isbns_survive_hyphens_multiples_and_the_isbn10_form() {
-        // The export's shape: hyphenated, and several ISBNs jammed into one IRI with %20.
-        let keys = isbn_keys("978-1-119-00120-1%20978-1-119-00119-5%20978-1-119-00121-8");
-        assert_eq!(
-            keys,
-            vec![
-                "9781119001201".to_string(),
-                "9781119001195".to_string(),
-                "9781119001218".to_string()
-            ]
-        );
-        // An ISBN-10 (including the X check digit) canonicalizes to its 13 form, so an export
-        // listing the 10 meets an API record listing the 13.
-        assert_eq!(
-            isbn_keys("1-934356-00-X"),
-            vec!["9781934356005".to_string()]
-        );
-        assert_eq!(isbn_keys("0596007124"), isbn_keys("978-0-596-00712-6"));
-        // Junk yields nothing rather than a bogus key.
-        assert!(isbn_keys("n/a").is_empty());
-        assert!(isbn_keys("").is_empty());
-    }
 
     #[test]
     fn a_linked_url_pdf_is_not_readable() {
