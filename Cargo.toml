@@ -91,7 +91,10 @@ server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.
-maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
+# ikigai-secret: the Zotero link pass reads its API key as `urn:secret:zotero-api-key` through the
+# kernel, so the maintenance kernel mounts the secret space (the server feature already had the dep
+# for the passkey store; maintenance needs it in its own right).
+maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
 
 [[bin]]
 name = "cms-server"
@@ -106,6 +109,11 @@ required-features = ["maintenance"]
 [[bin]]
 name = "cms-tag-suggest"
 path = "src/bin/tagsuggest.rs"
+required-features = ["maintenance"]
+
+[[bin]]
+name = "cms-zotero-links"
+path = "src/bin/zoterolinks.rs"
 required-features = ["maintenance"]
 
 [dev-dependencies]

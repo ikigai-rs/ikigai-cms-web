@@ -2017,9 +2017,10 @@ fn slug_tag(s: &str) -> String {
 // ---- kernel assembly ---------------------------------------------------------------------------
 
 /// A maintenance kernel: the CMS graph spaces (bookmarks + `zotero` books) + the `ikigai-http`
-/// outbound endpoints over `transport` + the `urn:cms:linkcheck` and `urn:cms:tag-suggest` passes,
-/// with a system clock so cacheable reads honor their deadlines. `transport` is injectable so a
-/// test can supply a canned one.
+/// outbound endpoints over `transport` + the `urn:cms:linkcheck`, `urn:cms:tag-suggest` and
+/// `urn:cms:zotero-links` passes, with a system clock so cacheable reads honor their deadlines.
+/// `transport` and `secrets` are injectable so a test can supply a canned transport and a tempdir
+/// keystore instead of the machine's real one.
 // Flat by design: each arg mirrors one resolved config value, and a test injects its own
 // transport/registry — bundling them would just add an intermediate struct nobody else uses.
 #[allow(clippy::too_many_arguments)]
@@ -2030,9 +2031,11 @@ pub fn maintenance_kernel(
     status_path: PathBuf,
     tags: crate::tagstore::TagPaths,
     transport: std::sync::Arc<dyn HttpTransport>,
+    secrets: std::sync::Arc<dyn ikigai_secret::Backend>,
     registry: ikigai_llm::Registry,
     llm_provider: &str,
 ) -> Kernel {
+    let zotero_links = tags.zotero_links.clone();
     let mut spaces = crate::cms_spaces_with(
         src_dir,
         zotero,
@@ -2049,6 +2052,10 @@ pub fn maintenance_kernel(
     spaces
         .push(std::sync::Arc::new(ikigai_llm::space(transport, registry))
             as std::sync::Arc<dyn Space>);
+    // `urn:secret:*` over the injected keystore. The Zotero pass reads its API key AS A RESOURCE
+    // through this space, which is the whole point: `ikigai-secret`'s capability gate lives in the
+    // endpoint, so a consumer holding the backend directly would bypass it.
+    spaces.push(std::sync::Arc::new(ikigai_secret::space(secrets)) as std::sync::Arc<dyn Space>);
     spaces.push(std::sync::Arc::new(
         EndpointSpace::new()
             .bind(
@@ -2061,6 +2068,10 @@ pub fn maintenance_kernel(
                     provider: llm_provider.to_string(),
                     tags,
                 },
+            )
+            .bind(
+                Exact::new("urn:cms:zotero-links"),
+                crate::zotero::ZoteroLinkPass { path: zotero_links },
             ),
     ) as std::sync::Arc<dyn Space>);
     Kernel::new(std::sync::Arc::new(Fallback::new(spaces)))
@@ -2143,6 +2154,9 @@ pub fn build_maintenance_kernel(
         status_path,
         tags,
         std::sync::Arc::new(ReqwestTransport::new()),
+        // The machine's real keystore (macOS Keychain). Constructing it touches nothing — only a
+        // `urn:secret:*` read does, so the passes that never read one never prompt.
+        ikigai_secret::default_backend(),
         registry,
         &provider,
     ))
@@ -2154,6 +2168,18 @@ mod tests {
     use ikigai_core::{Capability, Clock, Time};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
+
+    /// A throwaway keystore for the maintenance kernel under test. A file backend in a fresh
+    /// tempdir, deliberately NOT [`ikigai_secret::default_backend`] — a test must never reach for
+    /// the developer's real Keychain, which on macOS would put a system prompt in the middle of a
+    /// CI-shaped run.
+    fn test_secrets() -> Arc<dyn ikigai_secret::Backend> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = ikigai_secret::FileBackend::new(dir.path());
+        // The directory must outlive the backend; a test process is short and the OS reclaims it.
+        std::mem::forget(dir);
+        Arc::new(backend)
+    }
 
     /// A canned transport returning a fixed status, counting sends.
     struct Canned {
@@ -2193,6 +2219,114 @@ mod tests {
                 body: body.to_vec(),
             })
         }
+    }
+
+    /// The Zotero API as three canned pages: whose key it is, one book, and that book's two
+    /// attachments (a `linked_url` decoy that claims to be a PDF, and the real stored EPUB).
+    struct CannedZotero;
+    #[async_trait]
+    impl HttpTransport for CannedZotero {
+        async fn send(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            // The credential must travel in a header, never in the URL — assert it here so a
+            // refactor that "simplifies" it into a `?key=` query param fails loudly.
+            assert!(
+                !req.url.contains("key="),
+                "the API key must not ride in the URL: {}",
+                req.url
+            );
+            assert!(
+                req.headers
+                    .iter()
+                    .any(|(n, v)| n == "Zotero-API-Key" && v == "s3cret"),
+                "the key rides in the Zotero-API-Key header"
+            );
+            let body: &[u8] = if req.url.contains("/keys/current") {
+                br#"{"userID":14060365,"username":"bsletten","access":{"user":{"library":true,"files":true}}}"#
+            } else if req.url.contains("itemType=book") {
+                br#"[{"key":"BOOKKEY1","data":{"title":"Rust in Action","ISBN":"978-1-61729-455-6","creators":[{"lastName":"McNamara","firstName":"Tim"}]}}]"#
+            } else if req.url.contains("itemType=attachment") {
+                br#"[{"key":"DECOYPDF","links":{"alternate":{"href":"https://www.zotero.org/bsletten/items/DECOYPDF"}},"data":{"parentItem":"BOOKKEY1","linkMode":"linked_url","contentType":"application/pdf"}},
+                     {"key":"REALEPUB","links":{"alternate":{"href":"https://www.zotero.org/bsletten/items/REALEPUB"}},"data":{"parentItem":"BOOKKEY1","linkMode":"imported_file","contentType":"application/epub+zip"}}]"#
+            } else {
+                b"[]"
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_vec(),
+            })
+        }
+    }
+
+    /// End to end, the thing Brian actually asked for: run the pass, then render the room and find
+    /// the card pointing at the readable copy instead of an Open Library search.
+    ///
+    /// Also pins the two rules that are easy to lose: the key is read as a RESOURCE (an empty
+    /// keystore makes the pass fail, not silently skip), and the `linked_url` PDF decoy loses to
+    /// the stored EPUB.
+    #[test]
+    fn the_pass_links_a_book_card_to_its_readable_copy() {
+        let (dir, z) = untagged_book_fixture();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
+        let secrets: Arc<dyn ikigai_secret::Backend> =
+            Arc::new(ikigai_secret::FileBackend::new(dir.path()));
+        let kernel = || {
+            maintenance_kernel(
+                dir.path().to_path_buf(),
+                Some(z.clone()),
+                None,
+                dir.path().join("st.json"),
+                tags.clone(),
+                Arc::new(CannedZotero),
+                Arc::clone(&secrets),
+                default_llm_registry(),
+                "ollama",
+            )
+        };
+        let pass = || {
+            futures::executor::block_on(kernel().issue(
+                Request::new(Verb::Source, Iri::parse("urn:cms:zotero-links").unwrap()),
+                &Capability::root(),
+            ))
+        };
+
+        // No key in the keystore → the pass fails loudly. A missing credential is a broken
+        // configuration, not a reason to quietly write an empty overlay.
+        assert!(pass().is_err(), "no key must fail, not no-op");
+
+        secrets.set("zotero-api-key", b"s3cret").unwrap();
+        let summary = String::from_utf8(pass().expect("pass runs").bytes).unwrap();
+        assert!(summary.contains("1 by ISBN"), "summary: {summary}");
+
+        // The overlay carries the durable identity AND the reader link — and points at the stored
+        // EPUB, not the linked_url decoy that advertised a PDF.
+        let overlay = std::fs::read_to_string(&tags.zotero_links).unwrap();
+        assert!(
+            overlay.contains("<urn:zotero:item:BOOKKEY1>"),
+            "durable identity: {overlay}"
+        );
+        assert!(
+            overlay.contains("https://www.zotero.org/bsletten/items/REALEPUB"),
+            "the stored EPUB wins: {overlay}"
+        );
+        assert!(!overlay.contains("DECOYPDF"), "decoy linked: {overlay}");
+
+        // And the room renders it: the card's href is the reader, not an Open Library search.
+        let view = Request::new(Verb::Source, Iri::parse("urn:cms:type:book").unwrap());
+        let html = String::from_utf8(
+            futures::executor::block_on(kernel().issue(view, &Capability::root()))
+                .expect("renders")
+                .bytes,
+        )
+        .unwrap();
+        assert!(
+            html.contains("https://www.zotero.org/bsletten/items/REALEPUB"),
+            "the card opens the book: {html}"
+        );
+        assert!(
+            !html.contains("openlibrary.org/search"),
+            "a linked book no longer falls back: {html}"
+        );
     }
 
     #[test]
@@ -2281,6 +2415,7 @@ mod tests {
             dir.path().join("st.json"),
             tags.clone(),
             Arc::new(RoutedCanned),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );
@@ -2316,6 +2451,7 @@ mod tests {
             dir.path().join("st.json"),
             tags.clone(),
             Arc::new(RoutedCanned),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );
@@ -2359,6 +2495,7 @@ mod tests {
                 status: 503,
                 sends: Arc::clone(&sends),
             }),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );
@@ -2460,6 +2597,7 @@ mod tests {
             status_path.clone(),
             crate::tagstore::TagPaths::in_dir(dir),
             Arc::new(Failing::counted(err, sends)),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );
@@ -2714,6 +2852,7 @@ mod tests {
                 "error sending request: [nxdomain] failed to lookup address information: \
                  nodename nor servname provided, or not known",
             )),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );
@@ -2781,6 +2920,7 @@ mod tests {
                 status: 200,
                 sends: Arc::clone(&sends),
             }),
+            test_secrets(),
             default_llm_registry(),
             "ollama",
         );

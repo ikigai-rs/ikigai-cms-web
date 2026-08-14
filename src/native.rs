@@ -123,6 +123,10 @@ pub fn cms_spaces_with(
         )
         .bind(Exact::new("urn:cms:graph:books"), BooksGraph)
         .bind(
+            Exact::new("urn:cms:graph:zotero-links"),
+            ZoteroLinksGraph { tags: tags.clone() },
+        )
+        .bind(
             Exact::new("urn:cms:graph:presentations"),
             crate::presentations::PresentationsGraph {
                 config: presentations,
@@ -342,6 +346,13 @@ impl Endpoint for BookmarkGraph {
 /// a skolemized `cms:Book` with `dc:title`, `dc:creator` ("Surname, Given" per author),
 /// slugged `dc:subject` tags (letter-bearing only — drops call-number noise), and an
 /// Open Library title-search as `dc:identifier` so a book renders like a bookmark card.
+///
+/// The Open Library search is the *fallback* link, all the export alone can offer. Where the Zotero
+/// link overlay knows a `cms:readerUrl` for a book, the view prefers it and the card opens the
+/// actual EPUB/PDF (see `READER_WHERE`). That join is deliberately NOT done here: this CONSTRUCT
+/// parses a 4.4 MB RDF/XML export and is the one expensive step in the room, so it stays a pure
+/// function of the export and stays CACHED. Joining a file the pass rewrites would make it
+/// uncacheable by propagation and put a full re-parse on every page render.
 const BOOK_CONSTRUCT: &str = r#"PREFIX bib: <http://purl.org/net/biblio#>
 PREFIX dc: <http://purl.org/dc/elements/1.1/>
 PREFIX z: <http://www.zotero.org/namespaces/export#>
@@ -516,6 +527,17 @@ impl Endpoint for CmsGraph {
                 Iri::parse("urn:cms:graph:dismissed").expect("valid IRI"),
             ))
             .await?;
+        // The Zotero link overlay: each matched book's durable `urn:zotero:item:{KEY}` identity and,
+        // where the library holds a readable copy, the `cms:readerUrl` the views prefer over the
+        // Open Library fallback. Merged HERE rather than inside the books graph on purpose — this
+        // graph is already uncacheable, so a rewritten overlay is picked up on the next read,
+        // while `urn:cms:graph:books` (the expensive 4.4 MB export parse) stays cached.
+        let zotero_links = inv
+            .issue(Request::new(
+                Verb::Source,
+                Iri::parse("urn:cms:graph:zotero-links").expect("valid IRI"),
+            ))
+            .await?;
         let mut turtle = bookmarks.bytes;
         turtle.push(b'\n');
         turtle.extend_from_slice(&bookmark_types.bytes);
@@ -529,6 +551,8 @@ impl Endpoint for CmsGraph {
         turtle.extend_from_slice(&suggestions.bytes);
         turtle.push(b'\n');
         turtle.extend_from_slice(&dismissed.bytes);
+        turtle.push(b'\n');
+        turtle.extend_from_slice(&zotero_links.bytes);
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             turtle,
@@ -570,6 +594,40 @@ impl Endpoint for ApprovedGraph {
     fn describe(&self) -> Description {
         Description::new("urn:cms:graph:tags-approved")
             .summary("The human-approved tag overlay (dc:subject) merged into urn:cms:graph.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:zotero-links` — the Zotero link overlay: a durable `cms:zoteroItem` identity per
+/// matched book and a `cms:readerUrl` for the ones whose library copy is readable, written by the
+/// `urn:cms:zotero-links` pass. [`BOOK_CONSTRUCT`] joins it, so a book card's link points at the
+/// actual EPUB/PDF instead of an Open Library search.
+///
+/// Absent file → empty Turtle, never an error. The books graph resolves this on every build, so an
+/// error here would take the entire book half of the room down with it; a machine that has never
+/// run the pass simply gets the Open Library fallback. Uncacheable (see [`ApprovedGraph`]).
+struct ZoteroLinksGraph {
+    tags: crate::tagstore::TagPaths,
+}
+
+#[async_trait]
+impl Endpoint for ZoteroLinksGraph {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        let turtle = std::fs::read(&self.tags.zotero_links).unwrap_or_default();
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            turtle,
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-graph-zotero-links"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:zotero-links")
+            .summary(
+                "The Zotero link overlay (cms:zoteroItem identity + cms:readerUrl) joined by the \
+                 books graph.",
+            )
             .verb(Verb::Source)
     }
 }
@@ -740,6 +798,18 @@ const KIND_WHERE: &str = " OPTIONAL { ?s a ?kt . \
 /// elements the stylesheet renders as pending chips with `+`/`x`.
 const SUGGEST_CONSTRUCT: &str = " ; cms:suggestedTag ?sg";
 const SUGGEST_WHERE: &str = " OPTIONAL { ?s cms:suggestedTag ?sg }";
+
+/// Prefer the readable copy. A book's own `dc:identifier` is an Open Library search — all the
+/// Zotero export can offer — but the `urn:cms:graph:zotero-links` overlay knows the web-reader URL
+/// for the books whose EPUB/PDF is in Zotero storage. Every card therefore renders
+/// `COALESCE(reader, own identifier)`: a book with a readable copy opens the book, everything else
+/// is untouched.
+///
+/// Done at the view rather than in `BOOK_CONSTRUCT` so the expensive export parse stays cacheable —
+/// the overlay changes when the pass runs, the export only when Zotero is re-exported.
+const READER_CONSTRUCT: &str = "?s dc:title ?t ; dc:identifier ?link";
+const READER_WHERE: &str = " OPTIONAL { ?s cms:readerUrl ?reader } \
+    BIND(COALESCE(?reader, ?u) AS ?link)";
 
 /// The validated card stylesheet from the `style` arg — only shipped card themes are
 /// honored (never resolve an arbitrary `urn:cms:style:*` off a client string).
@@ -1083,9 +1153,9 @@ impl Endpoint for TagView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
+                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
         let view_iri = format!("urn:cms:view:{tag}");
         let ctx = ViewCtx {
@@ -1146,9 +1216,9 @@ impl Endpoint for SearchView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
         let ctx = ViewCtx {
             iri: "urn:cms:search",
@@ -1233,9 +1303,9 @@ impl Endpoint for TypeView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
         let view_iri = format!("urn:cms:type:{ty}");
         let ctx = ViewCtx {
