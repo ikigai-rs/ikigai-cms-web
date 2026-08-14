@@ -162,6 +162,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("(default: old-org/pinboard-bookmarks.org)")
     );
 
+    // Rekey the tag overlays onto durable Zotero identities before serving a single request, so a
+    // promote arriving in the first second writes the same key the store already uses. Idempotent
+    // and silent when there is nothing to move; a refusal leaves the files untouched and is worth
+    // seeing, but is not a reason to refuse to serve the room.
+    match cfg.tags.migrate_to_durable_keys() {
+        Ok(report) => println!("{}", report.summary()),
+        Err(refused) => eprintln!("{refused}"),
+    }
+
     // Cloned for the optional maintenance kernel (below), before the serving kernel consumes them.
     let src_dir_maint = src_dir.clone();
     let bookmarks_maint = bookmarks.clone();
