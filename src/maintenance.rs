@@ -1885,10 +1885,26 @@ enum OlShape {
 
 /// OpenLibrary subjects for a book: ISBN-first (exact edition), then a title search. Best-effort —
 /// any error or miss yields an empty list (the book simply gets no suggestion this run).
+///
+/// The `cms:isbn` field is never sent as-is. It is the Zotero export's subject IRI verbatim, and
+/// **454 of the library's 1,362 ISBN-bearing books have several ISBNs pasted into one field**. That
+/// whole string is not an ISBN and matched nothing: every one of those 454 fell through to the
+/// title search and took the weaker suggestions, with no error anywhere to say so. Splitting the
+/// field ([`crate::isbn::keys`]) takes those 454 from 0 to 438 matched, and the library's
+/// subject-bearing hit rate from 32.7% to 57.0% (measured over all 1,362, 2026-08-13).
+///
+/// Two things that field-guide instinct says to do here, measured and NOT done:
+/// - **Stripping hyphens is not what fixes this.** OpenLibrary's `bibkeys` accepts a hyphenated
+///   ISBN-13 fine — all 908 single-ISBN books scored identically before and after. Hyphens still
+///   come off because [`crate::isbn::keys`] validates and canonicalizes, not because they hurt.
+/// - **Sending the ISBN-10 spelling alongside the 13 buys nothing.** It rescued 0 of 1,362 books;
+///   OpenLibrary resolves the two forms itself (1,416 of the 1,781 ISBN-10 keys tried did return a
+///   record — always the same record the 13 already found). It only doubles the query string.
+///
+/// A book's editions all go in one `bibkeys` request: asking for N keys costs the same round trip
+/// as asking for one, and the OL rate limit is per request, not per key.
 async fn openlibrary_subjects(inv: &Invocation<'_>, isbn: &str, title: &str) -> Vec<String> {
-    if !isbn.is_empty() {
-        let url =
-            format!("https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data");
+    if let Some(url) = ol_bibkeys_url(isbn) {
         let subs = ol_fetch(inv, &url, OlShape::Books).await;
         if !subs.is_empty() {
             return subs;
@@ -1902,6 +1918,27 @@ async fn openlibrary_subjects(inv: &Invocation<'_>, isbn: &str, title: &str) -> 
         return ol_fetch(inv, &url, OlShape::Search).await;
     }
     Vec::new()
+}
+
+/// The `bibkeys` lookup for one raw `cms:isbn` field, or `None` when the field holds no ISBN at all
+/// (`"n/a"`, empty) — there is nothing to ask, so the caller goes straight to the title search
+/// rather than spending a round trip on a key that cannot match.
+///
+/// Split out from [`openlibrary_subjects`] so the part that is pure — which keys leave the house —
+/// is testable without a network.
+fn ol_bibkeys_url(isbn: &str) -> Option<String> {
+    let keys = crate::isbn::keys(isbn);
+    if keys.is_empty() {
+        return None;
+    }
+    let bibkeys = keys
+        .iter()
+        .map(|k| format!("ISBN:{k}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "https://openlibrary.org/api/books?bibkeys={bibkeys}&format=json&jscmd=data"
+    ))
 }
 
 /// One `urn:httpGet` to OpenLibrary (cacheable a week — its subject data is stable), parsed for the
@@ -1919,13 +1956,25 @@ async fn ol_fetch(inv: &Invocation<'_>, url: &str, shape: OlShape) -> Vec<String
     let json: serde_json::Value =
         serde_json::from_slice(&repr.bytes).unwrap_or(serde_json::Value::Null);
     match shape {
-        OlShape::Books => json
-            .as_object()
-            .into_iter()
-            .flatten()
-            .flat_map(|(_, v)| v["subjects"].as_array().cloned().unwrap_or_default())
-            .filter_map(|s| s["name"].as_str().map(String::from))
-            .collect(),
+        // One request can carry several keys for one book — the editions in a multi-ISBN field are
+        // usually the hardback/paperback/ebook of the same title — so several records can answer
+        // and repeat each other's subjects. Dedupe: a subject listed three times is not three
+        // subjects, and this list is verbatim what the LLM is asked to work from.
+        OlShape::Books => {
+            let mut out: Vec<String> = Vec::new();
+            for name in json
+                .as_object()
+                .into_iter()
+                .flatten()
+                .flat_map(|(_, v)| v["subjects"].as_array().cloned().unwrap_or_default())
+                .filter_map(|s| s["name"].as_str().map(String::from))
+            {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            out
+        }
         OlShape::Search => json["docs"]
             .as_array()
             .and_then(|d| d.first())
@@ -2340,6 +2389,40 @@ mod tests {
                 "distributed-systems".to_string(),
                 "networking".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn the_multi_isbn_field_becomes_one_request_asking_for_every_edition() {
+        // THE BUG THIS FIXES. 454 of the library's 1,362 ISBN-bearing books carry a field like
+        // this, and it used to go out whole: `bibkeys=ISBN:978-1-119-00120-1%20978-...`, which is
+        // not an ISBN and matched nothing. Best-effort lookup meant no error — the book just fell
+        // through to the title search and got weaker tags.
+        let url = ol_bibkeys_url("978-1-119-00120-1%20978-1-119-00119-5%20978-1-119-00121-8")
+            .expect("a field with ISBNs yields a lookup");
+        assert_eq!(
+            url,
+            "https://openlibrary.org/api/books?bibkeys=ISBN:9781119001201,ISBN:9781119001195,\
+             ISBN:9781119001218&format=json&jscmd=data",
+            "every edition, one round trip"
+        );
+        // The pasted field must not survive anywhere in the query.
+        assert!(!url.contains("%20"), "{url}");
+        assert!(!url.contains('-'), "{url}");
+    }
+
+    #[test]
+    fn a_field_with_no_isbn_is_not_worth_a_round_trip() {
+        // No key can match, so there is nothing to ask: the caller goes straight to the title
+        // search instead of spending a request to learn that.
+        assert_eq!(ol_bibkeys_url(""), None);
+        assert_eq!(ol_bibkeys_url("n/a"), None);
+        // And a single ordinary ISBN still asks for exactly itself.
+        assert_eq!(
+            ol_bibkeys_url("978-3-319-23093-1").as_deref(),
+            Some(
+                "https://openlibrary.org/api/books?bibkeys=ISBN:9783319230931&format=json&jscmd=data"
+            )
         );
     }
 

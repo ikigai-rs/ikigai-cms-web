@@ -33,6 +33,12 @@ pub mod tagstore;
 #[cfg(feature = "maintenance")]
 pub mod maintenance;
 
+// Normalizing the ISBNs the Zotero export hands us (hyphenated, and often several in one field).
+// Shared by the Zotero link pass, which matches on them, and the tag-suggest pass, which looks
+// them up in OpenLibrary — both are `maintenance`.
+#[cfg(feature = "maintenance")]
+mod isbn;
+
 // The Zotero link pass (`urn:cms:zotero-links`) — sweeps the Zotero API for the durable item
 // identity and the readable attachment behind each book, and writes the overlay the books graph
 // joins. Outbound HTTP + a credential, so it rides the `maintenance` feature with the rest.
