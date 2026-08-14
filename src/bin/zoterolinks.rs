@@ -33,6 +33,9 @@ async fn main() {
     eprintln!("overlay: {}", cfg.tags.zotero_links.display());
 
     let status_path = cfg.linkstatus.unwrap_or_else(default_status_path);
+    // Held past the kernel: a fresh sweep is exactly when a book gains a durable identity, so the
+    // tag overlays are rekeyed onto it the moment the overlay it comes from is rewritten.
+    let tags = cfg.tags.clone();
     let kernel = match build_maintenance_kernel(
         cfg.src_dir,
         cfg.zotero,
@@ -54,5 +57,12 @@ async fn main() {
             eprintln!("zotero-links failed: {e}");
             std::process::exit(1);
         }
+    }
+    // Move any tag decision that a book just became matchable for onto its durable key. A no-op
+    // when the sweep matched nothing new, and never fatal — the overlays serve correctly either
+    // way; a refusal only means they stay on the old key one more run.
+    match tags.migrate_to_durable_keys() {
+        Ok(report) => println!("{}", report.summary()),
+        Err(refused) => eprintln!("{refused}"),
     }
 }
