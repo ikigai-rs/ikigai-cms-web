@@ -33,6 +33,12 @@ pub mod tagstore;
 #[cfg(feature = "maintenance")]
 pub mod maintenance;
 
+// The Zotero link pass (`urn:cms:zotero-links`) — sweeps the Zotero API for the durable item
+// identity and the readable attachment behind each book, and writes the overlay the books graph
+// joins. Outbound HTTP + a credential, so it rides the `maintenance` feature with the rest.
+#[cfg(feature = "maintenance")]
+pub mod zotero;
+
 // Bin configuration: ~/.config/ikigai/cms.toml + CLI flags (no env vars). Behind
 // `maintenance` — the feature every bin has (`server` includes it).
 #[cfg(feature = "maintenance")]

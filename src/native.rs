@@ -123,6 +123,10 @@ pub fn cms_spaces_with(
         )
         .bind(Exact::new("urn:cms:graph:books"), BooksGraph)
         .bind(
+            Exact::new("urn:cms:graph:zotero-links"),
+            ZoteroLinksGraph { tags: tags.clone() },
+        )
+        .bind(
             Exact::new("urn:cms:graph:presentations"),
             crate::presentations::PresentationsGraph {
                 config: presentations,
@@ -340,20 +344,33 @@ impl Endpoint for BookmarkGraph {
 
 /// The CONSTRUCT that normalizes Zotero's RDF onto the CMS axis: each `bib:Book` becomes
 /// a skolemized `cms:Book` with `dc:title`, `dc:creator` ("Surname, Given" per author),
-/// slugged `dc:subject` tags (letter-bearing only — drops call-number noise), and an
-/// Open Library title-search as `dc:identifier` so a book renders like a bookmark card.
+/// slugged `dc:subject` tags (letter-bearing only — drops call-number noise), and a
+/// `dc:identifier` link so a book renders like a bookmark card.
+///
+/// That link prefers the **readable copy**: if the Zotero link overlay knows a `cms:readerUrl` for
+/// this book, the card opens the actual EPUB/PDF in Zotero's web reader; otherwise it falls back to
+/// the Open Library title search, which is all the export alone can offer. The overlay also carries
+/// the book's durable `cms:zoteroItem` identity (`urn:zotero:item:{KEY}`) — the export's own
+/// subjects are `#item_N` ordinals that renumber on every re-export, so they are not identities at
+/// all.
 const BOOK_CONSTRUCT: &str = r#"PREFIX bib: <http://purl.org/net/biblio#>
 PREFIX dc: <http://purl.org/dc/elements/1.1/>
 PREFIX z: <http://www.zotero.org/namespaces/export#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX cms: <https://ikigai-rs.dev/ns/cms#>
-CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug ; cms:isbn ?isbn ; dc:description ?description }
+CONSTRUCT { ?id a cms:Book ; dc:title ?title ; dc:identifier ?lookup ; dc:creator ?author ; dc:subject ?slug ; cms:isbn ?isbn ; dc:description ?description ; cms:zoteroItem ?zitem }
 WHERE {
   ?book a bib:Book ; dc:title ?title .
   OPTIONAL { ?book dc:description ?description }
   BIND(IRI(CONCAT("urn:cms:book:", SHA256(STR(?book)))) AS ?id)
-  BIND(CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title)) AS ?lookup)
+  # The link overlay, joined on the skolem the BIND above just minted. Both are OPTIONAL: a machine
+  # that has never run the `urn:cms:zotero-links` pass has no overlay, and a matched book may still
+  # have no readable attachment. COALESCE picks the reader URL when there is one and the Open
+  # Library search when there is not, so the card always has somewhere to go.
+  OPTIONAL { ?id cms:readerUrl ?readable }
+  OPTIONAL { ?id cms:zoteroItem ?zitem }
+  BIND(COALESCE(?readable, CONCAT("https://openlibrary.org/search?q=", ENCODE_FOR_URI(?title))) AS ?lookup)
   # Zotero keys a book's subject IRI on its ISBN (urn:isbn:…) — surface it so the tag-suggest pass
   # can look the book up in OpenLibrary by ISBN. Unbound (no triple) when the book has no ISBN. The
   # OPTIONAL carries a triple anchor (not just BIND/FILTER) so Oxigraph binds ?isbn.
@@ -417,7 +434,13 @@ impl Endpoint for BooksGraph {
         let construct = Iri::parse("urn:sparql:construct").expect("valid IRI");
         let req = Request::new(Verb::Source, construct)
             .with_arg("query", ArgRef::Inline(BOOK_CONSTRUCT.as_bytes().to_vec()))
-            .with_arg("graph", ArgRef::Inline(b"urn:cms:src:zotero".to_vec()))
+            // Two sources, one dataset: the export supplies the books, the overlay supplies their
+            // Zotero identity and reader links. `urn:sparql:*` loads each as a named graph and
+            // queries the union, so BOOK_CONSTRUCT joins them without any GRAPH clause.
+            .with_arg(
+                "graph",
+                ArgRef::Inline(b"urn:cms:src:zotero,urn:cms:graph:zotero-links".to_vec()),
+            )
             .with_arg("as", ArgRef::Inline(b"turtle".to_vec()));
         let turtle = match inv.issue(req).await {
             Ok(repr) => repr.bytes,
@@ -570,6 +593,40 @@ impl Endpoint for ApprovedGraph {
     fn describe(&self) -> Description {
         Description::new("urn:cms:graph:tags-approved")
             .summary("The human-approved tag overlay (dc:subject) merged into urn:cms:graph.")
+            .verb(Verb::Source)
+    }
+}
+
+/// `urn:cms:graph:zotero-links` — the Zotero link overlay: a durable `cms:zoteroItem` identity per
+/// matched book and a `cms:readerUrl` for the ones whose library copy is readable, written by the
+/// `urn:cms:zotero-links` pass. [`BOOK_CONSTRUCT`] joins it, so a book card's link points at the
+/// actual EPUB/PDF instead of an Open Library search.
+///
+/// Absent file → empty Turtle, never an error. The books graph resolves this on every build, so an
+/// error here would take the entire book half of the room down with it; a machine that has never
+/// run the pass simply gets the Open Library fallback. Uncacheable (see [`ApprovedGraph`]).
+struct ZoteroLinksGraph {
+    tags: crate::tagstore::TagPaths,
+}
+
+#[async_trait]
+impl Endpoint for ZoteroLinksGraph {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+        let turtle = std::fs::read(&self.tags.zotero_links).unwrap_or_default();
+        Ok(Representation::new(
+            ReprType::new("text/turtle").with_param("charset", "utf-8"),
+            turtle,
+        ))
+    }
+    fn name(&self) -> &str {
+        "cms-graph-zotero-links"
+    }
+    fn describe(&self) -> Description {
+        Description::new("urn:cms:graph:zotero-links")
+            .summary(
+                "The Zotero link overlay (cms:zoteroItem identity + cms:readerUrl) joined by the \
+                 books graph.",
+            )
             .verb(Verb::Source)
     }
 }

@@ -25,14 +25,19 @@ const CMS_SUGGESTED: &str = "https://ikigai-rs.dev/ns/cms#suggestedTag";
 /// fully-dismissed book from the candidate set; not rendered.
 const CMS_DISMISSED: &str = "https://ikigai-rs.dev/ns/cms#dismissedTag";
 
-/// The three overlay files as explicit paths, threaded from the config into every consumer
+/// The overlay files as explicit paths, threaded from the config into every consumer
 /// (the graph endpoints, the tag-suggest pass) — no process-global state, so tests hand each
 /// kernel its own tempdir store.
+///
+/// `zotero_links` is the odd one out: not a tag overlay but the same mechanism — a derived
+/// Turtle sidecar the graph joins against, written by a pass, never by hand. It rides here so a
+/// test's tempdir covers every overlay at once rather than half of them.
 #[derive(Clone, Debug)]
 pub struct TagPaths {
     pub approved: PathBuf,
     pub suggestions: PathBuf,
     pub dismissed: PathBuf,
+    pub zotero_links: PathBuf,
 }
 
 impl TagPaths {
@@ -42,6 +47,7 @@ impl TagPaths {
             approved: dir.join("cms-tags-approved.ttl"),
             suggestions: dir.join("cms-tag-suggestions.ttl"),
             dismissed: dir.join("cms-tag-dismissed.ttl"),
+            zotero_links: dir.join("cms-zotero-links.ttl"),
         }
     }
 

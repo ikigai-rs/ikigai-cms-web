@@ -55,6 +55,9 @@ struct Raw {
     tags_suggestions: Option<String>,
     /// The dismissed-tag overlay path (default `~/.ikigai/cms-tag-dismissed.ttl`).
     tags_dismissed: Option<String>,
+    /// The Zotero link overlay path (default `~/.ikigai/cms-zotero-links.ttl`) — written by the
+    /// `cms-zotero-links` pass, read by the books graph.
+    zotero_links: Option<String>,
 }
 
 /// The resolved configuration the bins consume.
@@ -179,6 +182,7 @@ fn apply_flags(raw: &mut Raw, args: &[String]) -> Result<(), String> {
             "--tags-approved" => raw.tags_approved = Some(value),
             "--tags-suggestions" => raw.tags_suggestions = Some(value),
             "--tags-dismissed" => raw.tags_dismissed = Some(value),
+            "--zotero-links" => raw.zotero_links = Some(value),
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -235,6 +239,9 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
     }
     if let Some(s) = raw.tags_dismissed {
         tags.dismissed = expand(home, &s);
+    }
+    if let Some(s) = raw.zotero_links {
+        tags.zotero_links = expand(home, &s);
     }
 
     let page_port = raw.page_port.unwrap_or(8080);
@@ -318,6 +325,7 @@ config: ~/.config/ikigai/cms.toml — flags override it, one run at a time
   --tags-approved <file>   approved-tag overlay (default ~/.ikigai/cms-tags-approved.ttl)
   --tags-suggestions <file> tag-suggestions overlay (default ~/.ikigai/cms-tag-suggestions.ttl)
   --tags-dismissed <file>  dismissed-tag overlay (default ~/.ikigai/cms-tag-dismissed.ttl)
+  --zotero-links <file>    Zotero link overlay (default ~/.ikigai/cms-zotero-links.ttl)
   --limit <n>              cap a maintenance pass (cms-linkcheck / cms-tag-suggest)";
 
 #[cfg(test)]
