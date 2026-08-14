@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! <urn:cms:book:{sha}> cms:zoteroItem <urn:zotero:item:{KEY}> .        # durable identity
-//! <urn:cms:book:{sha}> cms:readerUrl  "https://www.zotero.org/…" .     # the readable copy
+//! <urn:cms:book:{sha}> cms:readerUrl  "https://www.zotero.org/…/reader" . # the readable copy
 //! ```
 //!
 //! The identity is the bigger prize. `urn:zotero:item:{KEY}` survives re-export, so a books graph
@@ -121,7 +121,7 @@ impl Endpoint for ZoteroLinkPass {
                 book: gb.id.clone(),
                 item: api.key.clone(),
                 attachment: att.map(|a| a.key.clone()),
-                reader_url: att.map(|a| a.alternate.clone()),
+                reader_url: att.map(|a| reader_url(&a.alternate)),
             });
         }
 
@@ -324,7 +324,37 @@ fn creator_surname(c: &serde_json::Value) -> Option<String> {
 /// A readable attachment: the file the reader link points at.
 struct Readable {
     key: String,
+    /// The attachment's `links.alternate.href` from the API, stored **raw**. This is not the reader
+    /// link — see [`reader_url`], which is the only thing allowed to turn it into one.
     alternate: String,
+}
+
+/// The Zotero web reader for an attachment, from its `links.alternate.href`.
+///
+/// **`links.alternate.href` is not the readable copy, and using it bare is the bug this function
+/// exists to prevent.** It is the item's *library* page: every one of the 1,606 links this pass
+/// wrote in #71 opened the library instead of the book, and nothing failed — the link resolved, it
+/// just went to the wrong place. The reader is that same URL plus one segment.
+///
+/// Both of these open the book, and both were checked in a browser against a real attachment
+/// (VPR4QFMQ, parent 5Y8ANEF4):
+///
+/// ```text
+/// https://www.zotero.org/{user}/items/VPR4QFMQ/reader                      <- what we build
+/// https://www.zotero.org/{user}/items/5Y8ANEF4/attachment/VPR4QFMQ/reader
+/// ```
+///
+/// We build the first: it is exactly the API's own href plus `/reader`, so the only piece of
+/// Zotero's URL scheme baked in here is that one segment, and the parent item never has to be
+/// threaded through. (A `/search/{query}/titleCreatorYear` segment sometimes appears in a URL
+/// copied from the browser — that is navigation state and is not required.)
+///
+/// The instruction that produced the bug was "prefer `links.alternate.href`, do not hand-build a
+/// URL", which is good advice that happens to be wrong here: the API publishes no reader link at
+/// all, so the choice is one appended segment or no working link. Do not "restore" the API-blessed
+/// value — that silently breaks 1,606 links again, and the breakage is invisible from the graph.
+fn reader_url(alternate: &str) -> String {
+    format!("{}/reader", alternate.trim_end_matches('/'))
 }
 
 /// Group attachments by parent item, keeping only the *readable* one per book.
@@ -581,6 +611,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reader_link_points_at_the_reader_not_the_library_page() {
+        // THE BUG #71 SHIPPED. `links.alternate.href` is the item's library page; all 1,606 links
+        // resolved fine and every one of them opened the wrong thing. The reader is one segment on.
+        assert_eq!(
+            reader_url("https://www.zotero.org/bsletten/items/VPR4QFMQ"),
+            "https://www.zotero.org/bsletten/items/VPR4QFMQ/reader"
+        );
+        // A trailing slash from the API must not produce a `//reader` that 404s.
+        assert_eq!(
+            reader_url("https://www.zotero.org/bsletten/items/VPR4QFMQ/"),
+            "https://www.zotero.org/bsletten/items/VPR4QFMQ/reader"
+        );
+        // Whatever we emit must never be the bare href again — that is the regression to catch.
+        let bare = "https://www.zotero.org/bsletten/items/VPR4QFMQ";
+        assert_ne!(reader_url(bare), bare);
+    }
+
+    #[test]
     fn a_linked_url_pdf_is_not_readable() {
         // The trap this filter exists for: a bookmark that advertises a PDF content type. Linking
         // it would open a reader on a file Zotero does not have.
@@ -719,7 +767,7 @@ mod tests {
                 book: "urn:cms:book:a".into(),
                 item: "ITEM1".into(),
                 attachment: Some("ATT1".into()),
-                reader_url: Some("https://www.zotero.org/u/items/ATT1".into()),
+                reader_url: Some(reader_url("https://www.zotero.org/u/items/ATT1")),
             },
         ];
         let ttl = overlay_turtle(&rows);
@@ -727,7 +775,7 @@ mod tests {
         assert!(ttl.contains(
             "<urn:cms:book:b> <https://ikigai-rs.dev/ns/cms#zoteroItem> <urn:zotero:item:ITEM2> ."
         ));
-        assert!(ttl.contains("<urn:cms:book:a> <https://ikigai-rs.dev/ns/cms#readerUrl> \"https://www.zotero.org/u/items/ATT1\" ."));
+        assert!(ttl.contains("<urn:cms:book:a> <https://ikigai-rs.dev/ns/cms#readerUrl> \"https://www.zotero.org/u/items/ATT1/reader\" ."));
         assert_eq!(ttl.matches("readerUrl").count(), 1);
         // Sorted → a diff between runs means something actually changed.
         let lines: Vec<&str> = ttl.lines().collect();

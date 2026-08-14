@@ -71,6 +71,32 @@ const DURABLE_PREFIX: &str = "urn:zotero:item:";
 /// `zotero_links` is the odd one out: not a tag overlay but the same mechanism — a derived
 /// Turtle sidecar the graph joins against, written by a pass, never by hand. It rides here so a
 /// test's tempdir covers every overlay at once rather than half of them.
+///
+/// # Two views of an overlay, and which one is true
+///
+/// Since the durable-key change, an overlay file and the graph it serves do **not** hold the same
+/// subject, and that difference is correct and permanent:
+///
+/// - [`entries`] is the **file**, verbatim. A book the Zotero API matched is stored under
+///   `urn:zotero:item:{KEY}`, because that is the identity that survives a re-export.
+/// - `*_turtle` is the **graph**, projected onto today's `urn:cms:book:{sha}` so joins work as
+///   they always did.
+///
+/// **The file is authoritative; the projection is a view.** Storage is keyed on what is durable,
+/// and `urn:cms:book:{sha}` is not — it hashes the export subject, which for the 257 no-ISBN books
+/// is a `#item_N` ordinal that renumbers on every re-export. That is the whole reason for the
+/// re-key. The projection exists only so nothing downstream of `urn:cms:graph` had to change.
+///
+/// So the two disagreeing is the design, not a bug to reconcile. Do not "fix" it by making
+/// `entries` project, which would hand callers a view and lose the durable key on the next write;
+/// and do not make the served graph emit raw keys, which would put identities that are not
+/// resources into `urn:cms:graph` — `urn:cms:tags` counts `?s dc:subject ?tag` without requiring a
+/// title, so a leaked bare identity silently inflates a tag's count.
+///
+/// When writing a test: assert on `entries` for what was *stored*, on `*_turtle` for what the room
+/// *sees*. A fixture whose tempdir has no `cms-zotero-links.ttl` has nothing to canonicalize
+/// against, so the two coincide there — which is why a test can pass while telling you nothing
+/// about this distinction.
 #[derive(Clone, Debug)]
 pub struct TagPaths {
     pub approved: PathBuf,
