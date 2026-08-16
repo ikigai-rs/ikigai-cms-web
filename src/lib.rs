@@ -45,7 +45,7 @@ mod isbn;
 #[cfg(feature = "maintenance")]
 pub mod zotero;
 
-// Bin configuration: ~/.config/ikigai/cms.toml + CLI flags (no env vars). Behind
+// Bin configuration: `cms.toml` in the ikigai config home + CLI flags (no env vars). Behind
 // `maintenance` — the feature every bin has (`server` includes it).
 #[cfg(feature = "maintenance")]
 pub mod config;

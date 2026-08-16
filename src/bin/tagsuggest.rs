@@ -4,7 +4,7 @@
 //! suggestions overlay for `+`/`x` review — never a proper tag until you promote it.
 //!
 //! Run: `cargo run --features maintenance --bin cms-tag-suggest` — configured by
-//! `~/.config/ikigai/cms.toml` + CLI flags (`--limit <n>`, default 5); no env vars.
+//! `cms.toml` in the ikigai config home + CLI flags (`--limit <n>`, default 5); no env vars.
 
 use ikigai_cms_web::maintenance::{build_maintenance_kernel, default_status_path};
 use ikigai_core::{ArgRef, Capability, Iri, Request, Verb};
@@ -27,7 +27,12 @@ async fn main() {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none — no books)".into())
     );
-    let status_path = cfg.linkstatus.unwrap_or_else(default_status_path);
+    // No configured path and no data home ⇒ nowhere to reconcile; stop rather than write the
+    // cache to whatever directory we happened to start in.
+    let Some(status_path) = cfg.linkstatus.or_else(default_status_path) else {
+        eprintln!("HOME is not set");
+        std::process::exit(2);
+    };
     let kernel = match build_maintenance_kernel(
         cfg.src_dir,
         cfg.zotero,

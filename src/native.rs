@@ -29,15 +29,22 @@ const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
 ///   Open Library lookup as `dc:identifier` so a book renders like a bookmark).
 /// - `urn:cms:graph` — the whole CMS: bookmarks ⊕ books, what SPARQL points at.
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
-pub fn build_cms_kernel(src_dir: PathBuf, zotero: Option<PathBuf>) -> Kernel {
-    build_cms_kernel_with(
+///
+/// The no-config form: the tag overlays come from the ikigai data home, so it errors with
+/// the same `"HOME is not set"` [`crate::config::load`] uses when there is none. Callers that
+/// know where the overlays live pass them to [`build_cms_kernel_with`] and cannot fail here.
+pub fn build_cms_kernel(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+) -> std::result::Result<Kernel, String> {
+    Ok(build_cms_kernel_with(
         src_dir,
         zotero,
         None,
         None,
-        crate::tagstore::TagPaths::default_home(),
+        crate::tagstore::TagPaths::default_home().ok_or("HOME is not set")?,
         None,
-    )
+    ))
 }
 
 /// [`build_cms_kernel`] plus lectern presentations (`urn:cms:graph:presentations`): the
@@ -64,16 +71,20 @@ pub fn build_cms_kernel_with(
 }
 
 /// The spaces the CMS kernel is composed of, exposed so a maintenance kernel can add HTTP
-/// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings.
-pub fn cms_spaces(src_dir: PathBuf, zotero: Option<PathBuf>) -> Vec<Arc<dyn Space>> {
-    cms_spaces_with(
+/// (link-checking) alongside the same graph. See [`build_cms_kernel`] for the bindings, and
+/// for why the no-config form can fail.
+pub fn cms_spaces(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+) -> std::result::Result<Vec<Arc<dyn Space>>, String> {
+    Ok(cms_spaces_with(
         src_dir,
         zotero,
         None,
         None,
-        crate::tagstore::TagPaths::default_home(),
+        crate::tagstore::TagPaths::default_home().ok_or("HOME is not set")?,
         None,
-    )
+    ))
 }
 
 /// [`cms_spaces`] plus the presentations config, an optional bookmarks sub-path override,
@@ -193,8 +204,14 @@ pub fn cms_spaces_with(
     // htmx-polls for the running/last-run state. Present only when the maintenance stack is
     // compiled in (it shares that status format); it does no network, so it's safe in the serving
     // kernel.
+    // No configured path and no data home ⇒ there is no status file, so these views are not
+    // bound at all. That is the honest reading of "nowhere to look": binding them on a
+    // working-directory-relative path is the failure this replaces — the room would poll a
+    // status no pass will ever write, and see "no data" rather than an error.
     #[cfg(feature = "maintenance")]
-    let status_path = linkstatus.unwrap_or_else(crate::maintenance::default_status_file);
+    let Some(status_path) = linkstatus.or_else(crate::maintenance::default_status_file) else {
+        return spaces;
+    };
     #[cfg(not(feature = "maintenance"))]
     let _ = linkstatus;
     #[cfg(feature = "maintenance")]

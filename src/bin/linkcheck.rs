@@ -4,7 +4,7 @@
 //! separate, reviewed step.
 //!
 //! Run: `cargo run --features maintenance --bin cms-linkcheck` — configured by
-//! `~/.config/ikigai/cms.toml` + CLI flags (`--limit <n>` caps the pass); no env vars.
+//! `cms.toml` in the ikigai config home + CLI flags (`--limit <n>` caps the pass); no env vars.
 
 use ikigai_cms_web::maintenance::build_maintenance_kernel;
 use ikigai_core::{ArgRef, Capability, Iri, Request, Verb};
@@ -18,9 +18,15 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let status_path = cfg
+    // A pass has to know where to reconcile; with no configured path and no data home there
+    // is nowhere, so stop rather than write the cache to wherever we were started from.
+    let Some(status_path) = cfg
         .linkstatus
-        .unwrap_or_else(ikigai_cms_web::maintenance::default_status_path);
+        .or_else(ikigai_cms_web::maintenance::default_status_path)
+    else {
+        eprintln!("HOME is not set");
+        std::process::exit(2);
+    };
 
     eprintln!(
         "source: {}  bookmarks: {}  status: {}",

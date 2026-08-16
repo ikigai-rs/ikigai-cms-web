@@ -12,7 +12,7 @@
 //! session does the authenticating.
 //!
 //! Run: `cargo run --features maintenance --bin cms-zotero-links` — configured by
-//! `~/.config/ikigai/cms.toml` + CLI flags; no env vars.
+//! `cms.toml` in the ikigai config home + CLI flags; no env vars.
 
 use ikigai_cms_web::maintenance::{build_maintenance_kernel, default_status_path};
 use ikigai_core::{Capability, Iri, Request, Verb};
@@ -32,7 +32,12 @@ async fn main() {
     }
     eprintln!("overlay: {}", cfg.tags.zotero_links.display());
 
-    let status_path = cfg.linkstatus.unwrap_or_else(default_status_path);
+    // No configured path and no data home ⇒ nowhere to reconcile; stop rather than write the
+    // cache to whatever directory we happened to start in.
+    let Some(status_path) = cfg.linkstatus.or_else(default_status_path) else {
+        eprintln!("HOME is not set");
+        std::process::exit(2);
+    };
     // Held past the kernel: a fresh sweep is exactly when a book gains a durable identity, so the
     // tag overlays are rekeyed onto it the moment the overlay it comes from is rewritten.
     let tags = cfg.tags.clone();

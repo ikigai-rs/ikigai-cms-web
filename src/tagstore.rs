@@ -116,21 +116,31 @@ impl TagPaths {
         }
     }
 
-    /// The default store: `{home}/.ikigai` — the ikigai-owned state dir (created if
-    /// missing), kept out of synced content. `cms.toml` keys / flags override per file.
-    pub fn in_state_dir(home: &Path) -> Self {
-        let dir = home.join(".ikigai");
-        let _ = std::fs::create_dir_all(&dir);
-        Self::in_dir(&dir)
+    /// The default store: the ikigai data home under `home` — the ikigai-owned state dir
+    /// (created if missing), kept out of synced content. `cms.toml` keys / flags override
+    /// per file.
+    ///
+    /// `None` when `home` names no directory. That is not defensiveness: joining onto an
+    /// empty path yields a *relative* `.ikigai`, so the overlays land wherever the process
+    /// happened to start while every reader looks under the real home and finds nothing —
+    /// which reads as "no tags yet", not as an error.
+    pub fn in_state_dir(home: &Path) -> Option<Self> {
+        ikigai_core::config::data_home_from(Some(home.as_os_str().to_os_string()))
+            .map(Self::in_created_dir)
     }
 
     /// [`TagPaths::in_state_dir`] under `$HOME` — for the no-config kernel constructors.
-    pub fn default_home() -> Self {
-        Self::in_state_dir(
-            &std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-        )
+    /// `None` when `HOME` is unset or empty, for the reason [`TagPaths::in_state_dir`] gives.
+    pub fn default_home() -> Option<Self> {
+        ikigai_core::config::data_home().map(Self::in_created_dir)
+    }
+
+    /// [`TagPaths::in_dir`] with the directory created first. The creation lives here rather
+    /// than in `ikigai_core::config`, which is path algebra and performs no filesystem I/O —
+    /// that is what keeps the rule usable from the wasm face.
+    fn in_created_dir(dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        Self::in_dir(&dir)
     }
 }
 
@@ -598,6 +608,23 @@ impl TagPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state dir is the ikigai data home under the given home — and a home that names
+    /// nothing yields *no* store rather than a working-directory-relative `.ikigai`, which is
+    /// the failure that reads as "no tags yet". Injected, never the process environment: `HOME`
+    /// is process-global, so unsetting it here would race the harness's own threads.
+    #[test]
+    fn state_dir_follows_the_home_and_refuses_an_empty_one() {
+        let home = tempfile::tempdir().unwrap();
+        let tags = TagPaths::in_state_dir(home.path()).expect("a real home has a data home");
+        assert_eq!(
+            tags.approved,
+            home.path().join(".ikigai/cms-tags-approved.ttl")
+        );
+        assert!(home.path().join(".ikigai").is_dir(), "state dir created");
+
+        assert!(TagPaths::in_state_dir(Path::new("")).is_none());
+    }
 
     #[test]
     fn parse_roundtrips_and_escapes() {

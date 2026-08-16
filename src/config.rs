@@ -1,6 +1,9 @@
-//! Configuration for the CMS bins — the config home (`~/.config/ikigai/cms.toml`) plus
-//! CLI flags, flags winning. No environment variables: the file states the durable
-//! posture (ports, source paths, which passes run), a flag overrides it for one run.
+//! Configuration for the CMS bins — `cms.toml` in the ikigai config home plus CLI flags,
+//! flags winning. Where that home IS belongs to `ikigai_core::config`, not here
+//! (`$XDG_CONFIG_HOME/ikigai`, else `~/.config/ikigai`); this crate used to join
+//! `~/.config/ikigai` itself and was the one of four ikigai config readers that ignored the
+//! variable. No environment variables of our own: the file states the durable posture (ports,
+//! source paths, which passes run), a flag overrides it for one run.
 //!
 //! Fail-loud rules: a config file that exists but does not parse (or carries an unknown
 //! key) is an error, never a silent fallback to defaults; a path that was *explicitly*
@@ -86,16 +89,23 @@ pub struct CmsConfig {
     pub limit: Option<String>,
 }
 
-/// Load the configuration: `~/.config/ikigai/cms.toml` (or `--config <path>`) merged
+/// Load the configuration: `cms.toml` in the ikigai config home (or `--config <path>`) merged
 /// under the remaining CLI flags. See the module docs for the fail-loud rules.
 pub fn load(args: impl Iterator<Item = String>) -> Result<CmsConfig, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set")?;
-    load_with_home(&home, args)
+    load_with_home(std::env::var_os("XDG_CONFIG_HOME"), &home, args)
 }
 
-fn load_with_home(home: &Path, args: impl Iterator<Item = String>) -> Result<CmsConfig, String> {
+/// [`load`] with the environment passed in — the injected seam every test uses. Both variables
+/// arrive as arguments because the process environment is global: a test that let an ambient
+/// `XDG_CONFIG_HOME` reach in would read the developer's real config home instead of its tempdir.
+fn load_with_home(
+    xdg: Option<std::ffi::OsString>,
+    home: &Path,
+    args: impl Iterator<Item = String>,
+) -> Result<CmsConfig, String> {
     let mut args: Vec<String> = args.collect();
 
     // --config first: it decides which file the rest of the flags override.
@@ -107,10 +117,9 @@ fn load_with_home(home: &Path, args: impl Iterator<Item = String>) -> Result<Cms
             }
             Some(p)
         }
-        None => {
-            let p = home.join(".config/ikigai/cms.toml");
-            p.is_file().then_some(p)
-        }
+        None => ikigai_core::config::config_home_from(xdg, Some(home.as_os_str().to_os_string()))
+            .map(|dir| dir.join("cms.toml"))
+            .filter(|p| p.is_file()),
     };
 
     let mut raw = match &config_path {
@@ -229,8 +238,10 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
     )?;
 
     // The tag-overlay store: the ikigai state dir by default, each file overridable
-    // (they're outputs — created on first write, so no existence probe).
-    let mut tags = crate::tagstore::TagPaths::in_state_dir(home);
+    // (they're outputs — created on first write, so no existence probe). A home that names
+    // nothing has no state dir; fail loud with the same words `load` uses rather than write
+    // the overlays to a relative `.ikigai` nothing will read back.
+    let mut tags = crate::tagstore::TagPaths::in_state_dir(home).ok_or("HOME is not set")?;
     if let Some(s) = raw.tags_approved {
         tags.approved = expand(home, &s);
     }
@@ -305,7 +316,8 @@ fn expand(home: &Path, s: &str) -> PathBuf {
 
 const USAGE: &str = "\
 usage: cms-server [flags]   (also cms-linkcheck / cms-tag-suggest)
-config: ~/.config/ikigai/cms.toml — flags override it, one run at a time
+config: cms.toml in the ikigai config home ($XDG_CONFIG_HOME/ikigai, else
+        ~/.config/ikigai) — flags override it, one run at a time
   --config <path>          use a different config file
   --wire-port <port>       WebTransport port (default 4433)
   --page-port <port>       reading-room page port (default 8080)
@@ -339,8 +351,10 @@ mod tests {
         home
     }
 
+    /// No `XDG_CONFIG_HOME`: the config home is `{home}/.config/ikigai`, the shape every
+    /// test below was written against.
     fn load_args(home: &Path, args: &[&str]) -> Result<CmsConfig, String> {
-        load_with_home(home, args.iter().map(|s| s.to_string()))
+        load_with_home(None, home, args.iter().map(|s| s.to_string()))
     }
 
     #[test]
@@ -402,6 +416,45 @@ mod tests {
         assert_eq!(
             cfg.tags.dismissed,
             home.path().join(".ikigai/cms-tag-dismissed.ttl")
+        );
+    }
+
+    /// The default config file comes from `ikigai_core::config`, not from a local
+    /// `{home}/.config/ikigai` join — so an `XDG_CONFIG_HOME` moves it. This asserts only
+    /// that cms-web *calls* the rule; what the rule resolves to is core's own tested
+    /// contract. Injected, not `set_var`: the process environment is global.
+    #[test]
+    fn the_config_home_is_the_one_from_core() {
+        let home = fake_home();
+        let xdg = tempfile::tempdir().unwrap();
+        let dir = xdg.path().join("ikigai");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cms.toml"), "page_port = 8123\n").unwrap();
+
+        // The file under XDG_CONFIG_HOME is the one that is read...
+        let cfg = load_with_home(
+            Some(xdg.path().as_os_str().to_os_string()),
+            home.path(),
+            std::iter::empty(),
+        )
+        .expect("xdg load");
+        assert_eq!(cfg.page_port, 8123);
+
+        // ...and it is not merely the fallback finding nothing: `{home}/.config/ikigai` holds
+        // a different port, and the XDG file still wins.
+        let under_home = home.path().join(".config/ikigai");
+        std::fs::create_dir_all(&under_home).unwrap();
+        std::fs::write(under_home.join("cms.toml"), "page_port = 8456\n").unwrap();
+        let cfg = load_with_home(
+            Some(xdg.path().as_os_str().to_os_string()),
+            home.path(),
+            std::iter::empty(),
+        )
+        .expect("xdg load");
+        assert_eq!(cfg.page_port, 8123);
+        assert_eq!(
+            load_args(home.path(), &[]).expect("home load").page_port,
+            8456
         );
     }
 

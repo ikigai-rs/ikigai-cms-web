@@ -481,15 +481,31 @@ fn read_meta(path: &std::path::Path) -> Meta {
         .unwrap_or_default()
 }
 
-/// The default status file (`$HOME/.ikigai/cms-linkstatus.json`) WITHOUT creating the
-/// dir — the reader-side default; the configured path is threaded to every consumer so a
-/// view always resolves the same file the pass writes.
-pub fn default_status_file() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".ikigai")
-        .join("cms-linkstatus.json")
+/// The status cache's name in the ikigai data home. `dead-links.org` and
+/// `cms-linkcheck-meta.json` are *derived* from the resolved path ([`meta_path`],
+/// [`write_report`]) rather than spelled again, so this is the only stem to state.
+const STATUS_STEM: &str = "cms-linkstatus.json";
+
+/// The default status file in the ikigai data home, WITHOUT creating the dir — the
+/// reader-side default; the configured path is threaded to every consumer so a view always
+/// resolves the same file the pass writes.
+///
+/// `None` when `HOME` is unset or empty. That is the point of the `Option`: the spelling
+/// this replaces joined onto an empty path, so a process started without `HOME` wrote its
+/// status cache to a working-directory-relative `.ikigai/` and the room read the real data
+/// home and found nothing.
+pub fn default_status_file() -> Option<PathBuf> {
+    ikigai_core::config::data_path(STATUS_STEM)
+}
+
+/// [`default_status_file`] with the home passed in — the pure form, and the only testable one,
+/// since the process environment is global and `set_var` races the harness's threads. Public
+/// as the twin of [`crate::tagstore::TagPaths::in_state_dir`]: a caller that was handed a home
+/// (a tempdir standing in for `$HOME`, a per-tenant root) resolves the cache under it here
+/// rather than joining the data directory's name for itself.
+pub fn status_file_in(home: &std::path::Path) -> Option<PathBuf> {
+    ikigai_core::config::data_home_from(Some(home.as_os_str().to_os_string()))
+        .and_then(|dir| ikigai_core::config::data_path_in(&dir, STATUS_STEM))
 }
 
 // ---- the pass endpoint -------------------------------------------------------------------------
@@ -2132,11 +2148,16 @@ pub fn default_llm_registry() -> ikigai_llm::Registry {
     ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2"))
 }
 
-/// The LLM registry from the config home (`~/.config/ikigai/llm.json`) when present —
-/// a malformed file fails loud — else [`default_llm_registry`].
+/// The LLM registry from the config home (`llm.json`) when present — a malformed file fails
+/// loud — else [`default_llm_registry`]. The config home is `ikigai_core::config`'s, the same
+/// one `cms.toml` is read from; this used to join `~/.config/ikigai` itself and so was the one
+/// reader in the crate that could disagree with the other about which directory that is.
+///
+/// No config home at all (neither `XDG_CONFIG_HOME` nor `HOME`) keeps the compiled-in default,
+/// as it always has: an absent registry is not an error, only an unreadable one is.
 pub fn llm_registry() -> std::result::Result<ikigai_llm::Registry, String> {
-    match std::env::var_os("HOME").map(PathBuf::from) {
-        Some(home) => llm_registry_at(&home.join(".config/ikigai/llm.json")),
+    match ikigai_core::config::config_home() {
+        Some(dir) => llm_registry_at(&dir.join("llm.json")),
         None => Ok(default_llm_registry()),
     }
 }
@@ -2172,15 +2193,18 @@ pub fn resolve_llm_provider(
     }
 }
 
-/// [`default_status_file`], creating the `$HOME/.ikigai` state directory (kept out of
-/// your synced content dirs) — the writer-side default; `dead-links.org` is written
-/// beside it. The config `linkstatus` key overrides it.
-pub fn default_status_path() -> PathBuf {
-    let file = default_status_file();
+/// [`default_status_file`], creating the ikigai data directory (kept out of your synced
+/// content dirs) — the writer-side default; `dead-links.org` is written beside it. The
+/// config `linkstatus` key overrides it. `None` for the reason [`default_status_file`] gives.
+///
+/// The `create_dir_all` lives here, not in `ikigai_core::config`: core is path algebra and
+/// performs no filesystem I/O, which is what lets the rule compile for the wasm face.
+pub fn default_status_path() -> Option<PathBuf> {
+    let file = default_status_file()?;
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    file
+    Some(file)
 }
 
 /// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
@@ -2217,6 +2241,24 @@ mod tests {
     use ikigai_core::{Capability, Clock, Time};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
+
+    /// The status cache sits in the ikigai data home under the given home — and a home that
+    /// names nothing yields NO path rather than a working-directory-relative `.ikigai/`, which
+    /// is the failure that reads as an empty cache. `dead-links.org` and the meta file are
+    /// derived from this path, so they follow it. Injected, not `set_var`: the process
+    /// environment is global and would race the harness's own threads.
+    #[test]
+    fn the_status_file_follows_the_home_and_refuses_an_empty_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let file = status_file_in(home.path()).expect("a real home has a data home");
+        assert_eq!(file, home.path().join(".ikigai/cms-linkstatus.json"));
+        assert_eq!(
+            meta_path(&file),
+            home.path().join(".ikigai/cms-linkcheck-meta.json")
+        );
+
+        assert!(status_file_in(std::path::Path::new("")).is_none());
+    }
 
     /// A throwaway keystore for the maintenance kernel under test. A file backend in a fresh
     /// tempdir, deliberately NOT [`ikigai_secret::default_backend`] — a test must never reach for

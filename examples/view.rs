@@ -24,7 +24,13 @@ fn main() {
             })
         })
         .filter(|p| p.exists());
-    let kernel = ikigai_cms_web::build_cms_kernel(dir.into(), zotero);
+    let kernel = match ikigai_cms_web::build_cms_kernel(dir.into(), zotero) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     let iri = Iri::parse(format!("urn:cms:view:{tag}")).expect("valid IRI");
     match Resolver::issue(&kernel, Request::new(Verb::Source, iri)) {
         Ok((repr, status)) => {

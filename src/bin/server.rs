@@ -19,7 +19,7 @@
 //! `ikigai-secret`), not a plaintext file.
 //!
 //! Run: `cargo run --features server --bin cms-server` — configured by
-//! `~/.config/ikigai/cms.toml` + CLI flags (`--help` lists them); no env vars.
+//! `cms.toml` in the ikigai config home + CLI flags (`--help` lists them); no env vars.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ const MAX_CALL: usize = 8 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configuration = ~/.config/ikigai/cms.toml + CLI flags (flags win); no env vars.
+    // Configuration = cms.toml in the ikigai config home + CLI flags (flags win); no env vars.
     let cfg = match ikigai_cms_web::config::load(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -220,10 +220,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let linkcheck_on = cfg.linkcheck;
     let tagsuggest_on = cfg.tagsuggest;
     let _maint_registry = if linkcheck_on || tagsuggest_on {
-        let status_path = cfg
+        // A pass was asked for, so it must know where to reconcile. No configured path and no
+        // data home ⇒ nowhere: stop, rather than serve a room whose status cache is written to
+        // whatever directory the server was launched from.
+        let Some(status_path) = cfg
             .linkstatus
             .clone()
-            .unwrap_or_else(ikigai_cms_web::maintenance::default_status_path);
+            .or_else(ikigai_cms_web::maintenance::default_status_path)
+        else {
+            eprintln!("HOME is not set");
+            std::process::exit(2);
+        };
         // Fail loud: a maintenance pass was asked for, so a bad llm.json or an unknown
         // llm_provider must stop the server, never silently run the wrong model.
         let maint = match ikigai_cms_web::maintenance::build_maintenance_kernel(
@@ -1417,7 +1424,17 @@ mod tests {
              :PROPERTIES:\n   :TAGS: science\n   :END:\n",
         )
         .unwrap();
-        let kernel = ikigai_cms_web::build_cms_kernel(dir.to_path_buf(), None);
+        // The overlays and the status cache live in the tempdir, not the data home:
+        // `build_cms_kernel` would resolve the developer's real `~/.ikigai`, and the
+        // tag routes below WRITE.
+        let kernel = ikigai_cms_web::build_cms_kernel_with(
+            dir.to_path_buf(),
+            None,
+            None,
+            None,
+            ikigai_cms_web::tagstore::TagPaths::in_dir(dir),
+            Some(dir.join("cms-linkstatus.json")),
+        );
         let ent = vec![format!("urn:cap:fs:read:{}", dir.display())];
         (kernel, ent)
     }
