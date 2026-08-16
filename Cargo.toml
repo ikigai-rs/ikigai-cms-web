@@ -15,7 +15,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Shared across native and wasm: the request/reply types + the on-wire codec both
 # faces speak, and JSON (render on native, arg encoding on wasm).
-ikigai-core = "0.1.46"
+# 0.1.58 is a REAL floor: `ikigai_core::config` is the one spelling of both ikigai homes
+# (config_home_from arrived in 0.1.56, data_home_from/data_path in 0.1.57) and this crate
+# now derives every home from it rather than joining ".config/ikigai" and ".ikigai" itself.
+# The pin says 0.1.58, not 0.1.57, because 0.1.57 was never published — the registry goes
+# 0.1.56 → 0.1.58 — so 0.1.58 is the earliest version that actually resolves.
+ikigai-core = "0.1.58"
 # The on-wire Call/Reply codec — the SAME bytes ikigai-ipc/quic speak. The server
 # encodes/decodes it natively; the browser's wire codec does it in wasm.
 # 0.1.10 is a REAL floor, not caution: `handle` matches `Call::IssueTraced`, which
