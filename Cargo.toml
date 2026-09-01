@@ -75,7 +75,12 @@ futures = { version = "0.3", optional = true }
 # urn:time timer thread alike).
 futures-timer = { version = "3", optional = true }
 # The time transport: cms-server schedules the link-check pass on a recurring urn:time job.
-ikigai-time = { version = "0.1.11", optional = true }
+# 0.2.0 runs a job's cancel closure OUTSIDE the registry lock: before it, a panic in any cancel
+# closure poisoned the registry mutex and every later `lock().expect(..)` in the crate died with
+# it — the long-lived registry this server holds is exactly the thing that would have stayed
+# dead. 0.2.0 also takes the host's Clock as a required argument (see `JobRegistry::new` in
+# src/bin/server.rs), which is what makes this pin a floor rather than a preference.
+ikigai-time = { version = "0.2.0", optional = true }
 # S3 tag suggestion: urn:llm:ask over a local Ollama (OpenAI-compat) refines the noisy OpenLibrary
 # subjects onto the user's tag vocabulary; urn:llm:ollama:up gates the pass on the LLM being up.
 # Reuses the same HttpTransport as the link-checker.

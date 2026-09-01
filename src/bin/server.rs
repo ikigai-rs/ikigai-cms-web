@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use ikigai_core::{ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, Verb};
+use ikigai_core::{
+    ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, SystemClock, Verb,
+};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -247,8 +249,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         };
-        let registry = ikigai_time::JobRegistry::new(Arc::new(ikigai_time::ThreadTimer))
-            .with_capability(Capability::root());
+        // The registry reads time through the host's clock rather than a monotonic Instant, so
+        // it takes one explicitly. This is a native host: the same `SystemClock` the kernel runs
+        // on. (Only job *staleness* is measured on it — the schedule itself is the backend's.)
+        let registry = ikigai_time::JobRegistry::new(
+            Arc::new(ikigai_time::ThreadTimer),
+            Arc::new(SystemClock),
+        )
+        .with_capability(Capability::root());
         registry.set_resolver(Arc::clone(&maint) as Arc<dyn Resolver>);
         let schedule_pass = |iri: &'static str, label: &'static str| {
             match ikigai_time::parse_schedule("24h")
