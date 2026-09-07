@@ -70,7 +70,13 @@ async function connect() {
     const st = await (await fetch("/auth/status")).json();
     if (!st.authenticated || !st.wire_token) return; // only an authenticated page bridges
     const cert = await (await fetch("cert.json", { cache: "no-store" })).json();
-    wt = new WebTransport(`https://127.0.0.1:${cert.port}`, {
+    // Where to dial the wire follows the server's bind, and the server's cert SANs follow it
+    // too — a dial host the certificate does not name is rejected by the browser. `cert.host`
+    // is "127.0.0.1" for the loopback default (what this line used to hard-code); it is absent
+    // when the page is reached at some other name (a TLS proxy, or a bind naming no single
+    // address), and then the page's own hostname is the only host that can be right.
+    const wireHost = cert.host || location.hostname;
+    wt = new WebTransport(`https://${wireHost}:${cert.port}`, {
       serverCertificateHashes: [{ algorithm: "sha-256", value: hexToBytes(cert.cert) }],
     });
     await wt.ready;
