@@ -13,6 +13,13 @@
 //! is passkey-gated identically over the wire and over HTTP (`dev_open` ungates the HTTP
 //! face for localhost dev).
 //!
+//! Where the page listens is `bind` (default `127.0.0.1`), and it is checked against
+//! `rp_origin` before anything starts: plain HTTP is a **secure context** only on loopback, and
+//! WebAuthn only runs in a secure context, so a LAN-bound room served over plain HTTP has a
+//! passkey gate that is *inoperable*. `config::check_reachable` refuses that pair rather than
+//! start a room whose front door can never open; the certificate's SANs are derived from the
+//! same two settings so they cannot drift from it.
+//!
 //! The WebAuthn ceremony binds to the *page* origin (where `navigator.credentials` runs, default
 //! `http://localhost:8080`), configurable via `rp_id` / `rp_origin`; the
 //! `{Passkey → scopes}` store persists through the OS keystore (macOS Keychain via
@@ -22,6 +29,7 @@
 //! `cms.toml` in the ikigai config home + CLI flags (`--help` lists them); no env vars.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,7 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ikigai_secret::default_backend(),
     )?);
 
-    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
+    // The WebTransport certificate's SANs FOLLOW THE BIND. The browser dials the wire by the
+    // host the page came from; a cert that doesn't name it is rejected, and that failure shows
+    // up in the browser console nowhere near the config line that caused it. Derived, so the
+    // two cannot drift — with the default bind this is the same `["localhost","127.0.0.1","::1"]`
+    // that used to be written here.
+    let cert_sans = cfg.cert_sans();
+    let identity = Identity::self_signed(&cert_sans)?;
     let cert_hash = identity.certificate_chain().as_slice()[0].hash();
     let hash_hex: String = cert_hash
         .as_ref()
@@ -86,8 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    println!("ikigai reading room  →  http://localhost:{page_port}   (open this in Chrome/Edge)");
-    println!("  (webtransport on https://127.0.0.1:{port} — internal; the page connects there)");
+    // The URL to open is the RP origin: for the loopback default that is
+    // `http://localhost:{page_port}`, and behind a TLS proxy it is the proxy's origin — either
+    // way it is the origin the passkey ceremony is bound to, so it cannot drift from the page.
+    println!(
+        "ikigai reading room  →  {rp_origin}   (open this in Chrome/Edge)   [bind {}]",
+        cfg.bind
+    );
+    println!("  (webtransport on port {port} — internal; the page connects there)");
+    if let Some(note) = cfg.exposure_note() {
+        println!("{note}");
+    }
     println!("source jail: {}", src_dir.display());
     println!(
         "relying party: {rp_origin} (rp_id {rp_id}){}",
@@ -97,12 +120,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  — no passkey enrolled yet; register one from the page"
         }
     );
-    println!("cert sha-256: {hash_hex}");
+    println!("cert sha-256: {hash_hex}  (SANs: {})", cert_sans.join(", "));
     // Write the cert hash where the page can fetch it, so no one pastes `#cert=` by hand.
     // The static server serving `dist/` serves this too; the page reads `cert.json` on
     // load and connects automatically. `#cert=` in the URL still overrides it.
     let dist = cfg.dist.clone();
-    let cert_json = serde_json::json!({ "cert": hash_hex, "port": port }).to_string();
+    // `host` tells the page where to dial the wire. It is `127.0.0.1` for the loopback default
+    // (the literal the page used to hard-code); it is omitted when the page is reached at some
+    // other name — behind a proxy, or on a bind that names no single address — and the page
+    // then dials its own hostname. Without this the SANs above could name the right host while
+    // the page still dialed 127.0.0.1.
+    let cert_json =
+        serde_json::json!({ "cert": hash_hex, "port": port, "host": cfg.wire_dial_host() })
+            .to_string();
     match std::fs::write(dist.join("cert.json"), cert_json) {
         Ok(()) => println!(
             "wrote {}/cert.json — open the page (served from dist/) and it connects automatically",
@@ -204,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokio::spawn(serve_http(
         dist,
-        page_port,
+        SocketAddr::new(cfg.bind, page_port),
         Arc::clone(&kernel),
         Arc::clone(&rp),
         Arc::clone(&http_auth),
@@ -290,6 +320,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // The WebTransport wire binds every interface (`with_bind_default` = `[::]` dual-stack),
+    // deliberately NOT following `bind`. The page face is the one that may sit behind a proxy;
+    // QUIC cannot be proxied by an HTTP terminator or carried by `ssh -L`, so the browser dials
+    // the wire directly and the socket has to be reachable from wherever the page is. Its own
+    // gate is not the bind: a client needs the cert hash (served by the page face) *and* a
+    // passkey. Narrowing this to `bind` would break the proxied deployment, so it is a separate
+    // decision from the page's bind rather than the same one.
     let config = ServerConfig::builder()
         .with_bind_default(port)
         .with_identity(identity)
@@ -590,16 +627,19 @@ fn ensure_session(auth: &HttpAuth, sid: Option<&str>) -> (String, Option<String>
     (id, Some(cookie))
 }
 
-/// Serve the reading room over plain HTTP on `port`, localhost only — replacing the separate
+/// Serve the reading room over plain HTTP on `addr` — replacing the separate
 /// `python3 -m http.server`. Routes: `/r/{iri}?args` resolves a resource to its fragment under
 /// the caller's session capability (the same `resolve()` the wire does — so vanilla htmx can
 /// drive the room over HTTP); `/auth/*` runs the passkey ceremony; everything else is a static
-/// file from `dist/`. `http://localhost` is a secure context, so WebTransport + the passkey
-/// ceremony work from it. One request per connection (`Connection: close`).
+/// file from `dist/`. One request per connection (`Connection: close`).
+///
+/// `addr` comes from `bind` (default `127.0.0.1`). Plain HTTP is only a secure context on
+/// loopback, and WebAuthn only runs in one, so a wider bind is legal only behind a TLS
+/// terminator — `config::check_reachable` refuses the rest before we ever get here.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http(
     dist: PathBuf,
-    port: u16,
+    addr: SocketAddr,
     kernel: Arc<Kernel>,
     rp: Arc<Rp>,
     auth: Arc<HttpAuth>,
@@ -607,11 +647,14 @@ async fn serve_http(
     entitlement: Arc<Vec<String>>,
     dev_open: bool,
 ) {
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("reading-room server: cannot bind localhost:{port}: {e}");
-            eprintln!("  (is the port already in use? set page_port in cms.toml, or --page-port)");
+            eprintln!("reading-room server: cannot bind {addr}: {e}");
+            eprintln!(
+                "  (is the port already in use? set page_port in cms.toml, or --page-port;\n   \
+                 is the address one of this host's? set bind, or --bind)"
+            );
             return;
         }
     };
@@ -1400,6 +1443,7 @@ mod tests {
     use ikigai_cms_web::session::{RecentLog, Rp};
     use ikigai_core::{ArgRef, Capability, Iri, Request, Verb};
     use ikigai_wire::Reply;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1687,7 +1731,7 @@ mod tests {
         drop(probe);
         tokio::spawn(serve_http(
             dir.path().to_path_buf(),
-            port,
+            SocketAddr::from(([127, 0, 0, 1], port)),
             Arc::new(kernel),
             Arc::new(empty_rp(dir.path())),
             Arc::new(HttpAuth::default()),

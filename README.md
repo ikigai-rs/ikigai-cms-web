@@ -50,6 +50,7 @@ overrides it for one run, and a config file that doesn't parse fails loud. Examp
 ```toml
 # ~/.config/ikigai/cms.toml
 page_port = 8090                  # the URL you open (default 8080)
+bind      = "127.0.0.1"           # where the page listens (default; see below)
 wire_port = 4434                  # internal WebTransport port (default 4433)
 src_dir   = "~/Dropbox/org-mode-files"
 bookmarks = "bookmarks-src.org"   # sub-path under src_dir
@@ -61,6 +62,44 @@ llm_provider = "mlx"              # which ~/.config/ikigai/llm.json provider the
 `wire_port` is internal (the page reads it from `cert.json`); `page_port` is the page
 URL you open. The RP origin defaults to that page origin, so the passkey can't drift
 from the URL you open.
+
+### Reaching the room from another machine
+
+`bind` is where the page listens; it defaults to `127.0.0.1`, and **moving it off
+loopback is refused unless a TLS terminator fronts the room.** That is not caution, it
+is arithmetic: `http://localhost` is a **secure context** and `http://192.168.1.20` is
+not, WebAuthn runs *only* in a secure context, so a LAN-bound room over plain HTTP has a
+passkey gate that cannot function at all — nobody can register, nobody can sign in. The
+server refuses to start rather than look healthy until the first sign-in attempt.
+
+| `bind` | `rp_origin` | |
+|---|---|---|
+| loopback | `http://localhost:{page_port}` | legal — the default, and the ssh-tunnel deployment |
+| loopback | `https://…` | legal — a TLS reverse proxy on this host |
+| non-loopback | `https://…` | legal, with a startup warning: only the proxy's origin works |
+| non-loopback | `http://…` | **refused** |
+| any | `http://<non-loopback-host>` | **refused** — that origin is not a secure context |
+
+Plus `dev_open` (which ungates the HTTP face entirely — no passkey) requires a loopback
+bind; off loopback it would serve the whole room to the network.
+
+So two arrangements actually reach the room from elsewhere, and they are not equivalent:
+
+1. **SSH tunnel — keeps your passkeys.** Leave `bind = "127.0.0.1"` and forward the page
+   port: `ssh -N -L 8080:127.0.0.1:8080 <host>`. The browser still sees
+   `http://localhost:8080`, so `rp_id`/`rp_origin` don't change and no credential is
+   disturbed. (The WebTransport wire is QUIC/UDP and does *not* ride an `ssh -L` tunnel;
+   the HTTP face serves the whole reading room on its own, just without the wire.)
+2. **Reverse proxy terminating TLS — a one-way door.** Set `rp_id` and `rp_origin` to the
+   proxy's host. ⚠ A passkey is bound to its `rp_id`: changing it **invalidates every
+   enrolled passkey**, and each must be re-enrolled against the new origin. There is no
+   migration. Choose the hostname once. (This server never terminates TLS itself.)
+
+The WebTransport certificate's SANs are **derived** from `bind` and `rp_origin` (plus
+anything `cert_sans` adds), so they cannot drift from the address the browser dials — a
+cert that doesn't name the dialed host is rejected by the browser, and that failure shows
+up nowhere near the config that caused it. The default derives exactly the
+`["localhost", "127.0.0.1", "::1"]` that used to be compiled in.
 
 The page opens a WebTransport connection to `cms-server`. **The room is gated by a
 passkey** (rung 3): the server resolves under a public ceiling until a verified passkey
