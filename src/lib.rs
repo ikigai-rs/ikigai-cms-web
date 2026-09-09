@@ -6,11 +6,11 @@
 //! query).
 //!
 //! Two faces, split by target:
-//! - **native** ([`build_cms_kernel`], the [`native`] module): the kernel — the CMS
+//! - **native** ([`build_cms_kernel`], the private `native` module): the kernel — the CMS
 //!   source files, the assembled bookmark graph (`urn:cms:graph`), SPARQL, and the
 //!   `urn:cms:view:{tag}` reading-room render. The `cms-server` bin serves it over
 //!   WebTransport.
-//! - **wasm** ([`wire_client`]): only the `ikigai-wire` codec (`encodeIssue` /
+//! - **wasm** (the `wire_client` module, wasm32 only): only the `ikigai-wire` codec (`encodeIssue` /
 //!   `decodeReply`) the browser calls to talk to that server. The kernel never runs in
 //!   the page — the browser is a thin client that resolves views over the wire.
 
