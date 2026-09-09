@@ -8,7 +8,7 @@
 //!
 //! [`keys`] is the normalizer: split the field, drop the punctuation, keep only what is actually an
 //! ISBN, and canonicalize to ISBN-13 so an export listing the 10 and a record listing the 13 still
-//! meet. Both consumers want the same thing for different reasons — [`crate::zotero`] compares
+//! meet. Both consumers want the same thing for different reasons — `crate::zotero` compares
 //! these keys against the API's, and [`crate::maintenance`] sends them to OpenLibrary as `bibkeys`.
 
 /// Every ISBN in a raw field, as canonical ISBN-13 keys. Deduped, in field order.

@@ -1,36 +1,13 @@
 name: ci
-
 on:
-  push:
-    branches: [main]
+  push: { branches: [main] }
   pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test
-      - name: clippy (server feature)
-        run: cargo clippy --features server --bin cms-server -- -D warnings
-      - name: test (server feature)
-        run: cargo test --features server
-      - name: clippy (maintenance feature)
-        run: cargo clippy --features maintenance --all-targets -- -D warnings
-      - name: test (maintenance feature)
-        run: cargo test --features maintenance
-      - name: clippy (wasm wire codec)
-        run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    with:
+      features: "server maintenance"
+      wasm-lib: true

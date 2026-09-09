@@ -26,7 +26,7 @@
 //! `#item_500` now — silently, and for approved, suggested and dismissed alike.
 //!
 //! So an overlay is keyed on the **durable** identity where one exists:
-//! `urn:zotero:item:{KEY}` from the Zotero API, which [`crate::zotero`]'s pass writes into the link
+//! `urn:zotero:item:{KEY}` from the Zotero API, which `crate::zotero`'s pass writes into the link
 //! overlay and which survives re-export. That key is storage-only; it is never what the graph sees.
 //! Three rules keep the two apart:
 //!

@@ -31,7 +31,7 @@ const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
 /// - `urn:sparql:{select,ask,describe,construct}` — SPARQL over `graph=<uri>`.
 ///
 /// The no-config form: the tag overlays come from the ikigai data home, so it errors with
-/// the same `"HOME is not set"` [`crate::config::load`] uses when there is none. Callers that
+/// the same `"HOME is not set"` `crate::config::load` uses when there is none. Callers that
 /// know where the overlays live pass them to [`build_cms_kernel_with`] and cannot fail here.
 pub fn build_cms_kernel(
     src_dir: PathBuf,
@@ -50,7 +50,7 @@ pub fn build_cms_kernel(
 /// [`build_cms_kernel`] plus lectern presentations (`urn:cms:graph:presentations`): the
 /// decks under the configured root join the graph as `cms:Presentation` resources. `None`
 /// = no decks. `bookmarks` overrides the bookmarks file sub-path (relative to the jail
-/// root); `None` uses [`DEFAULT_BOOKMARKS`]. `tags` names the overlay store the tag
+/// root); `None` uses the private `DEFAULT_BOOKMARKS`. `tags` names the overlay store the tag
 /// endpoints read and write.
 pub fn build_cms_kernel_with(
     src_dir: PathBuf,
