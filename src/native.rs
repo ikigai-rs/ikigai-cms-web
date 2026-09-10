@@ -7,13 +7,77 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, FnEndpoint, Invocation,
-    Iri, Kernel, ReprType, Representation, Request, Result, Space, UriTemplate, Verb,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, FnEndpoint,
+    Invocation, Iri, Kernel, ReprType, Representation, Request, Result, Space, UriTemplate, Verb,
 };
 
 /// The default bookmarks file, as a path within the CMS source jail (`urn:cms:src:*`,
 /// relative to the jail root). Overridable via the `bookmarks` config key / `--bookmarks`.
 const DEFAULT_BOOKMARKS: &str = "old-org/pinboard-bookmarks.org";
+
+/// The datatype IRIs the ArgSpecs name. Every by-value input declares one, so the action
+/// manifold (`urn:kernel:actions`) and `urn:kernel:validate` know each scalar's shape —
+/// `ikigai-conformance`'s ARGSPECS check holds every endpoint here to it.
+pub(crate) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+pub(crate) const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+/// An input whose value is a resource IRI (the subject a tag rides on).
+pub(crate) const RDFS_RESOURCE: &str = "http://www.w3.org/2000/01/rdf-schema#Resource";
+/// The bare media types the faces declare (`ikigai-conformance` compares outputs bare; the
+/// served type carries `;charset=utf-8`).
+pub(crate) const TURTLE: &str = "text/turtle";
+pub(crate) const HTML: &str = "text/html";
+
+/// The fs jail's scopes, declared on every resource derived from it — and on every Sink that
+/// writes a file. `cms_spaces_with` binds the jail itself (an `ikigai_fs::FileEndpoint`, which
+/// enforces `urn:cap:fs:read:*` per path), so this crate IS the host and knows the gate its
+/// graph bottoms out in. Declaring it makes the kernel's pre-dispatch floor refuse a caller
+/// holding no fs grant at the graph or the view, with a typed `Denied`, instead of the same
+/// refusal surfacing from the file read three sub-resolutions down — and it stops the manifold
+/// over-offering the room to the public (empty) ceiling. The wildcard form means "holds SOME
+/// grant under this prefix"; the per-path ACL stays the file endpoint's. The server's
+/// entitlement (`urn:cap:fs:read:<src_dir>`) satisfies the read floor; the Sinks are issued
+/// under root after the signed-in check, so nothing the room does today is refused by it.
+pub(crate) const FS_READ: &str = "urn:cap:fs:read:*";
+pub(crate) const FS_WRITE: &str = "urn:cap:fs:write:*";
+
+/// The stylesheets `urn:cms:style:{name}` serves — the closed set `stylesheet` matches on,
+/// declared as the binding's `one_of` so the manifold can enumerate them.
+const STYLE_NAMES: [&str; 7] = [
+    "catalog", "mosaic", "agenda", "tags", "recent", "types", "review",
+];
+/// The card themes a view accepts as `style=` (the index/trail/review stylesheets are not
+/// card themes — `card_style` falls back to `catalog` for anything else).
+const CARD_STYLES: [&str; 3] = ["catalog", "mosaic", "agenda"];
+/// The content kinds `cms_class` knows — the closed set a `type` scope or binding accepts.
+const KINDS: [&str; 3] = ["book", "bookmark", "presentation"];
+
+/// The by-value inputs every paged card view shares (`style`, `dir`, `offset`), declared
+/// once so the three views cannot drift from `card_style` / `dir_arg` / `page_offset`.
+fn card_view_inputs(description: Description) -> Description {
+    description
+        .input(
+            ArgSpec::new("style")
+                .summary("the card theme")
+                .class(XSD_STRING)
+                .one_of(CARD_STYLES)
+                .default_value("catalog"),
+        )
+        .input(
+            ArgSpec::new("dir")
+                .summary("sort direction by title")
+                .class(XSD_STRING)
+                .one_of(["asc", "desc"])
+                .default_value("asc"),
+        )
+        .input(
+            ArgSpec::new("offset")
+                .summary("the page start (0 = first page; a page is 60 resources)")
+                .class(XSD_INTEGER)
+                .default_value("0"),
+        )
+        .output(HTML)
+        .requires(FS_READ)
+}
 
 /// Compose the CMS kernel over `src_dir` (the jail root for `urn:cms:src:*`) and an
 /// optional Zotero library (`My Library.rdf`) whose books join the same graph.
@@ -182,7 +246,23 @@ pub fn cms_spaces_with(
     // override for user-supplied themes.
     let styles = EndpointSpace::new().bind(
         UriTemplate::parse("urn:cms:style:{name}").expect("valid template"),
-        FnEndpoint::new("cms-style", stylesheet),
+        FnEndpoint::new("cms-style", stylesheet).with_description(
+            Description::new("cms-style")
+                .summary(
+                    "A reading-room stylesheet (XSLT) by name: the three card themes \
+                     (catalog, mosaic, agenda) and the index, trail, type and review \
+                     renderers. Embedded at build time — a pure function of the name.",
+                )
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("name")
+                        .binding()
+                        .summary("the stylesheet name (the `{name}` of `urn:cms:style:{name}`)")
+                        .class(XSD_STRING)
+                        .one_of(STYLE_NAMES),
+                )
+                .output("application/xslt+xml"),
+        ),
     );
 
     #[allow(unused_mut)]
@@ -356,6 +436,8 @@ impl Endpoint for BookmarkGraph {
                  and transrepted onto the dc:subject tag axis.",
             )
             .verb(Verb::Source)
+            .output(TURTLE)
+            .requires(FS_READ)
     }
 }
 
@@ -408,11 +490,19 @@ WHERE {
 /// `xml:base` so its relative IRIs (`#item_N`) resolve when SPARQL parses it. A dedicated
 /// source (not a `FileEndpoint`) because the filename has a space and the file needs the
 /// base-injection preprocessing.
+///
+/// Cacheable under its OWN IRI as the golden thread, the convention `ikigai-fs` follows for a
+/// file it serves. Nothing cut it before: the read was `.cacheable()` with an empty thread
+/// set, so the library — and `urn:cms:graph:books`, the expensive parse derived from it, which
+/// inherits this thread — was served forever, with a re-export invisible until a restart.
+/// Declaring the thread does not add a watcher; it makes the cut POSSIBLE
+/// (`urn:kernel:cut urn:cms:src:zotero`, or a host watcher on the file), which an empty thread
+/// set never was.
 struct ZoteroSource(PathBuf);
 
 #[async_trait]
 impl Endpoint for ZoteroSource {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let text = std::fs::read_to_string(&self.0)
             .map_err(|e| Error::Endpoint(format!("read zotero library: {e}")))?;
         let based = text.replacen("<rdf:RDF", "<rdf:RDF xml:base=\"http://zotero.local/\"", 1);
@@ -420,7 +510,8 @@ impl Endpoint for ZoteroSource {
             ReprType::new("application/rdf+xml").with_param("charset", "utf-8"),
             based.into_bytes(),
         )
-        .cacheable())
+        .cacheable()
+        .depends_on(inv.request.target.as_str()))
     }
 
     fn name(&self) -> &str {
@@ -431,6 +522,11 @@ impl Endpoint for ZoteroSource {
         Description::new("urn:cms:src:zotero")
             .summary("The Zotero RDF library (My Library.rdf), base-injected for parsing.")
             .verb(Verb::Source)
+            // Zotero's own document, verbatim: its blank nodes (authors, tags) are the
+            // export's, skolemized downstream by `urn:cms:graph:books`' CONSTRUCT.
+            .output("application/rdf+xml")
+            // A file read, gated like the jail's reads.
+            .requires(FS_READ)
     }
 }
 
@@ -468,6 +564,11 @@ impl Endpoint for BooksGraph {
                 "Zotero books normalized onto the CMS axis (cms:Book, dc:title/creator/subject).",
             )
             .verb(Verb::Source)
+            .output(TURTLE)
+            // Derived from the library file. Declared here too so the kernel's floor refuses
+            // an ungranted caller BEFORE the `Err(_) => Vec::new()` above could turn that
+            // refusal into an empty, cacheable graph.
+            .requires(FS_READ)
     }
 }
 
@@ -587,6 +688,8 @@ impl Endpoint for CmsGraph {
                  dc:subject/dc:title axis. Point `urn:sparql:* graph=urn:cms:graph` at it.",
             )
             .verb(Verb::Source)
+            .output(TURTLE)
+            .requires(FS_READ)
     }
 }
 
@@ -612,6 +715,7 @@ impl Endpoint for ApprovedGraph {
         Description::new("urn:cms:graph:tags-approved")
             .summary("The human-approved tag overlay (dc:subject) merged into urn:cms:graph.")
             .verb(Verb::Source)
+            .output(TURTLE)
     }
 }
 
@@ -646,6 +750,7 @@ impl Endpoint for ZoteroLinksGraph {
                  books graph.",
             )
             .verb(Verb::Source)
+            .output(TURTLE)
     }
 }
 
@@ -670,6 +775,7 @@ impl Endpoint for SuggestionsGraph {
         Description::new("urn:cms:graph:suggestions")
             .summary("The provisional tag-suggestion overlay (cms:suggestedTag) merged into urn:cms:graph.")
             .verb(Verb::Source)
+            .output(TURTLE)
     }
 }
 
@@ -695,6 +801,7 @@ impl Endpoint for DismissedGraph {
         Description::new("urn:cms:graph:dismissed")
             .summary("The dismissed-tag overlay (cms:dismissedTag) merged into urn:cms:graph.")
             .verb(Verb::Source)
+            .output(TURTLE)
     }
 }
 
@@ -705,11 +812,64 @@ struct TagApprove {
     tags: crate::tagstore::TagPaths,
 }
 
+/// The resource a tag action acts on, held to its declared class (`rdfs:Resource`): an IRI.
+/// The overlays are Turtle files written verbatim (`<{book}> …`), and the whole
+/// `urn:cms:graph` union is parsed as one document — so a `book` that is not an IRI does not
+/// fail one call, it poisons every view until someone edits the file by hand.
+/// `ikigai-conformance` found exactly that: its ENFORCED probe ran the then-ungated Sink with
+/// `book=x`, and every later face in the walk failed to parse.
+fn book_arg(inv: &Invocation<'_>) -> Result<String> {
+    let book = inv.inline_str("book")?;
+    Iri::parse(book)
+        .map(|_| book.to_string())
+        .map_err(|e| Error::InvalidArgument {
+            name: "book".to_string(),
+            detail: format!("not an IRI: {e}"),
+        })
+}
+
+/// The tag a tag action acts on: the named `tag`, else the piped value / sink body `content`
+/// (`… | urn:cms:tag-approve book=…`) — the pipeline convention, both spellings declared.
+/// Neither present is `MissingArgument("tag")`, the named spelling.
+fn tag_arg<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
+    match inv.inline_str("tag") {
+        Err(Error::MissingArgument(_)) => inv
+            .inline_str("content")
+            .map_err(|_| Error::MissingArgument("tag".to_string())),
+        other => other,
+    }
+}
+
+/// The inputs both tag actions share: the resource, and the tag in either spelling.
+fn tag_action_inputs(description: Description) -> Description {
+    description
+        .input(
+            ArgSpec::new("book")
+                .summary("the resource IRI the tag is on")
+                .class(RDFS_RESOURCE),
+        )
+        .input(
+            ArgSpec::new("tag")
+                .summary("the tag literal; falls back to piped `content` — one of the two must be present")
+                .class(XSD_STRING)
+                .optional(),
+        )
+        .input(
+            ArgSpec::new("content")
+                .summary("the tag literal as piped content — the `… | urn:cms:tag-*` form")
+                .class(XSD_STRING)
+                .optional(),
+        )
+        .output(HTML)
+        // Rewrites an overlay file in the data home: a file write, gated as one.
+        .requires(FS_WRITE)
+}
+
 #[async_trait]
 impl Endpoint for TagApprove {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let book = inv.inline_str("book")?.to_string();
-        let tag = inv.inline_str("tag")?.to_string();
+        let book = book_arg(inv)?;
+        let tag = tag_arg(inv)?.to_string();
         self.tags.approve(&book, &tag);
         let t = html_escape(&tag);
         let html = format!(
@@ -724,11 +884,11 @@ impl Endpoint for TagApprove {
         "cms-tag-approve"
     }
     fn describe(&self) -> Description {
-        Description::new("urn:cms:tag-approve")
-            .summary("Promote a suggested tag to an approved dc:subject tag (Sink executes).")
-            .verb(Verb::Sink)
-            .input(ikigai_core::ArgSpec::new("book").summary("the resource IRI the tag is on"))
-            .input(ikigai_core::ArgSpec::new("tag").summary("the tag literal to promote"))
+        tag_action_inputs(
+            Description::new("urn:cms:tag-approve")
+                .summary("Promote a suggested tag to an approved dc:subject tag (Sink executes).")
+                .verb(Verb::Sink),
+        )
     }
 }
 
@@ -741,8 +901,8 @@ struct TagReject {
 #[async_trait]
 impl Endpoint for TagReject {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let book = inv.inline_str("book")?.to_string();
-        let tag = inv.inline_str("tag")?.to_string();
+        let book = book_arg(inv)?;
+        let tag = tag_arg(inv)?.to_string();
         self.tags.reject(&book, &tag);
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
@@ -753,11 +913,11 @@ impl Endpoint for TagReject {
         "cms-tag-reject"
     }
     fn describe(&self) -> Description {
-        Description::new("urn:cms:tag-reject")
-            .summary("Dismiss a tag suggestion (Sink executes).")
-            .verb(Verb::Sink)
-            .input(ikigai_core::ArgSpec::new("book").summary("the resource IRI the tag is on"))
-            .input(ikigai_core::ArgSpec::new("tag").summary("the tag literal to dismiss"))
+        tag_action_inputs(
+            Description::new("urn:cms:tag-reject")
+                .summary("Dismiss a tag suggestion (Sink executes).")
+                .verb(Verb::Sink),
+        )
     }
 }
 
@@ -1191,14 +1351,29 @@ impl Endpoint for TagView {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:cms:view")
-            .summary(
-                "The reading room for a tag: an htmx HTML fragment of every resource \
-                 carrying `dc:subject {tag}`, rendered as cards through a stylesheet \
-                 resource. Optional `type` arg (book|bookmark) scopes the tag to a kind. \
-                 A view is a query.",
-            )
-            .verb(Verb::Source)
+        card_view_inputs(
+            Description::new("urn:cms:view")
+                .summary(
+                    "The reading room for a tag: an htmx HTML fragment of every resource \
+                     carrying `dc:subject {tag}`, rendered as cards through a stylesheet \
+                     resource. Optional `type` arg (book|bookmark|presentation) scopes the \
+                     tag to a kind. A view is a query.",
+                )
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("tag")
+                        .binding()
+                        .summary("the tag (the `{tag}` of `urn:cms:view:{tag}`)")
+                        .class(XSD_STRING),
+                )
+                .input(
+                    ArgSpec::new("type")
+                        .summary("scope the tag to one kind; absent = every kind")
+                        .class(XSD_STRING)
+                        .one_of(KINDS)
+                        .optional(),
+                ),
+        )
     }
 }
 
@@ -1253,12 +1428,19 @@ impl Endpoint for SearchView {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:cms:search")
-            .summary(
-                "Search the room: cards for resources whose dc:title contains the `q` \
-                 term (case-insensitive), paged. A view is a query.",
-            )
-            .verb(Verb::Source)
+        card_view_inputs(
+            Description::new("urn:cms:search")
+                .summary(
+                    "Search the room: cards for resources whose dc:title contains the `q` \
+                     term (case-insensitive), paged. A view is a query.",
+                )
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("q")
+                        .summary("the title search term")
+                        .class(XSD_STRING),
+                ),
+        )
     }
 }
 
@@ -1288,6 +1470,8 @@ impl Endpoint for TagsIndex {
                  that opens its view. A view is a query.",
             )
             .verb(Verb::Source)
+            .output(HTML)
+            .requires(FS_READ)
     }
 }
 
@@ -1341,12 +1525,21 @@ impl Endpoint for TypeView {
     }
 
     fn describe(&self) -> Description {
-        Description::new("urn:cms:type")
-            .summary(
-                "Cards for resources of a kind (book | bookmark), paged. Narrow further by \
-                 tag or search. A view is a query.",
-            )
-            .verb(Verb::Source)
+        card_view_inputs(
+            Description::new("urn:cms:type")
+                .summary(
+                    "Cards for resources of a kind (book | bookmark | presentation), paged. \
+                     Narrow further by tag or search. A view is a query.",
+                )
+                .verb(Verb::Source)
+                .input(
+                    ArgSpec::new("type")
+                        .binding()
+                        .summary("the kind (the `{type}` of `urn:cms:type:{type}`)")
+                        .class(XSD_STRING)
+                        .one_of(KINDS),
+                ),
+        )
     }
 }
 
@@ -1376,10 +1569,12 @@ impl Endpoint for TypesIndex {
     fn describe(&self) -> Description {
         Description::new("urn:cms:types")
             .summary(
-                "The type index: each kind (book, bookmark) with a count, a clickable chip \
-                 that opens its type view. A view is a query.",
+                "The type index: each kind (book, bookmark, presentation) with a count, a \
+                 clickable chip that opens its type view. A view is a query.",
             )
             .verb(Verb::Source)
+            .output(HTML)
+            .requires(FS_READ)
     }
 }
 

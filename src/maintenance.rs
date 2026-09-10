@@ -602,8 +602,11 @@ impl Endpoint for LinkCheckPass {
             .verb(Verb::Source)
             .input(
                 ikigai_core::ArgSpec::new("limit")
-                    .summary("check at most N of the non-fresh URLs (a subset run)"),
+                    .summary("check at most N of the non-fresh URLs (a subset run)")
+                    .class(crate::native::XSD_INTEGER)
+                    .optional(),
             )
+            .output("text/plain")
             // It dereferences the web, so it needs a net grant (the inner urn:httpHead enforces it).
             .requires("urn:cap:net:*")
     }
@@ -1034,6 +1037,7 @@ impl Endpoint for LinkStatusView {
         Description::new("urn:cms:linkstatus")
             .summary("The room's live link-check indicator: a small HTML fragment of the run progress or the last-run tally.")
             .verb(Verb::Source)
+            .output(crate::native::HTML)
     }
 }
 
@@ -1108,6 +1112,7 @@ impl Endpoint for ReviewView {
         Description::new("urn:cms:review")
             .summary("The suggested-deletes review: the link-check removal candidates rendered as cards.")
             .verb(Verb::Source)
+            .output(crate::native::HTML)
     }
 }
 
@@ -1307,15 +1312,27 @@ impl Endpoint for PurgeView {
     }
 
     fn describe(&self) -> Description {
+        // Two verbs, two contracts: the prompt is a read anyone in the room may see, the purge
+        // is the write. Per-verb ActionSpecs, so the write scope gates the Sink alone and the
+        // Source — served all along, but undeclared until now — is on the manifold.
         Description::new(self.set.iri())
             .summary(
                 "Purge the reviewed removal set from the source file (Sink executes, Source \
                  returns the confirm prompt). Backs the file up first, then writes through the \
                  kernel so the graph re-derives.",
             )
-            .verb(Verb::Sink)
-            // It writes the bookmarks file (and its backup) through the fs resource.
-            .requires("urn:cap:fs:write:*")
+            .action(
+                ikigai_core::ActionSpec::new(Verb::Source)
+                    .summary("the confirm prompt: the set's size, with Confirm and Cancel")
+                    .output(crate::native::HTML),
+            )
+            .action(
+                ikigai_core::ActionSpec::new(Verb::Sink)
+                    .summary("execute the purge; takes no body — the set is the persisted status")
+                    .output(crate::native::HTML)
+                    // It writes the bookmarks file (and its backup) through the fs resource.
+                    .requires(crate::native::FS_WRITE),
+            )
     }
 }
 
@@ -1440,10 +1457,22 @@ pub struct LinkAction {
     pub status_path: PathBuf,
 }
 
+/// The URL a link action acts on: the named `url`, else the piped value / sink body `content`
+/// (`… | urn:cms:link-remove`) — the pipeline convention, both spellings declared. Neither
+/// present is `MissingArgument("url")`, the named spelling.
+fn url_arg<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
+    match inv.inline_str("url") {
+        Err(Error::MissingArgument(_)) => inv
+            .inline_str("content")
+            .map_err(|_| Error::MissingArgument("url".to_string())),
+        other => other,
+    }
+}
+
 #[async_trait]
 impl Endpoint for LinkAction {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        let url = inv.inline_str("url")?.to_string();
+        let url = url_arg(inv)?.to_string();
         match self.decision {
             LinkDecision::Remove => self.remove(inv, &url).await,
             LinkDecision::Keep => Ok(self.keep(&url)),
@@ -1459,23 +1488,38 @@ impl Endpoint for LinkAction {
 
     fn describe(&self) -> Description {
         let d = match self.decision {
-            LinkDecision::Remove => Description::new("urn:cms:link-remove")
-                .summary(
-                    "Strike one reviewed URL from the bookmarks file (Sink executes). Backs the \
-                     file up first, then writes through the kernel so the graph re-derives.",
-                )
-                // It writes the bookmarks file (and its backup) through the fs resource.
-                .requires("urn:cap:fs:write:*"),
-            // Keep touches only the status cache (the same std::fs file the pass itself owns and
-            // writes uncapped), never the bookmarks file — so it declares no fs grant. Declaring
-            // one it doesn't enforce would make the manifold lie in the more dangerous direction.
+            LinkDecision::Remove => Description::new("urn:cms:link-remove").summary(
+                "Strike one reviewed URL from the bookmarks file (Sink executes). Backs the \
+                 file up first, then writes through the kernel so the graph re-derives.",
+            ),
             LinkDecision::Keep => Description::new("urn:cms:link-keep").summary(
                 "Mark one URL reviewed-and-kept (Sink executes): it leaves every review bucket \
                  and every removal set, permanently, and drops to a weekly background re-check.",
             ),
         };
+        // Both write a file: Remove rewrites the bookmarks source (and its backup) through the
+        // fs resource, Keep rewrites the status cache and the dead-links worksheet on disk. The
+        // scope is enforced by the kernel's pre-dispatch floor — which is exactly what an
+        // undeclared Keep was missing: it used to declare nothing on the theory that a
+        // declaration it "doesn't enforce" would lie, but declared IS enforced, at dispatch.
         d.verb(Verb::Sink)
-            .input(ikigai_core::ArgSpec::new("url").summary("the bookmark URL to act on"))
+            .input(
+                ikigai_core::ArgSpec::new("url")
+                    .summary(
+                        "the bookmark URL to act on; falls back to piped `content` — one of the \
+                         two must be present",
+                    )
+                    .class(crate::native::XSD_STRING)
+                    .optional(),
+            )
+            .input(
+                ikigai_core::ArgSpec::new("content")
+                    .summary("the bookmark URL as piped content — the `… | urn:cms:link-*` form")
+                    .class(crate::native::XSD_STRING)
+                    .optional(),
+            )
+            .output(crate::native::HTML)
+            .requires(crate::native::FS_WRITE)
     }
 }
 
@@ -1721,9 +1765,11 @@ impl Endpoint for TagSuggestPass {
             .verb(Verb::Source)
             .input(
                 ikigai_core::ArgSpec::new("limit")
-                    .optional()
-                    .summary("check at most N untagged books this run (default 5)"),
+                    .summary("check at most N untagged books this run")
+                    .class(crate::native::XSD_INTEGER)
+                    .default_value("5"),
             )
+            .output("text/plain")
             .requires("urn:cap:net:*")
     }
 }

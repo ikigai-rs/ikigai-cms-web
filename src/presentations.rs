@@ -64,6 +64,9 @@ impl Endpoint for PresentationsGraph {
                  venue path segments, linked to the built deck. A view is a query.",
             )
             .verb(Verb::Source)
+            .output(crate::native::TURTLE)
+            // Deck files are read through `urn:cms:deck:*`, an fs jail like the sources.
+            .requires(crate::native::FS_READ)
     }
 }
 

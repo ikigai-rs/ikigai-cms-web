@@ -130,3 +130,8 @@ required-features = ["maintenance"]
 futures = "0.3"
 # A throwaway source jail for the hermetic integration test.
 tempfile = "3"
+# The module recipe as one test (tests/conformance.rs). Its floor is ikigai-core 0.1.67
+# (`Kernel::entries` lists the kernel's own operations), above the library's 0.1.58 pin — so
+# the lock resolves ONE core at 0.1.67 for the whole graph. The library's pin stays the true
+# minimum of the API it uses; a dev-dependency raises the lock, not the contract.
+ikigai-conformance = "0.1.0"

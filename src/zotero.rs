@@ -158,6 +158,13 @@ impl Endpoint for ZoteroLinkPass {
                     .class("http://www.w3.org/2001/XMLSchema#integer")
                     .default_value(DAY_SECS.to_string()),
             )
+            .output("text/plain")
+            // It sweeps the Zotero API (the inner urn:httpGet enforces the net grant) with a
+            // key read as `urn:secret:zotero-api-key` (ikigai-secret enforces the read grant).
+            // Declared, so the manifold offers the pass only to a caller holding both, and the
+            // kernel refuses one holding neither with a typed `Denied` before the first read.
+            .requires("urn:cap:net:*")
+            .requires("urn:cap:secret:read:*")
     }
 }
 
