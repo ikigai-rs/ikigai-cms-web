@@ -126,6 +126,31 @@ view (SPARQL) → CONSTRUCT (align/shape meaning) → RDF/XML → XSLT (type→c
 CONSTRUCT shapes meaning; XSLT shapes pixels; htmx delivers hypermedia; web
 components are the interactive islands (the WebGPU graph).
 
+## Conformance
+
+The kernel passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)
+(`tests/conformance.rs`): every input typed, every face declared, every Sink taking
+`content` and declaring `urn:cap:fs:write:*`, every jail-derived Source declaring
+`urn:cap:fs:read:*` — so a caller holding no fs grant is refused with a typed `Denied`
+at the view, by the kernel, not three sub-resolutions down. The only findings left are
+NAMES (the ids are full IRIs, held for the ecosystem-wide rename) and the ones inherited
+from `ikigai-fs`/`ikigai-sparql`/`ikigai-xslt`/`ikigai-cms` at their published versions.
+
+The room coins one vocabulary, **`cms:`** = `https://ikigai-rs.dev/ns/cms#`, beside
+Dublin Core Elements 1.1: the kinds `cms:Book`, `cms:Bookmark`, `cms:Presentation`;
+`cms:isbn` and `cms:kind` on a card; the overlay predicates `cms:suggestedTag`,
+`cms:dismissedTag`, `cms:zoteroItem`, `cms:zoteroAttachment`, `cms:readerUrl`. Every
+subject is a skolem IRI (`urn:cms:bookmark:{fnv}`, `urn:cms:book:{sha256}`,
+`urn:cms:presentation:{slug}`); no face emits a blank node.
+
+Caching is the room's one performance contract, and the test pins it timing-free: the
+expensive parses (`urn:cms:graph:books`, `urn:cms:graph:bookmarks`,
+`urn:cms:graph:presentations`) are cached under the golden threads of the files they
+read — a `urn:kernel:cut urn:cms:src:zotero` recomputes the books after a re-export —
+while `urn:cms:graph`, the union, is live BY DESIGN: it is where the tag overlays join.
+Joining an overlay into a cached part instead is the ~2000× regression this room once
+shipped, and it is now a red test.
+
 ## Status
 
 Rung 1 only. Native kernel library; the WebTransport server and browser front-end
