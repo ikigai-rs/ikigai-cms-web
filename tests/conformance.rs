@@ -571,9 +571,15 @@ fn the_zotero_source_is_cached_under_its_own_thread() {
 fn every_sink_declares_content_and_is_denied_without_a_grant() {
     let room = room();
     let kernel = &room.kernel;
-    let mut sinks = vec!["urn:cms:tag-approve", "urn:cms:tag-reject"];
     #[cfg(feature = "maintenance")]
-    sinks.extend(["urn:cms:link-remove", "urn:cms:link-keep"]);
+    let sinks = [
+        "urn:cms:tag-approve",
+        "urn:cms:tag-reject",
+        "urn:cms:link-remove",
+        "urn:cms:link-keep",
+    ];
+    #[cfg(not(feature = "maintenance"))]
+    let sinks = ["urn:cms:tag-approve", "urn:cms:tag-reject"];
     #[cfg(feature = "maintenance")]
     let purges = [
         "urn:cms:purge",
@@ -676,7 +682,7 @@ fn declared_outputs_are_the_media_types_served() {
     let kernel = &room.kernel;
     // (the IRI to resolve, the verb, the args; the description reached is the id's)
     type Call<'a> = (&'a str, Verb, Vec<(&'a str, &'a str)>);
-    let mut calls: Vec<Call<'_>> = vec![
+    let calls: Vec<Call<'_>> = vec![
         (ZOTERO_IRI, Verb::Source, vec![]),
         ("urn:cms:graph:bookmarks", Verb::Source, vec![]),
         ("urn:cms:graph:books", Verb::Source, vec![]),
@@ -710,7 +716,7 @@ fn declared_outputs_are_the_media_types_served() {
         ),
     ];
     #[cfg(feature = "maintenance")]
-    calls.extend([
+    let maintenance: Vec<Call<'_>> = vec![
         ("urn:cms:linkstatus", Verb::Source, vec![]),
         ("urn:cms:review", Verb::Source, vec![]),
         ("urn:cms:purge", Verb::Source, vec![]),
@@ -726,9 +732,11 @@ fn declared_outputs_are_the_media_types_served() {
             Verb::Sink,
             vec![("url", "https://nowhere.example/")],
         ),
-    ]);
+    ];
+    #[cfg(not(feature = "maintenance"))]
+    let maintenance: Vec<Call<'_>> = Vec::new();
     let mut seen = BTreeSet::new();
-    for (target, verb, args) in calls {
+    for (target, verb, args) in calls.into_iter().chain(maintenance) {
         let description = kernel
             .describe(&iri(target))
             .unwrap_or_else(|| panic!("{target} describes itself"));
