@@ -134,4 +134,4 @@ tempfile = "3"
 # (`Kernel::entries` lists the kernel's own operations), above the library's 0.1.58 pin — so
 # the lock resolves ONE core at 0.1.67 for the whole graph. The library's pin stays the true
 # minimum of the API it uses; a dev-dependency raises the lock, not the contract.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
