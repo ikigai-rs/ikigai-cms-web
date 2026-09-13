@@ -59,8 +59,11 @@ url = { version = "2", optional = true }                                   # rp_
 uuid = { version = "1", features = ["v4"], optional = true }               # user handle
 serde = { version = "1", features = ["derive"], optional = true }          # the {Passkey → scopes} store
 # rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext;
-# 0.1.1 adds require_biometric (Touch ID) to gate enrollment.
-ikigai-secret = { version = "0.1.1", optional = true }
+# 0.1.1 adds require_biometric (Touch ID) to gate enrollment; 0.1.6 is the floor because the
+# secret space became THREE enumerable endpoints there (the store plus generate and unlock)
+# and tests/conformance.rs asserts the maintenance catalog exactly — under 0.1.5 that list is
+# a different set and the walk fails.
+ikigai-secret = { version = "0.1.6", optional = true }
 # Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.6 = lenient
 # Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
 # failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.
@@ -84,7 +87,16 @@ ikigai-time = { version = "0.2.0", optional = true }
 # S3 tag suggestion: urn:llm:ask over a local Ollama (OpenAI-compat) refines the noisy OpenLibrary
 # subjects onto the user's tag vocabulary; urn:llm:ollama:up gates the pass on the LLM being up.
 # Reuses the same HttpTransport as the link-checker.
-ikigai-llm = { version = "0.7", optional = true }
+# 0.12 is a REAL floor, and the `0.7` it replaces was a CEILING: `^0.7` on a 0.x crate means
+# `>=0.7.0, <0.8.0`, so this pin could not see 0.8 through 0.12 at all and the room served the
+# 0.7 line of `urn:llm:*` for months without saying so. The floor is 0.12 because the
+# conformance walk asserts the catalog EXACTLY: 0.10.0 binds `urn:llm:{provider}:model`
+# (a fourth per-provider endpoint the walk must list) and 0.12.1 adopted ikigai-conformance,
+# which is what makes the inherited-finding partition in tests/conformance.rs true.
+# 0.11.0 also made `OpenAiConfig::default_model` an `Option` — this crate builds its registry
+# through `OpenAiConfig::ollama` / `Registry::single` / `Registry::from_json`, never a struct
+# literal, so that break does not reach here.
+ikigai-llm = { version = "0.12", optional = true }
 # Bin configuration lives in ~/.config/ikigai/cms.toml (+ CLI flags) — never env vars.
 toml = { version = "0.8", optional = true }
 

@@ -1011,14 +1011,25 @@ fn the_maintenance_kernel_conforms() {
         "httpPut",
         "httpPatch",
         "httpDelete",
-        "urn:llm:ask",
-        "urn:llm:config",
-        "urn:llm:models",
-        "urn:llm:select",
-        "urn:llm:ollama:ask",
-        "urn:llm:ollama:up",
-        "urn:llm:ollama:installed",
+        // ikigai-llm 0.9.2 made a Description id a LABEL rather than an IRI, so these
+        // are `llm-ask`, not `urn:llm:ask` — the binding IRIs are unchanged. 0.10.0
+        // added the fourth per-provider endpoint (`urn:llm:{provider}:model`), which is
+        // why the list grows by one against a dependency this crate only ever asks and
+        // probes.
+        "llm-ask",
+        "llm-config",
+        "llm-models",
+        "llm-select",
+        "llm-ollama-ask",
+        "llm-ollama-up",
+        "llm-ollama-installed",
+        "llm-ollama-model",
+        // ikigai-secret's space is three endpoints as of 0.1.6 — the store itself plus
+        // generate and unlock. Its ids are mixed: the store kept its IRI id, the two new
+        // ones are labels.
         "urn:secret",
+        "secret-generate",
+        "secret-unlock",
     ]);
     assert_findings(&report, &kernel, &ours, &inherited);
 
