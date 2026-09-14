@@ -10,7 +10,7 @@ passkey-authenticated, cap-scoped**. It reuses web-demo's proven plumbing (the
 WebTransport kernel server, the WASM wire client, the passkey ceremony) and adds a
 CMS server, the reading-room UI, and a server-verified relying party.
 
-## Rungs
+## What it composes, in three layers
 
 1. **The kernel spine** (`build_cms_kernel`) — *this crate, today.* Composes the CMS
    source files (jailed, read through the kernel), the assembled bookmark graph
@@ -102,7 +102,7 @@ up nowhere near the config that caused it. The default derives exactly the
 `["localhost", "127.0.0.1", "::1"]` that used to be compiled in.
 
 The page opens a WebTransport connection to `cms-server`. **The room is gated by a
-passkey** (rung 3): the server resolves under a public ceiling until a verified passkey
+passkey** (layer 3 above): the server resolves under a public ceiling until a verified passkey
 raises it, so on first run click **register passkey** (Touch ID) to enrol, then **sign
 in** — the WebAuthn ceremony rides over the wire as `urn:auth:*`, the server (a
 `webauthn-rs` relying party) verifies it and mints the connection's capability. After
@@ -153,5 +153,12 @@ shipped, and it is now a red test.
 
 ## Status
 
-Rung 1 only. Native kernel library; the WebTransport server and browser front-end
-land in the next rungs.
+**All three layers ship.** The kernel spine is the library; `cms-server` (the `server`
+feature) serves it over WebTransport and hosts the page; the passkey gate is a
+`webauthn-rs` relying party that raises the connection's capability ceiling.
+
+To run it you need the WASM wire codec built into `dist/` (step 1 of "Run the reading
+room"), a `cms.toml` naming `src_dir` and `dist`, and a passkey enrolled on first use.
+The page binds loopback, and moving it off loopback is refused unless a TLS terminator
+fronts the room — see "Reaching the room from another machine" for why that is
+arithmetic rather than caution.
