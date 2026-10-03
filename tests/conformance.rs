@@ -316,6 +316,21 @@ fn threads(repr: &Representation) -> BTreeSet<String> {
     repr.threads().iter().map(|t| t.to_string()).collect()
 }
 
+/// The threads an answer hangs on that are NOT an own-name thread. Since core 0.1.73 the
+/// kernel hangs every cacheable Source answer on its own canonical name's thread, and that
+/// thread propagates: a cacheable composite carries its own name AND the own names of the
+/// cacheable steps it issued (ledger #549). Those are bookkeeping, not dependencies, so
+/// `own_names` lists them (the resource and its cacheable steps) and this subtracts them;
+/// what is left is what the answer truly depends on. Before 0.1.73 the subtraction removes
+/// nothing, so one assertion holds on both sides of the change. Any other thread (an
+/// overlay, a live source) stays in the result and a caller's exact-set assertion refuses it.
+fn foreign_threads(repr: &Representation, own_names: &[&str]) -> BTreeSet<String> {
+    threads(repr)
+        .into_iter()
+        .filter(|t| !own_names.contains(&t.as_str()))
+        .collect()
+}
+
 fn no_grants() -> Capability {
     Capability::scoped(Vec::<String>::new())
 }
@@ -420,10 +435,14 @@ fn the_books_graph_stays_cached_beside_the_live_union() {
 
     let books = source(kernel, "urn:cms:graph:books");
     assert_eq!(books.expiry, Expiry::Never, "the expensive parse is cached");
+    // Own names allowed: the graph's own and its one cacheable step's (the CONSTRUCT). The
+    // library's thread is required, and nothing else may appear: an overlay or live-union
+    // thread here is the PR #71 regression.
     assert_eq!(
-        threads(&books),
+        foreign_threads(&books, &["urn:cms:graph:books", "urn:sparql:construct"]),
         BTreeSet::from([ZOTERO_IRI.to_string()]),
-        "cached under the library's thread, and nothing else's"
+        "cached under the library's thread, and nothing else's but its own names: {:?}",
+        threads(&books)
     );
     assert!(kernel.is_cached(
         &request(Verb::Source, "urn:cms:graph:books", &[]),
@@ -434,9 +453,10 @@ fn the_books_graph_stays_cached_beside_the_live_union() {
     let bookmarks = source(kernel, "urn:cms:graph:bookmarks");
     assert_eq!(bookmarks.expiry, Expiry::Never);
     assert_eq!(
-        threads(&bookmarks),
+        foreign_threads(&bookmarks, &["urn:cms:graph:bookmarks"]),
         BTreeSet::from([BOOKMARKS_IRI.to_string()]),
-        "the bookmarks graph is threaded to the org file it reads"
+        "the bookmarks graph is threaded to the org file it reads, and its own name: {:?}",
+        threads(&bookmarks)
     );
 
     let presentations = source(kernel, "urn:cms:graph:presentations");
