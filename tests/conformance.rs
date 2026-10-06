@@ -1007,6 +1007,26 @@ fn the_maintenance_kernel_conforms() {
 
     let report = suite()
         .fixture(Fixture::new("urn:secret", Verb::Source).binding("name", "conformance"))
+        // HERMETIC (ledger #762): ikigai-secret's two reserved operations end in a REAL
+        // Touch ID prompt (`require_biometric`) once their cap check passes, and the walk
+        // invokes under root. `secret-unlock` prompts outright; `secret-generate` prompts
+        // too, because the walk fills its required `into` with a sample value and `type`
+        // defaults to `ed25519`. So walking them put biometric prompts on the developer's
+        // screen and hung `cargo test` until someone answered. Nothing here can make those
+        // calls non-biometric: the prompt is not injectable and takes no backend. Both are
+        // opted out of the INVOKING checks only; their descriptions are still walked, and
+        // their gates are pinned below under no grants, where the cap check refuses before
+        // any prompt. They are ikigai-secret's to certify, not this module's.
+        .opt_out(
+            "secret-unlock",
+            Some(Verb::Source),
+            "a real Touch ID prompt under root; its gate is pinned under no grants instead",
+        )
+        .opt_out(
+            "secret-generate",
+            Some(Verb::Source),
+            "a real Touch ID prompt under root (and a minted key); gate pinned under no grants",
+        )
         // The pass kernel never has a presentations root (`maintenance_kernel` passes
         // `None`), so its presentations graph is the constant empty document: a pure
         // function of nothing, cached forever correctly. Over the SERVING kernel the same
@@ -1053,11 +1073,15 @@ fn the_maintenance_kernel_conforms() {
     ]);
     assert_findings(&report, &kernel, &ours, &inherited);
 
-    // The passes declare their gates and are refused under no grants, before any read.
+    // The passes declare their gates and are refused under no grants, before any read —
+    // and so are the two opted-out secret operations, whose cap checks run BEFORE their
+    // biometric prompts.
     for pass in [
         "urn:cms:linkcheck",
         "urn:cms:tag-suggest",
         "urn:cms:zotero-links",
+        "urn:secret:unlock",
+        "urn:secret:generate",
     ] {
         match issue(&kernel, request(Verb::Source, pass, &[]), &no_grants()) {
             Err(Error::Denied(_)) => {}
