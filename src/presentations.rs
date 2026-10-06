@@ -353,12 +353,17 @@ fn pretty_slug(deck: &Path) -> String {
         .replace(['-', '_'], " ")
 }
 
-/// Escape a value for a Turtle double-quoted string literal.
+/// Escape a value for a Turtle double-quoted string literal (`STRING_LITERAL_QUOTE`), which
+/// forbids exactly four characters raw: `"`, `\`, LF and CR. Every one is escaped; missing CR
+/// was enough to make the whole `urn:cms:graph` unparseable, and every view with it, from one deck
+/// title. Line breaks were flattened to a space before; they are escaped now, which renders the
+/// same in a card (HTML collapses the whitespace) and keeps the value intact.
 fn ttl_str(s: &str) -> String {
     let esc = s
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('\n', " ");
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     format!("\"{esc}\"")
 }
 

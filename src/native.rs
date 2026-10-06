@@ -592,15 +592,32 @@ impl Endpoint for BooksGraph {
             .with_arg("query", ArgRef::Inline(BOOK_CONSTRUCT.as_bytes().to_vec()))
             .with_arg("graph", ArgRef::Inline(b"urn:cms:src:zotero".to_vec()))
             .with_arg("as", ArgRef::Inline(b"turtle".to_vec()));
-        let turtle = match inv.issue(req).await {
-            Ok(repr) => repr.bytes,
-            Err(_) => Vec::new(), // no library / unparseable → no books
-        };
-        Ok(Representation::new(
-            ReprType::new("text/turtle").with_param("charset", "utf-8"),
-            turtle,
-        )
-        .cacheable())
+        match inv.issue(req).await {
+            Ok(repr) => Ok(Representation::new(
+                ReprType::new("text/turtle").with_param("charset", "utf-8"),
+                repr.bytes,
+            )
+            .cacheable()),
+            // A refusal is the caller's answer, never "no books" — an empty graph cached under
+            // the caller's capability would say the library is empty.
+            Err(e @ Error::Denied(_)) => Err(e),
+            // No library, or one that does not parse (a re-export caught mid-write, a file briefly
+            // absent): degrade to no books rather than fail the room. But the fallback is a
+            // COMPOSITE's answer to a failed read, and a failed sub-request records no thread —
+            // so an empty graph cached as it stood hung from nothing, and the documented cut on
+            // `urn:cms:src:zotero` could never bring the books back short of a restart. It hangs
+            // from the library's thread explicitly: the same cut that recomputes a good export
+            // recovers a bad one.
+            Err(e) => {
+                eprintln!("urn:cms:graph:books: no books this read: {e}");
+                Ok(Representation::new(
+                    ReprType::new("text/turtle").with_param("charset", "utf-8"),
+                    Vec::new(),
+                )
+                .cacheable()
+                .depends_on("urn:cms:src:zotero"))
+            }
+        }
     }
 
     fn name(&self) -> &str {
@@ -985,9 +1002,14 @@ impl Endpoint for TagReject {
     }
 }
 
-/// Escape a value riding into a SPARQL double-quoted string literal.
+/// Escape a value riding into a SPARQL double-quoted string literal (`STRING_LITERAL2`), which
+/// forbids `"`, `\`, LF and CR raw — a search for text pasted with a line break was a query
+/// syntax error.
 fn sparql_lit(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// The `cms:` class for a content-type slug (`book` | `bookmark` | `presentation`), or

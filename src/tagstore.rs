@@ -568,17 +568,27 @@ impl TagPaths {
     /// decision. Safe to run on every startup: it is idempotent and writes nothing when there is
     /// nothing to move.
     ///
-    /// The safety argument is one invariant, checked per file before anything is written:
-    /// **every entry the old file held must still reach the same resource through the new file.**
-    /// Projecting the rewritten entries and requiring that set to cover the old one proves it. It
-    /// holds by construction — `project(canonical(x))` contains `x` whenever `x` is a book the link
-    /// overlay knows, and `canonical` is the identity function on everything else — so a violation
-    /// means the link overlay changed underfoot mid-run. In that case the file is left exactly as
-    /// it was and the reason is returned; a partial rekey is the one outcome not worth having.
+    /// The safety argument is one invariant, checked for EVERY file before ANY file is written:
+    /// **what the room sees through the new file covers what it saw through the old one** —
+    /// `project(old) ⊆ project(new)`, both sides projected. It holds by construction for one
+    /// consistent identity map (`project(canonical(x)) ⊇ project(x)` for every key), so a
+    /// violation means the map is inconsistent, and then nothing is written at all.
+    ///
+    /// Both sides are projected, and that is the fix for a migration that never completed. The
+    /// first version compared the RAW old keys against the projected new ones, so an entry already
+    /// on a durable key (`urn:zotero:item:K` never equals its projection, `urn:cms:book:{sha}`) —
+    /// or one PARKED on a durable key whose book left today's export, which projects to nothing by
+    /// design — counted as lost. Every re-run of a store holding one was refused, and the refusal
+    /// came after the files earlier in the loop had already been rewritten: a partial rekey on
+    /// every startup. Now the whole run is planned first and written second.
     ///
     /// Entry *count* is deliberately not the invariant. Two duplicate books that share one Zotero
     /// item collapse their identical tags into a single stored entry — the count drops, and the
     /// projection still puts the tag on both cards. Coverage is the honest test; count is not.
+    ///
+    /// The writes themselves are atomic per file but not across files: an I/O failure partway
+    /// through the write phase (a full disk) is reported, and the files already written hold a
+    /// correct rekey — every reader projects both key forms, so a mixed store reads right.
     pub fn migrate_to_durable_keys(
         &self,
     ) -> std::result::Result<MigrationReport, MigrationRefused> {
@@ -586,7 +596,7 @@ impl TagPaths {
         // and a decision landing between the read below and the rewrite would be lost.
         let locked = crate::filelock::with_locks(
             &[&self.approved, &self.suggestions, &self.dismissed],
-            || self.migrate_locked(),
+            || self.migrate_locked(&self.identities()),
         );
         locked.unwrap_or_else(|e| {
             Err(MigrationRefused {
@@ -597,10 +607,14 @@ impl TagPaths {
         })
     }
 
-    /// [`TagPaths::migrate_to_durable_keys`] with every overlay's lock already held.
-    fn migrate_locked(&self) -> std::result::Result<MigrationReport, MigrationRefused> {
-        let ids = self.identities();
+    /// [`TagPaths::migrate_to_durable_keys`] with every overlay's lock already held: plan all three
+    /// files, refuse if any plan breaks the invariant, and only then back up and write.
+    fn migrate_locked(
+        &self,
+        ids: &Identities,
+    ) -> std::result::Result<MigrationReport, MigrationRefused> {
         let mut report = MigrationReport::default();
+        let mut writes = Vec::new();
         for (path, predicate) in [
             (&self.approved, DC_SUBJECT),
             (&self.suggestions, CMS_SUGGESTED),
@@ -631,23 +645,21 @@ impl TagPaths {
             if after == before {
                 continue; // nothing to move in this file — no backup, no write, no mtime churn
             }
-            // The invariant: does every old entry still reach its resource?
-            let reachable: Vec<Entry> = after
-                .iter()
-                .flat_map(|e| {
-                    ids.project(&e.iri)
-                        .into_iter()
-                        .map(move |iri| Entry {
+            // The invariant: everything the room saw through the old file, it sees through the new.
+            let seen = |es: &[Entry]| -> Vec<Entry> {
+                es.iter()
+                    .flat_map(|e| {
+                        ids.project(&e.iri).into_iter().map(move |iri| Entry {
                             iri,
                             tag: e.tag.clone(),
                         })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let lost: Vec<Entry> = before
-                .iter()
-                .filter(|e| !reachable.contains(e))
-                .cloned()
+                    })
+                    .collect()
+            };
+            let now_seen = seen(&after);
+            let lost: Vec<Entry> = seen(&before)
+                .into_iter()
+                .filter(|e| !now_seen.contains(e))
                 .collect();
             if !lost.is_empty() {
                 return Err(MigrationRefused {
@@ -656,8 +668,12 @@ impl TagPaths {
                     io: None,
                 });
             }
-            // Back up the pre-migration file before the first rewrite, and only then: a later run
-            // (after a link sweep matches more books) must not overwrite the original copy.
+            writes.push((path, predicate, after));
+        }
+        // Every plan holds: back up, then write. A backup is made before a file's first rewrite
+        // and only then — a later run (after a link sweep matches more books) must not overwrite
+        // the original copy.
+        for (path, predicate, after) in writes {
             let backup = path.with_extension(format!(
                 "{}{BACKUP_SUFFIX}",
                 path.extension()
@@ -753,6 +769,45 @@ mod tests {
             .collect();
         std::fs::write(&tags.zotero_links, ttl).unwrap();
         (dir, tags)
+    }
+
+    /// A refusal writes NOTHING. The invariant cannot fail for one consistent identity map, so it
+    /// is forced with an inconsistent one (B maps to K2, which maps back to no book): approved
+    /// plans a valid move, suggestions breaks the invariant — and approved, earlier in the loop,
+    /// must not have been rewritten. The first version wrote it before refusing.
+    #[test]
+    fn a_refused_migration_rewrites_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tags = TagPaths::in_dir(dir.path());
+        let mut ids = Identities::default();
+        ids.to_durable
+            .insert("urn:cms:book:A".into(), "urn:zotero:item:K1".into());
+        ids.to_current
+            .insert("urn:zotero:item:K1".into(), vec!["urn:cms:book:A".into()]);
+        ids.to_durable
+            .insert("urn:cms:book:B".into(), "urn:zotero:item:K2".into());
+        let approved = format!("<urn:cms:book:A> <{DC_SUBJECT}> \"rust\" .\n");
+        let suggestions = format!("<urn:cms:book:B> <{CMS_SUGGESTED}> \"wasm\" .\n");
+        std::fs::write(&tags.approved, &approved).unwrap();
+        std::fs::write(&tags.suggestions, &suggestions).unwrap();
+
+        let refused = tags
+            .migrate_locked(&ids)
+            .expect_err("an inconsistent map is refused");
+        assert_eq!(refused.file, tags.suggestions);
+        assert_eq!(std::fs::read_to_string(&tags.approved).unwrap(), approved);
+        assert_eq!(
+            std::fs::read_to_string(&tags.suggestions).unwrap(),
+            suggestions
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(BACKUP_SUFFIX)),
+            "no backup either: {names:?}"
+        );
     }
 
     #[test]
