@@ -115,6 +115,23 @@ async function disconnect() {
   } catch (_) {}
 }
 
+// The IRI a `/r/{iri}` path names — the same two steps as `path_iri` in src/bin/server.rs, so a
+// chip names one IRI whichever face carries it: percent-decode as a PATH (`+` stays a plus), then
+// re-escape what an IRI cannot carry raw (whitespace, controls, the characters < > " { } | \ ^
+// and the backtick, a `%` that does not begin an escape). A tag with a space goes out as `urn:cms:view:machine%20learning`, never as an
+// IRI with a space in it, which the server refuses.
+function pathIri(path) {
+  let raw;
+  try {
+    raw = decodeURIComponent(path);
+  } catch (_) {
+    raw = path; // a malformed escape: leave it for the server to judge
+  }
+  return raw.replace(/%(?![0-9A-Fa-f]{2})|[\s\x00-\x1f\x7f<>"{}|\\^`]/gu, (c) =>
+    Array.from(new TextEncoder().encode(c), (b) => "%" + b.toString(16).toUpperCase().padStart(2, "0")).join(""),
+  );
+}
+
 // Intercept htmx's `/r/` GETs when the wire is up; otherwise let htmx do its normal HTTP request.
 document.body.addEventListener("htmx:beforeRequest", (evt) => {
   if (!ready) return;
@@ -131,7 +148,7 @@ document.body.addEventListener("htmx:beforeRequest", (evt) => {
     else for (const k of Object.keys(p)) args[k] = p[k];
   }
   const swapStyle = (elt.getAttribute("hx-swap") || "innerHTML").split(" ")[0];
-  wireCall(encodeIssue(decodeURIComponent(iriEnc), JSON.stringify(args)))
+  wireCall(encodeIssue(pathIri(iriEnc), JSON.stringify(args)))
     .then((html) => htmx.swap(target, html, { swapStyle }))
     .catch(() => {
       // Wire failed mid-request → drop to HTTP for this request and everything after it.

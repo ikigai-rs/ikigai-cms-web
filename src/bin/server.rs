@@ -1068,7 +1068,7 @@ fn resolve_http(
 ) -> (&'static str, String, Vec<u8>) {
     let html = || "text/html; charset=utf-8".to_string();
     let (iri_enc, query) = target.split_once('?').unwrap_or((target, ""));
-    let iri = percent_decode(iri_enc);
+    let iri = path_iri(iri_enc);
     // The recency trail is a session resource, not a kernel one — render it from this
     // principal's history through the shared `recent` stylesheet, exactly as the wire does.
     if iri == "urn:cms:recent" {
@@ -1172,6 +1172,59 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The IRI a `/r/{iri}` path names: percent-decoded as a PATH, then re-escaped where an IRI
+/// cannot carry the character raw.
+///
+/// Two rules, each one a chip that used to open nothing:
+/// - **`+` is a literal plus.** The path was decoded with FORM rules (`+` → space), so the `c++`
+///   chip (`hx-get="/r/urn:cms:view:c++"`) asked for tag `c  `. Form decoding belongs to query
+///   strings and bodies, never to a path.
+/// - **A character an IRI forbids is re-escaped**, not handed to `Iri::parse` to refuse: a tag
+///   with a space reaches us as `%20` and decodes to a space. So it goes on as
+///   `urn:cms:view:machine%20learning`, and the tag view decodes its binding back. A `%` that does
+///   not begin an escape becomes `%25` for the same reason.
+///
+/// `dist/wire.js` applies the same two steps to the same href before it sends an IRI over the
+/// wire, so a chip names one IRI whichever face carries it.
+fn path_iri(path: &str) -> String {
+    let b = path.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut raw = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                raw.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        raw.push(b[i]);
+        i += 1;
+    }
+    let raw = String::from_utf8_lossy(&raw);
+    let mut out = String::with_capacity(raw.len());
+    let chars: Vec<char> = raw.chars().collect();
+    for (j, &c) in chars.iter().enumerate() {
+        let begins_escape = c == '%'
+            && chars.get(j + 1).is_some_and(char::is_ascii_hexdigit)
+            && chars.get(j + 2).is_some_and(char::is_ascii_hexdigit);
+        if (c == '%' && !begins_escape)
+            || c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+        {
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Resolve an HTTP request-target to a safe relative path under `dist/`: strip the query,
@@ -1345,8 +1398,13 @@ fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
 /// it needs its `q` arg. `scope` is the request's `type` arg (a tag opened inside a kind).
 fn recordable(iri: &str, scope: Option<&str>) -> Option<(String, Option<String>)> {
     if let Some(tag) = iri.strip_prefix("urn:cms:view:") {
+        // The label shows the tag itself; the IRI may carry it percent-encoded (`path_iri`).
+        let tag = ikigai_cms_web::pct_decode(tag);
+        // Every kind a tag view can be scoped to — presentations included. The list missed it,
+        // so a tag opened inside Presentations was recorded unscoped and re-opened across all
+        // kinds.
         return Some(match scope {
-            Some(kind @ ("book" | "bookmark")) => {
+            Some(kind @ ("book" | "bookmark" | "presentation")) => {
                 (format!("{kind} · #{tag}"), Some(kind.to_string()))
             }
             _ => (format!("#{tag}"), None),
@@ -1594,6 +1652,11 @@ mod privacy;
 #[cfg(test)]
 #[path = "server_tests/http_face.rs"]
 mod http_face;
+
+/// A chip opens the tag it names (`+`, a space), and the trail keeps a presentation scope.
+#[cfg(test)]
+#[path = "server_tests/chips.rs"]
+mod chips;
 
 #[cfg(test)]
 mod tests {

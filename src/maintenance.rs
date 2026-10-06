@@ -619,11 +619,7 @@ impl Endpoint for LinkCheckPass {
                 if (s.status == "ok" || kept(s)) && now.saturating_sub(s.checked_at) < WEEK_SECS)
         };
         // Optional `limit` — check at most N of the non-fresh URLs (handy for a subset run).
-        let limit = inv
-            .inline_str("limit")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(usize::MAX);
+        let limit = limit_arg(inv, usize::MAX)?;
         let to_check: Vec<&(String, String, String)> = bookmarks
             .iter()
             .filter(|(_, url, _)| !fresh(url))
@@ -703,6 +699,24 @@ impl Endpoint for LinkCheckPass {
             .output("text/plain")
             // It dereferences the web, so it needs a net grant (the inner urn:httpHead enforces it).
             .requires("urn:cap:net:*")
+    }
+}
+
+/// A pass's optional `limit`: absent is `default`, a non-negative integer is that bound, and
+/// anything else is REFUSED. A bound must refuse, not truncate: `limit=2x` (a typo for 2) used to
+/// parse as "no limit" and run the whole link-check pass — every bookmark HEAD-checked — and
+/// tag-suggest silently fell back to its default.
+fn limit_arg(inv: &Invocation<'_>, default: usize) -> Result<usize> {
+    match inv.inline_str("limit") {
+        Err(Error::MissingArgument(_)) => Ok(default),
+        Err(e) => Err(e),
+        Ok(s) => s
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::InvalidArgument {
+                name: "limit".to_string(),
+                detail: format!("`{s}` is not a non-negative integer"),
+            }),
     }
 }
 
@@ -951,9 +965,14 @@ fn merge(
         Outcome::Unreachable(r) => ("unreachable", r.clone()),
         Outcome::Refused(r) => ("refused", r.clone()),
         Outcome::NxDomain => {
+            // A domain already CONFIRMED dead stays confirmed on a further sighting, however soon
+            // it comes: more evidence never lowers a verdict. (It did: a pass within 4h of the
+            // confirming one — a restart, a manual run — re-ran the gap test against that run and
+            // demoted the link back under observation, out of the dead-domain purge set.)
             let confirmed = prev.is_some_and(|p| {
-                p.reason.contains("NXDOMAIN")
-                    && now.saturating_sub(p.checked_at) >= NXDOMAIN_CONFIRM_GAP_SECS
+                p.status == "nxdomain"
+                    || (p.reason.contains("NXDOMAIN")
+                        && now.saturating_sub(p.checked_at) >= NXDOMAIN_CONFIRM_GAP_SECS)
             });
             if confirmed {
                 (
@@ -1794,6 +1813,8 @@ pub struct TagSuggestPass {
 #[async_trait]
 impl Endpoint for TagSuggestPass {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        // A malformed bound is refused before anything is sent, the probe included.
+        let limit = limit_arg(inv, 5)?;
         // GATE (Brian's requirement): only run if the local LLM is up — otherwise no OpenLibrary
         // calls, nothing written. `urn:llm:{provider}:up` is a cheap liveness probe.
         if !llm_up(inv, &self.provider).await {
@@ -1802,11 +1823,6 @@ impl Endpoint for TagSuggestPass {
                 b"tag-suggest: skipped \xe2\x80\x94 local LLM unavailable".to_vec(),
             ));
         }
-        let limit = inv
-            .inline_str("limit")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(5);
         // Two vocabularies for the prompt: the human-CURATED tags (the approved overlay — always fed
         // as "strongly prefer", so an accepted tag steers suggestions from its first acceptance) and
         // the COMMON existing tags (top-200 by frequency, minus the curated ones already listed).
@@ -2023,16 +2039,22 @@ fn parse_llm_tags(reply: &str) -> Vec<String> {
 /// Untagged books (no tag, no pending suggestion) with the context the LLM needs — title-ordered
 /// (stable), capped at `limit`. Skipping already-suggested books makes re-runs advance, not repeat.
 async fn list_untagged_books(inv: &Invocation<'_>, limit: usize) -> Result<Vec<UntaggedBook>> {
+    // ONE ROW PER BOOK. Without the grouping a book came back once per author (and per ISBN or
+    // description variant), so a two-author book was looked up and asked about twice, got up to
+    // twice the per-book cap of suggestions, and `limit` — a count of books — was spent on rows.
     let query = format!(
         "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
          PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-         SELECT ?id ?title ?isbn ?author ?description WHERE {{ \
-           ?id a cms:Book ; dc:title ?title . \
-           OPTIONAL {{ ?id cms:isbn ?isbn }} OPTIONAL {{ ?id dc:creator ?author }} \
-           OPTIONAL {{ ?id dc:description ?description }} \
+         SELECT ?id (SAMPLE(?t) AS ?title) (SAMPLE(?i) AS ?isbn) \
+           (GROUP_CONCAT(DISTINCT ?a; separator=\"; \") AS ?author) \
+           (SAMPLE(?d) AS ?description) WHERE {{ \
+           ?id a cms:Book ; dc:title ?t . \
+           OPTIONAL {{ ?id cms:isbn ?i }} OPTIONAL {{ ?id dc:creator ?a }} \
+           OPTIONAL {{ ?id dc:description ?d }} \
            FILTER NOT EXISTS {{ ?id dc:subject ?sub }} \
            FILTER NOT EXISTS {{ ?id cms:suggestedTag ?sg }} \
-           FILTER NOT EXISTS {{ ?id cms:dismissedTag ?dt }} }} ORDER BY ?title LIMIT {limit}"
+           FILTER NOT EXISTS {{ ?id cms:dismissedTag ?dt }} }} \
+         GROUP BY ?id ORDER BY ?title LIMIT {limit}"
     );
     let request = Request::new(
         Verb::Source,
@@ -2430,6 +2452,32 @@ mod tests {
         );
 
         assert!(status_file_in(std::path::Path::new("")).is_none());
+    }
+
+    /// More evidence never lowers a verdict: a domain already CONFIRMED dead (`nxdomain`) stays
+    /// confirmed on the next sighting, even one under 4h later (a restart's pass, a manual run).
+    /// It used to re-run the gap test and drop back under observation, out of the purge set.
+    #[test]
+    fn a_confirmed_dead_domain_stays_confirmed_on_the_next_sighting() {
+        let now = 2_000_000_000;
+        let prev = Status {
+            url: "https://gone-domain.example/".into(),
+            subject: "urn:x".into(),
+            title: "t".into(),
+            status: "nxdomain".into(),
+            reason: "domain no longer resolves (NXDOMAIN, confirmed across runs)".into(),
+            checked_at: now - 3600,
+            first_broken_at: now - 10 * 86_400,
+            broken_count: 3,
+            kept_at: 0,
+        };
+        let url = "https://gone-domain.example/";
+        let next = merge(Some(&prev), "urn:x", url, "t", &Outcome::NxDomain, now);
+        assert_eq!(next.status, "nxdomain", "{}", next.reason);
+        assert_eq!(next.first_broken_at, prev.first_broken_at);
+        // Control: a FIRST sighting is still not trusted on its own.
+        let first = merge(None, "urn:x", url, "t", &Outcome::NxDomain, now);
+        assert_eq!(first.status, "unreachable");
     }
 
     /// A throwaway keystore for the maintenance kernel under test. A file backend in a fresh

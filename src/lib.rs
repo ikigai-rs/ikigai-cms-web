@@ -19,7 +19,9 @@ mod native;
 #[cfg(not(target_family = "wasm"))]
 mod presentations;
 #[cfg(not(target_family = "wasm"))]
-pub use native::{build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with};
+pub use native::{
+    build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with, pct_decode,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use presentations::Presentations;
 

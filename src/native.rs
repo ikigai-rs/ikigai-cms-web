@@ -225,7 +225,7 @@ pub fn cms_spaces_with(
     if let Some(cfg) = &presentations {
         deck_space = deck_space.bind(
             UriTemplate::parse("urn:cms:deck:{path}").expect("valid template"),
-            ikigai_fs::FileEndpoint::new(cfg.root.clone()).cacheable(),
+            DeckFiles(ikigai_fs::FileEndpoint::new(cfg.root.clone()).cacheable()),
         );
     }
     // The graph resources: bookmarks, books, and their union (what SPARQL points at).
@@ -1002,6 +1002,58 @@ impl Endpoint for TagReject {
     }
 }
 
+/// `urn:cms:deck:{path}` — the deck jail: ikigai-fs's file endpoint with its `path` binding
+/// percent-decoded first.
+///
+/// A binding is the IRI's own text, and ikigai-fs joins it onto the root verbatim. So a deck
+/// under a directory whose name an IRI cannot carry raw (`talks/my talk`, encoded as
+/// `talks/my%20talk` by `presentations::deck_source`) named a file that does not exist, and the
+/// deck silently vanished from the room. Decoding happens before the jail checks, so they judge
+/// the real path. Everything else — the description, the cache thread (the request's own IRI), the
+/// capability path-ACL — is the inner endpoint's, unchanged.
+struct DeckFiles(ikigai_fs::FileEndpoint);
+
+#[async_trait]
+impl Endpoint for DeckFiles {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let mut bindings = inv.bindings.clone();
+        if let Some(path) = inv.bindings.get("path") {
+            bindings.insert("path", pct_decode(path));
+        }
+        self.0.invoke(&inv.with_bindings(&bindings)).await
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.0.describe()
+    }
+}
+
+/// Percent-decode an IRI segment (`%XX` → the byte; a `%` not followed by two hex digits is kept
+/// as is). NOT form decoding: `+` is a literal `+` in an IRI, which is how a `c++` tag survives.
+/// Invalid UTF-8 after decoding is replaced, never a panic.
+pub fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Escape a value riding into a SPARQL double-quoted string literal (`STRING_LITERAL2`), which
 /// forbids `"`, `\`, LF and CR raw — a search for text pasted with a line break was a query
 /// syntax error.
@@ -1392,7 +1444,9 @@ impl Endpoint for TagView {
             .bindings
             .get("tag")
             .ok_or_else(|| Error::MissingArgument("tag".to_string()))?;
-        let safe = sparql_lit(tag);
+        // The binding is the IRI's own text, so a tag an IRI cannot carry raw arrives
+        // percent-encoded (`machine%20learning`); the graph holds the tag itself.
+        let safe = sparql_lit(&pct_decode(tag));
         // Optional `type` scope: a tag click inside a type view stays within that kind.
         // Resolved through `cms_class` (the shared map), so the filter can never disagree
         // with the header the browser shows. An unknown/absent type → no filter (all kinds).

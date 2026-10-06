@@ -161,7 +161,12 @@ impl CmsConfig {
         if !origin_is_local || self.bind.is_unspecified() {
             return None;
         }
-        Some(self.bind.to_string())
+        // The page splices this into `https://${host}:${port}`, so an IPv6 literal is bracketed
+        // as a URL host must be: `https://::1:4433` is not a URL, and the wire never connected.
+        Some(match self.bind {
+            IpAddr::V6(v6) => format!("[{v6}]"),
+            IpAddr::V4(v4) => v4.to_string(),
+        })
     }
 
     /// A startup warning for the one legal arrangement that still has a sharp edge: a
@@ -556,8 +561,16 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         Some(s) => parse_bind(s)?,
         None => IpAddr::V4(Ipv4Addr::LOCALHOST),
     };
+    // One trailing `/` is accepted and dropped: it is how `Url` itself serializes an origin
+    // (`http://localhost:8080/`), so it is what a user copying one writes, and refusing it stopped
+    // every bin — the maintenance passes included, which never use the origin. Anything more is
+    // still a path, and still refused by `parse_origin`.
     let rp_origin = raw
         .rp_origin
+        .map(|o| match o.strip_suffix('/') {
+            Some(bare) if bare.contains("://") && !bare.ends_with('/') => bare.to_string(),
+            _ => o,
+        })
         .unwrap_or_else(|| format!("http://localhost:{page_port}"));
     let dev_open = raw.dev_open.unwrap_or(false);
     // Where the room is reachable and where the passkey ceremony can run are one decision, not
@@ -668,6 +681,47 @@ mod tests {
     /// test below was written against.
     fn load_args(home: &Path, args: &[&str]) -> Result<CmsConfig, String> {
         load_with_home(None, home, args.iter().map(|s| s.to_string()))
+    }
+
+    /// An IPv6 loopback bind is legal, so the host it puts in `cert.json` must be one the page
+    /// can splice into `https://${host}:${port}` and get a URL — bracketed. Unbracketed, the
+    /// wire never connected.
+    #[test]
+    fn an_ipv6_bind_yields_a_dialable_wire_host() {
+        let home = fake_home();
+        let cfg = load_args(home.path(), &["--bind", "::1"]).expect("::1 + the default origin");
+        let host = cfg
+            .wire_dial_host()
+            .expect("a loopback origin + a specific bind");
+        assert_eq!(host, "[::1]");
+        // The WHATWG parser `new WebTransport(url)` uses is the one the `url` crate implements.
+        #[cfg(feature = "server")]
+        {
+            let dial = format!("https://{host}:{}", cfg.wire_port);
+            assert!(url::Url::parse(&dial).is_ok(), "{dial}");
+        }
+    }
+
+    /// One trailing `/` is how `Url` serializes an origin, so it loads (and is dropped, so every
+    /// comparison sees the bare origin); a real path is still refused.
+    #[test]
+    fn an_origin_with_a_trailing_slash_loads_and_a_path_does_not() {
+        let home = fake_home();
+        let dir = home.path().join(".config/ikigai");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cms.toml"),
+            "rp_origin = \"http://localhost:8080/\"\n",
+        )
+        .unwrap();
+        let cfg = load_args(home.path(), &[]).expect("a trailing slash loads");
+        assert_eq!(cfg.rp_origin, "http://localhost:8080");
+        for bad in ["http://localhost:8080/room", "http://localhost:8080//"] {
+            assert!(
+                load_args(home.path(), &["--rp-origin", bad]).is_err(),
+                "{bad} is a path, not an origin"
+            );
+        }
     }
 
     #[test]
