@@ -28,6 +28,7 @@
 //! Run: `cargo run --features server --bin cms-server` — configured by
 //! `cms.toml` in the ikigai config home + CLI flags (`--help` lists them); no env vars.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -232,6 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if dev_open {
         println!("HTTP resolve face: /r/{{iri}} — DEV-OPEN (ungated; localhost only)");
     }
+    // The origin the page face answers for: a request naming any other Host, or carrying a
+    // foreign Origin, is refused before it is routed (DNS rebinding; cross-site POSTs).
+    let page_origin = Arc::new(PageOrigin::parse(&rp_origin)?);
     tokio::spawn(serve_http(
         dist,
         SocketAddr::new(cfg.bind, page_port),
@@ -240,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&http_auth),
         Arc::clone(&recent),
         Arc::clone(&entitlement),
+        page_origin,
         dev_open,
     ));
 
@@ -380,17 +385,21 @@ struct HttpAuth {
     sessions: Mutex<HashMap<String, HttpSession>>,
 }
 
-/// The three things we need off a request line + headers: the method, the target, the cookie
-/// jar, and the body length. Everything else is ignored.
+/// What we need off a request line + headers: the method, the target, the cookie jar, the body
+/// length, and the `Host` and `Origin` the request claims. Everything else is ignored.
 struct ReqHead {
     method: String,
     target: String,
     cookies: HashMap<String, String>,
     content_length: usize,
+    /// The `Host` header, if sent: checked against the page origin (DNS rebinding).
+    host: Option<String>,
+    /// The `Origin` header, if sent: must name the same origin as `Host` (cross-site requests).
+    origin: Option<String>,
 }
 
 /// Parse the request head (everything before the blank line) into a [`ReqHead`]. Header names
-/// are matched case-insensitively; only `Cookie` and `Content-Length` are read.
+/// are matched case-insensitively; only `Cookie`, `Content-Length`, `Host` and `Origin` are read.
 fn parse_head(head: &str) -> ReqHead {
     let mut lines = head.lines();
     let first = lines.next().unwrap_or("");
@@ -399,6 +408,7 @@ fn parse_head(head: &str) -> ReqHead {
     let target = parts.next().unwrap_or("/").to_string();
     let mut cookies = HashMap::new();
     let mut content_length = 0usize;
+    let (mut host, mut origin) = (None, None);
     for line in lines {
         if let Some(v) = header_val(line, "cookie") {
             for kv in v.split(';') {
@@ -408,6 +418,10 @@ fn parse_head(head: &str) -> ReqHead {
             }
         } else if let Some(v) = header_val(line, "content-length") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = header_val(line, "host") {
+            host = Some(v.to_string());
+        } else if let Some(v) = header_val(line, "origin") {
+            origin = Some(v.to_string());
         }
     }
     ReqHead {
@@ -415,7 +429,95 @@ fn parse_head(head: &str) -> ReqHead {
         target,
         cookies,
         content_length,
+        host,
+        origin,
     }
+}
+
+/// The origin the page face is served at (`rp_origin`), and the one question it answers: may a
+/// request claiming this `Host` and this `Origin` be served?
+///
+/// - **Host** must name the configured origin's host and port. When that origin is a loopback
+///   one, any loopback name on any port is admitted as well: an ssh tunnel may remap the port,
+///   and DNS rebinding — the attack this check exists for — can only ever put the ATTACKER'S
+///   name in `Host`, never `localhost` or `127.0.0.1`. A request with no `Host` is refused
+///   (HTTP/1.1 requires one, and every browser sends it).
+/// - **Origin**, when a browser sends one, must be the very origin `Host` names: a page on
+///   another origin — another port on localhost included, which `SameSite` counts as the same
+///   site — cannot POST into the room. A request without `Origin` (a navigation, curl) passes;
+///   the session cookie's `SameSite=Strict` already keeps it out of cross-site requests.
+struct PageOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    loopback: bool,
+}
+
+impl PageOrigin {
+    fn parse(rp_origin: &str) -> Result<Self, String> {
+        let url = url::Url::parse(rp_origin).map_err(|e| format!("bad rp_origin: {e}"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| format!("rp_origin {rp_origin} names no host"))?
+            .to_ascii_lowercase();
+        Ok(PageOrigin {
+            loopback: is_loopback_name(&host),
+            port: url.port_or_known_default(),
+            scheme: url.scheme().to_string(),
+            host,
+        })
+    }
+
+    /// `(host, port)` of an authority (`Host` header form), read with `scheme`'s default port.
+    fn authority(scheme: &str, authority: &str) -> Option<(String, Option<u16>)> {
+        if authority.is_empty()
+            || authority
+                .chars()
+                .any(|c| c.is_whitespace() || "/?#@\\".contains(c))
+        {
+            return None;
+        }
+        let url = url::Url::parse(&format!("{scheme}://{authority}")).ok()?;
+        Some((
+            url.host_str()?.to_ascii_lowercase(),
+            url.port_or_known_default(),
+        ))
+    }
+
+    fn admits(&self, host: Option<&str>, origin: Option<&str>) -> bool {
+        let Some(host) = host else { return false };
+        let Some((name, port)) = Self::authority(&self.scheme, host) else {
+            return false;
+        };
+        let named =
+            (name == self.host && port == self.port) || (self.loopback && is_loopback_name(&name));
+        if !named {
+            return false;
+        }
+        let Some(origin) = origin else { return true };
+        let Ok(url) = url::Url::parse(origin) else {
+            return false;
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return false;
+        }
+        Self::authority(url.scheme(), host)
+            == url
+                .host_str()
+                .map(|h| (h.to_ascii_lowercase(), url.port_or_known_default()))
+    }
+}
+
+/// `localhost`, `*.localhost`, or a loopback IP literal (bracketed or not).
+fn is_loopback_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    h.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The value of header `name` on `line` (`Name: value`), or `None` if it's a different header.
@@ -645,6 +747,7 @@ async fn serve_http(
     auth: Arc<HttpAuth>,
     recent: Arc<RecentLog>,
     entitlement: Arc<Vec<String>>,
+    page_origin: Arc<PageOrigin>,
     dev_open: bool,
 ) {
     let listener = match TcpListener::bind(addr).await {
@@ -667,6 +770,7 @@ async fn serve_http(
                 let auth = Arc::clone(&auth);
                 let recent = Arc::clone(&recent);
                 let entitlement = Arc::clone(&entitlement);
+                let page_origin = Arc::clone(&page_origin);
                 tokio::spawn(async move {
                     let _ = handle_http(
                         sock,
@@ -676,6 +780,7 @@ async fn serve_http(
                         &auth,
                         &recent,
                         &entitlement,
+                        &page_origin,
                         dev_open,
                     )
                     .await;
@@ -698,6 +803,7 @@ async fn handle_http(
     auth: &HttpAuth,
     recent: &RecentLog,
     entitlement: &[String],
+    page_origin: &PageOrigin,
     dev_open: bool,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
@@ -738,67 +844,77 @@ async fn handle_http(
         .split_once('?')
         .unwrap_or((req.target.as_str(), ""));
 
-    let (status, ctype, out, set_cookie) = if let Some(route) = req.target.strip_prefix("/auth/") {
-        http_auth(
-            route,
-            &req.method,
-            &body,
-            sid,
-            rp,
-            auth,
-            entitlement,
-            dev_open,
-        )
-    } else if path == "/purge" && req.method == "POST" {
-        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge");
-        (s, c, b, None)
-    } else if path == "/purge-domains" && req.method == "POST" {
-        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-domains");
-        (s, c, b, None)
-    } else if path == "/link/remove" && req.method == "POST" {
-        let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-remove", query);
-        (s, c, b, None)
-    } else if path == "/link/keep" && req.method == "POST" {
-        let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-keep", query);
-        (s, c, b, None)
-    } else if req.target == "/tag/approve" && req.method == "POST" {
-        let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-approve", &body);
-        (s, c, b, None)
-    } else if req.target == "/tag/reject" && req.method == "POST" {
-        let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-reject", &body);
-        (s, c, b, None)
-    } else if path == "/purge-unreachable" && req.method == "POST" {
-        let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-unreachable");
-        (s, c, b, None)
-    } else if let Some(target) = req.target.strip_prefix("/r/") {
-        let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
-        let (s, c, b) = resolve_http(kernel, recent, &cap, principal.as_deref(), target);
-        (s, c, b, None)
-    } else {
-        let (s, c, b) = match safe_rel(&req.target) {
-            Some(rel) => match std::fs::read(dist.join(&rel)) {
-                Ok(bytes) => ("200 OK", content_type(&rel), bytes),
-                Err(_) => (
-                    "404 Not Found",
-                    "text/plain; charset=utf-8",
-                    b"not found".to_vec(),
-                ),
-            },
-            None => (
-                "400 Bad Request",
+    let borrowed = |s, c: &'static str, b| (s, Cow::Borrowed(c), b, None);
+    let (status, ctype, out, set_cookie) =
+        if !page_origin.admits(req.host.as_deref(), req.origin.as_deref()) {
+            borrowed(
+                "403 Forbidden",
                 "text/plain; charset=utf-8",
-                b"bad path".to_vec(),
-            ),
+                b"this room answers only for its own origin".to_vec(),
+            )
+        } else if let Some(route) = req.target.strip_prefix("/auth/") {
+            let (s, c, b, k) = http_auth(
+                route,
+                &req.method,
+                &body,
+                sid,
+                rp,
+                auth,
+                entitlement,
+                dev_open,
+            );
+            (s, Cow::Borrowed(c), b, k)
+        } else if path == "/purge" && req.method == "POST" {
+            let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge");
+            borrowed(s, c, b)
+        } else if path == "/purge-domains" && req.method == "POST" {
+            let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-domains");
+            borrowed(s, c, b)
+        } else if path == "/link/remove" && req.method == "POST" {
+            let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-remove", query);
+            borrowed(s, c, b)
+        } else if path == "/link/keep" && req.method == "POST" {
+            let (s, c, b) = handle_link(kernel, auth, sid, dev_open, "urn:cms:link-keep", query);
+            borrowed(s, c, b)
+        } else if req.target == "/tag/approve" && req.method == "POST" {
+            let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-approve", &body);
+            borrowed(s, c, b)
+        } else if req.target == "/tag/reject" && req.method == "POST" {
+            let (s, c, b) = handle_tag(kernel, auth, sid, dev_open, "urn:cms:tag-reject", &body);
+            borrowed(s, c, b)
+        } else if path == "/purge-unreachable" && req.method == "POST" {
+            let (s, c, b) = handle_purge(kernel, auth, sid, dev_open, "urn:cms:purge-unreachable");
+            borrowed(s, c, b)
+        } else if let Some(target) = req.target.strip_prefix("/r/") {
+            let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
+            let (s, c, b) = resolve_http(kernel, recent, &cap, principal.as_deref(), target);
+            (s, Cow::Owned(c), b, None)
+        } else {
+            let (s, c, b) = match safe_rel(&req.target) {
+                Some(rel) => match std::fs::read(dist.join(&rel)) {
+                    Ok(bytes) => ("200 OK", content_type(&rel), bytes),
+                    Err(_) => (
+                        "404 Not Found",
+                        "text/plain; charset=utf-8",
+                        b"not found".to_vec(),
+                    ),
+                },
+                None => (
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"bad path".to_vec(),
+                ),
+            };
+            borrowed(s, c, b)
         };
-        (s, c, b, None)
-    };
 
     let cookie_line = set_cookie
         .map(|c| format!("Set-Cookie: {c}\r\n"))
         .unwrap_or_default();
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         {cookie_line}Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+         {cookie_line}Cache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\n\r\n",
         out.len()
     );
     sock.write_all(header.as_bytes()).await?;
@@ -839,7 +955,7 @@ fn handle_purge(
         Err(e) => (
             "200 OK",
             "text/html; charset=utf-8",
-            format!("<p class=\"cms-error\">purge failed: {e}</p>").into_bytes(),
+            error_fragment("p", &format!("purge failed: {e}")),
         ),
     }
 }
@@ -883,7 +999,7 @@ fn handle_link(
         Err(e) => (
             "200 OK",
             "text/html; charset=utf-8",
-            format!("<span class=\"cms-error\">link action failed: {e}</span>").into_bytes(),
+            error_fragment("span", &format!("link action failed: {e}")),
         ),
     }
 }
@@ -926,7 +1042,7 @@ fn handle_tag(
         Err(e) => (
             "200 OK",
             "text/html; charset=utf-8",
-            format!("<span class=\"cms-error\">tag action failed: {e}</span>").into_bytes(),
+            error_fragment("span", &format!("tag action failed: {e}")),
         ),
     }
 }
@@ -949,25 +1065,22 @@ fn resolve_http(
     cap: &Capability,
     principal: Option<&str>,
     target: &str,
-) -> (&'static str, &'static str, Vec<u8>) {
+) -> (&'static str, String, Vec<u8>) {
+    let html = || "text/html; charset=utf-8".to_string();
     let (iri_enc, query) = target.split_once('?').unwrap_or((target, ""));
     let iri = percent_decode(iri_enc);
     // The recency trail is a session resource, not a kernel one — render it from this
     // principal's history through the shared `recent` stylesheet, exactly as the wire does.
     if iri == "urn:cms:recent" {
         return match render_recent_html(kernel, recent, principal, cap) {
-            Ok(bytes) => ("200 OK", "text/html; charset=utf-8", bytes),
-            Err(e) => (
-                "200 OK",
-                "text/html; charset=utf-8",
-                format!("<p class=\"cms-error\">{e}</p>").into_bytes(),
-            ),
+            Ok(bytes) => ("200 OK", html(), bytes),
+            Err(e) => ("200 OK", html(), error_fragment("p", &e.to_string())),
         };
     }
     let Ok(resource) = Iri::parse(iri.clone()) else {
         return (
             "400 Bad Request",
-            "text/plain; charset=utf-8",
+            "text/plain; charset=utf-8".to_string(),
             b"bad iri".to_vec(),
         );
     };
@@ -984,14 +1097,47 @@ fn resolve_http(
     match Resolver::issue_as(kernel, request, cap) {
         Ok((repr, _)) => {
             note_recent(recent, principal, &iri, scope.as_deref());
-            ("200 OK", "text/html; charset=utf-8", repr.bytes)
+            ("200 OK", served_type(&repr.repr_type), repr.bytes)
         }
-        Err(e) => (
-            "200 OK",
-            "text/html; charset=utf-8",
-            format!("<p class=\"cms-error\">{e}</p>").into_bytes(),
-        ),
+        // The error text routinely quotes the caller's own input (a query, a stylesheet's
+        // complaint about `content`), so it is escaped: unescaped, any `/r/` URL was a script.
+        Err(e) => ("200 OK", html(), error_fragment("p", &e.to_string())),
     }
+}
+
+/// The `Content-Type` a resolved body is served as: its OWN media type, never a blanket
+/// `text/html` — a Turtle graph or a SPARQL result labeled HTML is markup the browser will run.
+/// The views are `text/html` by their own declaration, so htmx sees no change. A type carrying
+/// anything a header line cannot (a control character, non-ASCII) is served as opaque bytes.
+fn served_type(repr_type: &ReprType) -> String {
+    let canonical = repr_type.canonical();
+    if canonical.is_empty()
+        || !canonical
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_control())
+    {
+        return "application/octet-stream".to_string();
+    }
+    canonical
+}
+
+/// An inline error fragment (`<{tag} class="cms-error">…</{tag}>`) with the message escaped, so
+/// htmx swaps something visible and nothing the message quotes can become markup.
+fn error_fragment(tag: &str, message: &str) -> Vec<u8> {
+    format!(
+        "<{tag} class=\"cms-error\">{}</{tag}>",
+        escape_html(message)
+    )
+    .into_bytes()
+}
+
+/// Escape text for an HTML text node or a quoted attribute value.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Minimal percent-decoding for a URL path/query segment (`%XX` and `+`→space).
@@ -999,14 +1145,18 @@ fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
+    // Hex digits are read as BYTES: slicing the `&str` at `i + 1..i + 3` panicked when a
+    // multi-byte character followed the `%` (not a char boundary) — any unauthenticated request
+    // could kill its connection's task that way.
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     while i < b.len() {
         match b[i] {
-            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
                     i += 3;
                 }
-                Err(_) => {
+                _ => {
                     out.push(b'%');
                     i += 1;
                 }
@@ -1439,6 +1589,12 @@ fn error_reply(msg: &str) -> Reply {
 #[path = "server_tests/privacy.rs"]
 mod privacy;
 
+/// The page face's own hardening: escaped errors, honest content types, the Host/Origin check,
+/// a decoder that cannot panic, and the wire's verb refusal.
+#[cfg(test)]
+#[path = "server_tests/http_face.rs"]
+mod http_face;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1742,6 +1898,7 @@ mod tests {
             Arc::new(HttpAuth::default()),
             Arc::new(RecentLog::default()),
             Arc::new(ent),
+            Arc::new(super::PageOrigin::parse("http://localhost:8080").unwrap()),
             true, // dev-open, so /r/ resolves under the entitlement
         ));
 
@@ -1756,7 +1913,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             let mut c = s.expect("page server listening");
-            c.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            c.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
                 .await
                 .unwrap();
             let mut buf = Vec::new();

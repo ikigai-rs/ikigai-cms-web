@@ -404,10 +404,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// - **any bind + `http://<non-loopback>` origin** — refused. The stated origin is not a secure
 ///   context whatever the bind, so the ceremony could never complete there.
 ///
-/// Plus: `dev_open` needs a loopback bind. It ungates the HTTP face entirely (no passkey), so on
-/// a network-reachable bind it would serve the whole room to anyone who can route here. That one
-/// is not a WebAuthn problem — it is the same class of mistake with a worse blast radius, and it
-/// was a comment ("localhost dev only") that nothing enforced.
+/// Plus: `dev_open` needs a loopback bind AND a plain-http loopback origin. It ungates the HTTP
+/// face entirely (no passkey), so on a network-reachable bind, or behind a declared front door
+/// (an https or non-loopback origin: a proxy carrying the network to the loopback bind), it would
+/// serve the whole room to anyone who can route there. That one is not a WebAuthn problem — it
+/// is the same class of mistake with a worse blast radius, and it was a comment ("localhost dev
+/// only") that nothing enforced.
 fn check_reachable(
     bind: IpAddr,
     rp_origin: &str,
@@ -424,6 +426,18 @@ fn check_reachable(
              the network,\nso this would serve the whole reading room to anyone who can route to \
              this host.\nIt is a localhost-development switch: drop dev_open, or set \
              bind = \"127.0.0.1\"."
+        ));
+    }
+    // A loopback bind is not enough: an https origin, or a plain-http one naming another host,
+    // says something in front (a TLS proxy, a tunnel endpoint) carries the network to this
+    // loopback bind — and dev_open would hand that network the whole room with no passkey.
+    if dev_open && (scheme != "http" || !is_loopback_host(&host)) {
+        return Err(format!(
+            "dev_open with rp_origin {rp_origin}: refusing to start.\n\n\
+             dev_open ungates the HTTP face — no passkey at all — and that origin says the room \
+             is reached\nthrough something in front of this host, so it would serve the whole \
+             reading room to\neveryone that front door serves. It is a localhost-development \
+             switch: drop dev_open, or\nleave rp_origin at http://localhost:{page_port}."
         ));
     }
 
@@ -904,6 +918,37 @@ mod tests {
                 .expect("local dev")
                 .dev_open
         );
+    }
+
+    /// A loopback bind behind a declared front door (a TLS proxy origin) is the network reaching
+    /// the room through that door; `dev_open` there is the same ungated room, one hop removed.
+    #[test]
+    fn dev_open_is_refused_behind_a_declared_proxy_origin() {
+        let home = fake_home();
+        let err = load_args(
+            home.path(),
+            &[
+                "--dev-open",
+                "--rp-id",
+                "room.example.com",
+                "--rp-origin",
+                "https://room.example.com",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("dev_open"), "{err}");
+        assert!(err.contains("https://room.example.com"), "{err}");
+        // Without dev_open the same proxied arrangement stays legal.
+        load_args(
+            home.path(),
+            &[
+                "--rp-id",
+                "room.example.com",
+                "--rp-origin",
+                "https://room.example.com",
+            ],
+        )
+        .expect("a TLS proxy on this host is a legal arrangement");
     }
 
     /// An unspecified bind names no address to certify, so the page must dial its own hostname,

@@ -81,7 +81,15 @@ server refuses to start rather than look healthy until the first sign-in attempt
 | any | `http://<non-loopback-host>` | **refused** — that origin is not a secure context |
 
 Plus `dev_open` (which ungates the HTTP face entirely — no passkey) requires a loopback
-bind; off loopback it would serve the whole room to the network.
+bind AND a plain-http loopback `rp_origin`; off loopback, or behind a proxy origin, it would
+serve the whole room to the network.
+
+Whatever the arrangement, the page face answers only for its own origin: a request whose
+`Host` names another host (DNS rebinding), or whose `Origin` is not the origin its `Host`
+names (a cross-site form, another localhost port), is refused with 403 before it is routed.
+A loopback `rp_origin` admits any loopback name on any port, so a tunnel that remaps the
+port still works. Every response carries `X-Content-Type-Options: nosniff`, and `/r/` serves
+each body as its own media type (a graph is `text/turtle`, never HTML).
 
 So two arrangements actually reach the room from elsewhere, and they are not equivalent:
 
