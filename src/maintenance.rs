@@ -418,11 +418,94 @@ fn migrate(mut s: Status) -> Status {
     s
 }
 
-fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) {
+/// Write the whole cache, atomically. Private on purpose: the only caller is [`update_status`],
+/// which holds the write lock — a bare save of a copy loaded earlier is exactly how a keep made
+/// during a link-check pass was overwritten.
+fn save_status(path: &std::path::Path, cache: &HashMap<String, Status>) -> std::io::Result<()> {
     let mut list: Vec<&Status> = cache.values().collect();
     list.sort_by(|a, b| a.url.cmp(&b.url));
-    if let Ok(bytes) = serde_json::to_vec_pretty(&list) {
-        let _ = std::fs::write(path, bytes);
+    let bytes = serde_json::to_vec_pretty(&list)
+        .map_err(|e| std::io::Error::other(format!("serialize the status cache: {e}")))?;
+    crate::filelock::write_atomic(path, &bytes)
+}
+
+/// The ONE way to change the status cache: read it fresh under its write lock, let `change` edit
+/// it, write it back atomically, and regenerate the `dead-links.org` worksheet from the result —
+/// all before any other writer can read. Returns the cache as written.
+///
+/// The cache has writers in two kernels and two processes — the room's keep / remove / purge
+/// (serving kernel), the link-check pass (the server's maintenance kernel, or `cms-linkcheck`) —
+/// so every write is a merge onto what is on disk NOW, never a copy loaded earlier. The worksheet
+/// is rewritten inside the same lock so it can never describe an older cache than the one beside
+/// it.
+fn update_status(
+    path: &std::path::Path,
+    now: u64,
+    change: impl FnOnce(&mut HashMap<String, Status>),
+) -> std::io::Result<HashMap<String, Status>> {
+    crate::filelock::with_lock(path, || {
+        let mut cache = load_status(path);
+        change(&mut cache);
+        save_status(path, &cache)?;
+        write_report(path, &cache, now);
+        Ok(cache)
+    })?
+}
+
+/// What a link-check pass has learned, kept apart from the cache it was computed against, so it
+/// can be merged onto whatever the cache holds when it is written — see [`PassLedger::write`].
+struct PassLedger {
+    /// The URLs the cache held when the pass loaded it, plus every URL this pass has since
+    /// written. A URL in here that is now ABSENT from the cache was removed by someone else
+    /// mid-pass (a purge, a per-card remove) — and must stay removed.
+    known: HashSet<String>,
+    /// Each checked URL's new status, computed by [`merge`] against the pass's starting copy.
+    learned: HashMap<String, Status>,
+}
+
+impl PassLedger {
+    fn new(start: &HashMap<String, Status>) -> Self {
+        Self {
+            known: start.keys().cloned().collect(),
+            learned: HashMap::new(),
+        }
+    }
+
+    /// Merge what the pass learned onto the cache AS IT IS ON DISK, under its lock. Per entry:
+    ///
+    /// - the outcome is the pass's — the reachability evidence is what it is there to learn;
+    /// - the human's decision is the disk's: `kept_at` is never taken from the pass's copy, since a
+    ///   keep clicked while the pass ran exists only on disk (the higher of the two is kept, so a
+    ///   decision can never be lowered by this write);
+    /// - a URL the pass knew about that is now gone from disk was purged or removed meanwhile, and
+    ///   is NOT written back.
+    ///
+    /// `prune` drops the cache entries for bookmarks no longer in the file — limited to URLs this
+    /// pass knew at its start, so an entry another writer added under a newer bookmark list is
+    /// never pruned on the strength of this pass's older one.
+    fn write(
+        &mut self,
+        path: &std::path::Path,
+        now: u64,
+        prune: Option<&HashSet<&str>>,
+    ) -> std::io::Result<HashMap<String, Status>> {
+        let known = &self.known;
+        let learned = &mut self.learned;
+        let written = update_status(path, now, |disk| {
+            learned.retain(|url, _| disk.contains_key(url) || !known.contains(url));
+            for (url, status) in learned.iter() {
+                let mut entry = status.clone();
+                entry.kept_at = disk
+                    .get(url)
+                    .map_or(entry.kept_at, |d| d.kept_at.max(entry.kept_at));
+                disk.insert(url.clone(), entry);
+            }
+            if let Some(current) = prune {
+                disk.retain(|url, _| current.contains(url.as_str()) || !known.contains(url));
+            }
+        })?;
+        self.known.extend(self.learned.keys().cloned());
+        Ok(written)
     }
 }
 
@@ -522,7 +605,10 @@ impl Endpoint for LinkCheckPass {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         let now = unix_now();
         let bookmarks = list_bookmarks(inv).await?;
-        let mut cache = load_status(&self.status_path);
+        // The pass's starting copy: what `fresh` and `merge` judge against. It is never written
+        // back — what the pass learns goes through `PassLedger`, onto the cache as it is then.
+        let cache = load_status(&self.status_path);
+        let mut ledger = PassLedger::new(&cache);
 
         // A URL is skipped this run if it was ok within the week — or if the human has decided to
         // keep it, which demotes it from "re-check every run" (what broken links get) to the same
@@ -557,12 +643,21 @@ impl Endpoint for LinkCheckPass {
             },
         );
 
-        run_checks(inv, &to_check, &mut cache, &self.status_path, &meta, now).await;
-        // Drop status for bookmarks that no longer exist.
+        run_checks(
+            inv,
+            &to_check,
+            &cache,
+            &mut ledger,
+            &self.status_path,
+            &meta,
+            now,
+        )
+        .await;
+        // Drop status for bookmarks that no longer exist, in the same locked write as the rest.
         let current: HashSet<&str> = bookmarks.iter().map(|(_, u, _)| u.as_str()).collect();
-        cache.retain(|url, _| current.contains(url.as_str()));
-
-        save_status(&self.status_path, &cache);
+        let cache = ledger
+            .write(&self.status_path, now, Some(&current))
+            .map_err(|e| Error::Endpoint(format!("write the link status cache: {e}")))?;
         write_meta(
             &meta,
             &Meta {
@@ -573,7 +668,6 @@ impl Endpoint for LinkCheckPass {
                 finished_at: unix_now(),
             },
         );
-        write_report(&self.status_path, &cache, now);
         let b = buckets(&cache, now);
         let summary = Summary {
             checked: to_check.len(),
@@ -662,7 +756,8 @@ async fn list_bookmarks(inv: &Invocation<'_>) -> Result<Vec<(String, String, Str
 async fn run_checks(
     inv: &Invocation<'_>,
     items: &[&(String, String, String)],
-    cache: &mut HashMap<String, Status>,
+    cache: &HashMap<String, Status>,
+    ledger: &mut PassLedger,
     status_path: &std::path::Path,
     meta: &std::path::Path,
     now: u64,
@@ -683,7 +778,7 @@ async fn run_checks(
     while let Some((idx, outcome)) = results.next().await {
         let (subject, url, title) = items[idx];
         let entry = merge(cache.get(url), subject, url, title, &outcome, now);
-        cache.insert(url.clone(), entry);
+        ledger.learned.insert(url.clone(), entry);
         let n = done.load(Ordering::Relaxed);
         // A tiny meta write each tick keeps the heartbeat fresh (cheap); a full status checkpoint
         // only every CHECKPOINT_EVERY (the bigger write).
@@ -698,7 +793,10 @@ async fn run_checks(
             },
         );
         if n.is_multiple_of(CHECKPOINT_EVERY) {
-            save_status(status_path, cache);
+            // A checkpoint failure is not fatal: the final write retries everything learned.
+            if let Err(e) = ledger.write(status_path, now, None) {
+                eprintln!("link-check: checkpoint of the status cache failed: {e}");
+            }
         }
     }
 }
@@ -941,7 +1039,7 @@ fn age_phrase(status: &str, days: u64) -> String {
 /// purge prunes the cache, so regenerating here keeps the worksheet from lagging the removal).
 fn write_report(status_path: &std::path::Path, cache: &HashMap<String, Status>, now: u64) {
     let path = status_path.with_file_name("dead-links.org");
-    let _ = std::fs::write(path, report(&buckets(cache, now), now));
+    let _ = crate::filelock::write_atomic(&path, report(&buckets(cache, now), now).as_bytes());
 }
 
 /// The human-readable review as an org file, one section per **kind of evidence** so the worksheet
@@ -1400,36 +1498,16 @@ impl PurgeView {
                 "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
             ));
         }
-        let iri = Iri::parse(&self.bookmarks_iri)
-            .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
-        let bak = Iri::parse(&self.bak_iri)
-            .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
-        // Read the current file through the kernel, strike the matching entries.
-        let current = inv.source(&iri).await?;
-        let text = String::from_utf8_lossy(&current.bytes).into_owned();
         let refs: HashSet<&str> = removable.iter().map(String::as_str).collect();
-        let (new_text, removed) = strike(&text, &refs);
-        // Back up the old content, then write the new — the write cuts the bookmarks golden thread
-        // (BookmarkGraph depends on it), so the graph re-derives and the room refreshes live.
-        inv.issue(
-            Request::new(Verb::Sink, bak).with_arg("content", ArgRef::Inline(text.into_bytes())),
-        )
-        .await?;
-        inv.issue(
-            Request::new(Verb::Sink, iri)
-                .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
-        )
-        .await?;
+        let removed = strike_bookmarks(inv, &self.bookmarks_iri, &self.bak_iri, &refs).await?;
         // The review view + indicator read the status cache (not the graph), so drop the purged
         // URLs from it too — otherwise they'd keep showing as candidates until the next pass prunes
-        // them. Re-load in case a pass wrote it meanwhile.
-        let mut cache = load_status(&status_path);
-        cache.retain(|url, _| !removable.contains(url));
-        save_status(&status_path, &cache);
-        // Regenerate the dead-links.org worksheet from the pruned cache so it doesn't lag the room
-        // (the purge just removed these; the next scheduled pass would otherwise be the only thing
-        // to refresh the org file).
-        write_report(&status_path, &cache, now);
+        // them. A locked merge onto the cache as it is now (a pass may be writing it), which also
+        // regenerates the dead-links.org worksheet so it doesn't lag the room.
+        update_status(&status_path, now, |cache| {
+            cache.retain(|url, _| !removable.contains(url))
+        })
+        .map_err(|e| Error::Endpoint(format!("write the link status cache: {e}")))?;
         Ok(fragment(format!(
             "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
              refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
@@ -1486,7 +1564,7 @@ impl Endpoint for LinkAction {
         let url = url_arg(inv)?.to_string();
         match self.decision {
             LinkDecision::Remove => self.remove(inv, &url).await,
-            LinkDecision::Keep => Ok(self.keep(&url)),
+            LinkDecision::Keep => self.keep(&url),
         }
     }
 
@@ -1540,30 +1618,12 @@ impl LinkAction {
     /// writes nothing — an identical rewrite would cut the golden thread for no reason — but still
     /// reports success, because from the caller's side the link is gone either way.
     async fn remove(&self, inv: &Invocation<'_>, url: &str) -> Result<Representation> {
-        let iri = Iri::parse(&self.bookmarks_iri)
-            .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
-        let bak = Iri::parse(&self.bak_iri)
-            .map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
-        let current = inv.source(&iri).await?;
-        let text = String::from_utf8_lossy(&current.bytes).into_owned();
         let one: HashSet<&str> = std::iter::once(url).collect();
-        let (new_text, removed) = strike(&text, &one);
-        if removed > 0 {
-            inv.issue(
-                Request::new(Verb::Sink, bak)
-                    .with_arg("content", ArgRef::Inline(text.into_bytes())),
-            )
-            .await?;
-            inv.issue(
-                Request::new(Verb::Sink, iri)
-                    .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
-            )
-            .await?;
-        }
-        let mut cache = load_status(&self.status_path);
-        cache.remove(url);
-        save_status(&self.status_path, &cache);
-        write_report(&self.status_path, &cache, unix_now());
+        strike_bookmarks(inv, &self.bookmarks_iri, &self.bak_iri, &one).await?;
+        update_status(&self.status_path, unix_now(), |cache| {
+            cache.remove(url);
+        })
+        .map_err(|e| Error::Endpoint(format!("write the link status cache: {e}")))?;
         Ok(fragment(
             "<span class=\"cms-card-done removed\">removed</span>".to_string(),
         ))
@@ -1572,15 +1632,70 @@ impl LinkAction {
     /// Keep one URL: stamp `kept_at` in the status cache and regenerate the worksheet. A URL with no
     /// cache entry is already invisible to the review, so there is nothing to stamp and nothing to
     /// fail about — the answer is the same either way.
-    fn keep(&self, url: &str) -> Representation {
-        let mut cache = load_status(&self.status_path);
-        if let Some(s) = cache.get_mut(url) {
-            s.kept_at = unix_now();
-        }
-        save_status(&self.status_path, &cache);
-        write_report(&self.status_path, &cache, unix_now());
-        fragment("<span class=\"cms-card-done kept\">kept</span>".to_string())
+    fn keep(&self, url: &str) -> Result<Representation> {
+        let now = unix_now();
+        update_status(&self.status_path, now, |cache| {
+            if let Some(s) = cache.get_mut(url) {
+                s.kept_at = now;
+            }
+        })
+        .map_err(|e| Error::Endpoint(format!("write the link status cache: {e}")))?;
+        Ok(fragment(
+            "<span class=\"cms-card-done kept\">kept</span>".to_string(),
+        ))
     }
+}
+
+/// How many times [`strike_bookmarks`] re-reads a file that changed under it before refusing.
+const STRIKE_ATTEMPTS: usize = 3;
+
+/// Strike `urls` from the bookmarks file AS IT IS NOW and write the result back through the
+/// kernel, backing up exactly the text that was struck. Returns how many entries were struck; zero
+/// writes nothing (an identical rewrite would cut the golden thread for no reason).
+///
+/// The bookmarks file has writers outside the room — org-capture, a Dropbox sync — so this never
+/// strikes a copy read earlier: the jail is uncached (see `cms_spaces_with`), every read here is of
+/// the disk, and the file is read AGAIN immediately before the write. If the two reads differ, an
+/// edit landed in between, and writing the strike of the first would erase it; the strike is
+/// recomputed on the newer text instead (striking is by URL, so recomputing IS the merge). After
+/// [`STRIKE_ATTEMPTS`] changes in a row it refuses and writes nothing.
+///
+/// What remains is the window between the second read and the write itself — microseconds, not the
+/// unbounded window of a cached copy. An external editor holds no lock this process could share, so
+/// no protocol here can close it.
+async fn strike_bookmarks(
+    inv: &Invocation<'_>,
+    bookmarks_iri: &str,
+    bak_iri: &str,
+    urls: &HashSet<&str>,
+) -> Result<usize> {
+    let iri = Iri::parse(bookmarks_iri)
+        .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
+    let bak = Iri::parse(bak_iri).map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
+    for _ in 0..STRIKE_ATTEMPTS {
+        let text = inv.source(&iri).await?.bytes;
+        let (new_text, removed) = strike(&String::from_utf8_lossy(&text), urls);
+        if removed == 0 {
+            return Ok(0);
+        }
+        if inv.source(&iri).await?.bytes != text {
+            continue; // edited between the two reads: strike the newer text
+        }
+        // Back up the old content, then write the new — the write cuts the bookmarks golden thread
+        // (BookmarkGraph depends on it), so the graph re-derives and the room refreshes live.
+        inv.issue(Request::new(Verb::Sink, bak).with_arg("content", ArgRef::Inline(text)))
+            .await?;
+        inv.issue(
+            Request::new(Verb::Sink, iri)
+                .with_arg("content", ArgRef::Inline(new_text.into_bytes())),
+        )
+        .await?;
+        return Ok(removed);
+    }
+    Err(Error::Endpoint(format!(
+        "the bookmarks file changed {STRIKE_ATTEMPTS} times while it was being edited; nothing was \
+         written — try again"
+    )))
 }
 
 /// Remove the org entries whose bookmark URL is in `removable`: drop each matching `*`-heading and
@@ -2883,7 +2998,7 @@ mod tests {
         for s in cache.values_mut() {
             s.checked_at = stale;
         }
-        save_status(&status_path, &cache);
+        save_status(&status_path, &cache).unwrap();
         sends.store(0, Ordering::SeqCst);
         run_pass(&kernel);
         assert_eq!(sends.load(Ordering::SeqCst), 2, "both re-checked on run 3");
@@ -2968,7 +3083,7 @@ mod tests {
         let e = cache.get_mut("https://nx.example").unwrap();
         e.status = "gone".into();
         e.reason = "domain no longer resolves (NXDOMAIN, confirmed across runs)".into();
-        save_status(&status_path, &cache);
+        save_status(&status_path, &cache).unwrap();
         let reloaded = load_status(&status_path);
         assert_eq!(reloaded["https://nx.example"].status, "nxdomain");
 
@@ -3157,7 +3272,7 @@ mod tests {
         let mut observing = st("unreachable", 0, 1); // only 1 run → still under observation
         observing.url = "http://observing.example".into();
         cache.insert(observing.url.clone(), observing);
-        save_status(&status_path, &cache);
+        save_status(&status_path, &cache).unwrap();
 
         // The review view resolves through the review stylesheet (xrust) — this exercises the
         // whole pipeline (endpoint → build XML → urn:xslt:transform → urn:cms:style:review).

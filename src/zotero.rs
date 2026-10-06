@@ -601,8 +601,10 @@ fn overlay_turtle(rows: &[Row]) -> String {
     s
 }
 
+/// Replace the link overlay atomically: every tag write reads it to canonicalize its key, and a
+/// torn read there would store a decision under the wrong identity.
 fn write_overlay(path: &Path, rows: &[Row]) {
-    let _ = std::fs::write(path, overlay_turtle(rows));
+    let _ = crate::filelock::write_atomic(path, overlay_turtle(rows).as_bytes());
 }
 
 /// Turtle string-literal escaping (a URL can legally contain a quote or a backslash).

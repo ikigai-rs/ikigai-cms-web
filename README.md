@@ -160,12 +160,17 @@ subject is a skolem IRI (`urn:cms:bookmark:{fnv}`, `urn:cms:book:{sha256}`,
 `urn:cms:presentation:{slug}`); no face emits a blank node.
 
 Caching is the room's one performance contract, and the test pins it timing-free: the
-expensive parses (`urn:cms:graph:books`, `urn:cms:graph:bookmarks`,
-`urn:cms:graph:presentations`) are cached under the golden threads of the files they
-read — a `urn:kernel:cut urn:cms:src:zotero` recomputes the books after a re-export —
-while `urn:cms:graph`, the union, is live BY DESIGN: it is where the tag overlays join.
-Joining an overlay into a cached part instead is the ~2000× regression this room once
-shipped, and it is now a red test.
+expensive parses (`urn:cms:graph:books`, `urn:cms:graph:presentations`) are cached under
+the golden threads of the files they read — a `urn:kernel:cut urn:cms:src:zotero`
+recomputes the books after a re-export — while `urn:cms:graph`, the union, is live BY
+DESIGN: it is where the tag overlays join. Joining an overlay into a cached part instead
+is the ~2000× regression this room once shipped, and it is now a red test.
+
+`urn:cms:graph:bookmarks` is live too, on purpose: the bookmarks org file is written
+outside the kernel (org-capture, a Dropbox sync) and nothing watches it, so a cached copy
+was both stale and destructive (a purge struck it and wrote it back over the edit). Reading
+it fresh costs ~10 ms per read of a 2.1 MB file; a watcher that cuts `urn:cms:src:{path}`
+would earn the cache back.
 
 ## Status
 

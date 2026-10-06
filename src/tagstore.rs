@@ -269,8 +269,37 @@ fn serialize(entries: &[Entry], predicate: &str) -> String {
     s
 }
 
-fn write_entries(path: &Path, entries: &[Entry], predicate: &str) {
-    let _ = std::fs::write(path, serialize(entries, predicate));
+/// Replace an overlay file whole, atomically (temp + rename), so the room — which reads these
+/// files on every render, unlocked — never sees a torn one. Called only under [`update`]'s lock or
+/// by the migration, which holds every overlay's lock itself.
+fn write_entries(path: &Path, entries: &[Entry], predicate: &str) -> std::io::Result<()> {
+    crate::filelock::write_atomic(path, serialize(entries, predicate).as_bytes())
+}
+
+/// One locked read-modify-write of an overlay: read the file fresh under its write lock, let `f`
+/// change the entries, and write them back atomically only if they changed. Every mutation goes
+/// through here, because every overlay has several writers at once — the page server's tasks, the
+/// server's maintenance kernel (the tag-suggest pass), and the `cms-*` bins — and an unlocked
+/// whole-file rewrite loses all but one of a burst of decisions (sixteen concurrent approvals kept
+/// one or two). A failure to lock or write is logged and the decision reported as not made, never
+/// silently dropped.
+fn update<T>(path: &Path, predicate: &str, f: impl FnOnce(&mut Vec<Entry>) -> T) -> Option<T> {
+    let result = crate::filelock::with_lock(path, || {
+        let before = entries(path);
+        let mut after = before.clone();
+        let out = f(&mut after);
+        if after != before {
+            write_entries(path, &after, predicate)?;
+        }
+        Ok(out)
+    });
+    match result.and_then(|r| r) {
+        Ok(out) => Some(out),
+        Err(e) => {
+            eprintln!("tag overlay {}: write failed: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Turtle string-literal escaping (the subset a tag can contain).
@@ -344,58 +373,75 @@ impl TagPaths {
 
     /// Add a suggestion `<iri> cms:suggestedTag "tag"` (idempotent — no duplicate).
     pub fn add_suggestion(&self, iri: &str, tag: &str) {
-        let mut es = entries(&self.suggestions);
         let e = Entry {
             iri: self.canonical(iri),
             tag: tag.to_string(),
         };
-        if !es.contains(&e) {
-            es.push(e);
-            write_entries(&self.suggestions, &es, CMS_SUGGESTED);
-        }
+        update(&self.suggestions, CMS_SUGGESTED, |es| {
+            if !es.contains(&e) {
+                es.push(e);
+            }
+        });
     }
 
     /// Promote a suggestion to a real tag: drop it from suggestions, add `<iri> dc:subject "tag"`
     /// to the approved overlay (idempotent). Returns false if the suggestion wasn't present.
+    ///
+    /// Two files, two locked steps, approved FIRST: the decision lands before the pending chip
+    /// leaves, so a failure between the two leaves a tag both approved and still offered (the
+    /// next `+` is a no-op), never one that is neither. The locks are taken one at a time, never
+    /// nested, so no lock order can deadlock against another writer.
     pub fn approve(&self, iri: &str, tag: &str) -> bool {
         let (target, raw) = self.targets(iri, tag);
-        let mut sug = entries(&self.suggestions);
-        let had = sug.contains(&target) || sug.contains(&raw);
-        sug.retain(|e| *e != target && *e != raw);
-        write_entries(&self.suggestions, &sug, CMS_SUGGESTED);
-
-        let mut app = entries(&self.approved);
-        if !app.contains(&target) {
-            app.push(target);
-            write_entries(&self.approved, &app, DC_SUBJECT);
+        let landed = update(&self.approved, DC_SUBJECT, |app| {
+            if !app.contains(&target) {
+                app.push(target.clone());
+            }
+        });
+        if landed.is_none() {
+            return false;
         }
-        had
+        Self::drop_suggestion(&self.suggestions, &target, &raw)
     }
 
     /// Dismiss a suggestion: drop it from the suggestions overlay AND remember the dismissal, so
     /// the tag-suggest pass won't re-suggest it (and a fully-dismissed book drops out of the
     /// candidate set). Returns false if the suggestion wasn't present.
+    ///
+    /// The dismissal is recorded first, for the reason [`TagPaths::approve`] lands its tag first.
     pub fn reject(&self, iri: &str, tag: &str) -> bool {
         let (target, raw) = self.targets(iri, tag);
-        let mut sug = entries(&self.suggestions);
-        let had = sug.contains(&target) || sug.contains(&raw);
-        sug.retain(|e| *e != target && *e != raw);
-        write_entries(&self.suggestions, &sug, CMS_SUGGESTED);
-        self.dismiss(iri, tag);
-        had
+        if !self.dismiss(iri, tag) {
+            return false;
+        }
+        Self::drop_suggestion(&self.suggestions, &target, &raw)
+    }
+
+    /// Remove a pending suggestion (both key forms), under the suggestions overlay's lock. Whether
+    /// it was there is read inside the same lock, so two decisions on one chip agree on which of
+    /// them took it.
+    fn drop_suggestion(path: &Path, target: &Entry, raw: &Entry) -> bool {
+        update(path, CMS_SUGGESTED, |sug| {
+            let had = sug.contains(target) || sug.contains(raw);
+            sug.retain(|e| e != target && e != raw);
+            had
+        })
+        .unwrap_or(false)
     }
 
     /// Record that `tag` was dismissed for `iri` (idempotent) — the negative feedback signal.
-    pub fn dismiss(&self, iri: &str, tag: &str) {
-        let mut es = entries(&self.dismissed);
+    /// False only when the overlay could not be written.
+    pub fn dismiss(&self, iri: &str, tag: &str) -> bool {
         let e = Entry {
             iri: self.canonical(iri),
             tag: tag.to_string(),
         };
-        if !es.contains(&e) {
-            es.push(e);
-            write_entries(&self.dismissed, &es, CMS_DISMISSED);
-        }
+        update(&self.dismissed, CMS_DISMISSED, |es| {
+            if !es.contains(&e) {
+                es.push(e);
+            }
+        })
+        .is_some()
     }
 
     /// The entry a promote/dismiss writes, and the un-canonicalized one it also clears.
@@ -497,10 +543,15 @@ impl MigrationReport {
 pub struct MigrationRefused {
     pub file: PathBuf,
     pub lost: Vec<Entry>,
+    /// Set when the refusal is an I/O failure (a lock or a write) rather than the invariant.
+    pub io: Option<String>,
 }
 
 impl std::fmt::Display for MigrationRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(io) = &self.io {
+            return write!(f, "refusing to rewrite {}: {io}", self.file.display());
+        }
         write!(
             f,
             "refusing to rewrite {}: {} entr{} would stop reaching {} resource — left untouched",
@@ -531,6 +582,23 @@ impl TagPaths {
     pub fn migrate_to_durable_keys(
         &self,
     ) -> std::result::Result<MigrationReport, MigrationRefused> {
+        // Every overlay's write lock for the whole run: the bins run this while the server serves,
+        // and a decision landing between the read below and the rewrite would be lost.
+        let locked = crate::filelock::with_locks(
+            &[&self.approved, &self.suggestions, &self.dismissed],
+            || self.migrate_locked(),
+        );
+        locked.unwrap_or_else(|e| {
+            Err(MigrationRefused {
+                file: self.approved.clone(),
+                lost: Vec::new(),
+                io: Some(e.to_string()),
+            })
+        })
+    }
+
+    /// [`TagPaths::migrate_to_durable_keys`] with every overlay's lock already held.
+    fn migrate_locked(&self) -> std::result::Result<MigrationReport, MigrationRefused> {
         let ids = self.identities();
         let mut report = MigrationReport::default();
         for (path, predicate) in [
@@ -585,6 +653,7 @@ impl TagPaths {
                 return Err(MigrationRefused {
                     file: path.clone(),
                     lost,
+                    io: None,
                 });
             }
             // Back up the pre-migration file before the first rewrite, and only then: a later run
@@ -598,7 +667,11 @@ impl TagPaths {
             if !backup.exists() && std::fs::copy(path, &backup).is_ok() {
                 report.backups.push(backup);
             }
-            write_entries(path, &after, predicate);
+            write_entries(path, &after, predicate).map_err(|e| MigrationRefused {
+                file: path.clone(),
+                lost: Vec::new(),
+                io: Some(e.to_string()),
+            })?;
             report.rewritten.push(path.clone());
         }
         Ok(report)
@@ -801,7 +874,7 @@ mod tests {
                 tag: tag.to_string(),
             })
             .collect();
-            write_entries(path, &es, pred);
+            write_entries(path, &es, pred).unwrap();
         }
         let served_before: Vec<String> = [
             tags.approved_turtle(),
@@ -872,7 +945,8 @@ mod tests {
                 tag: "rust".into(),
             }],
             CMS_SUGGESTED,
-        );
+        )
+        .unwrap();
         assert!(
             tags.approve("urn:cms:book:aaa", "rust"),
             "the stale-keyed suggestion is found"
