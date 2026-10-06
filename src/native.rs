@@ -37,8 +37,40 @@ pub(crate) const HTML: &str = "text/html";
 /// grant under this prefix"; the per-path ACL stays the file endpoint's. The server's
 /// entitlement (`urn:cap:fs:read:<src_dir>`) satisfies the read floor; the Sinks are issued
 /// under root after the signed-in check, so nothing the room does today is refused by it.
+///
+/// The same read floor gates the resources that read a PRIVATE file with `std::fs` rather than
+/// through the jail: the four tag/link overlays, the link-check status, the review and the purge
+/// prompts. Nothing else stood in front of those, so with no declaration the public ceiling read
+/// them over `/r/`. The wildcard is the honest grain for them too — they are file reads, and the
+/// floor cannot name a path a module's own ACL would — and it is the grain every live session
+/// already holds, so gating them needs no new grant on any credential.
 pub(crate) const FS_READ: &str = "urn:cap:fs:read:*";
 pub(crate) const FS_WRITE: &str = "urn:cap:fs:write:*";
+
+/// Refuse a verb `description` does not declare, before the endpoint does anything.
+///
+/// The kernel's floor gates each DECLARED verb by that verb's `requires`; a verb with no spec has
+/// no requirement and passes the floor, and an endpoint that never looks at
+/// `inv.request.verb` then serves it as though it were the one it meant. That is how a
+/// `Source` — all the HTTP face's `/r/` ever issues — ran `urn:cms:tag-approve`'s write for a
+/// visitor holding nothing, and how an `Exists` over the wire would read an overlay its Source
+/// gates. So every endpoint the serving kernel binds calls this first, against its own
+/// description, and declarations stay the whole contract: what is not declared is not served.
+/// `Meta` never reaches `invoke` (the kernel renders the description itself).
+pub(crate) fn serves(inv: &Invocation<'_>, description: &Description) -> Result<()> {
+    let verb = inv.request.verb;
+    if description
+        .action_specs()
+        .iter()
+        .any(|spec| spec.verb == verb)
+    {
+        return Ok(());
+    }
+    Err(Error::Endpoint(format!(
+        "`{}` does not serve {verb:?}",
+        inv.request.target.as_str()
+    )))
+}
 
 /// The stylesheets `urn:cms:style:{name}` serves — the closed set `stylesheet` matches on,
 /// declared as the binding's `one_of` so the manifold can enumerate them.
@@ -412,6 +444,7 @@ struct BookmarkGraph {
 #[async_trait]
 impl Endpoint for BookmarkGraph {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let iri = Iri::parse(&self.src)
             .map_err(|e| Error::Endpoint(format!("bad bookmarks IRI: {e}")))?;
         let src = inv.source(&iri).await?;
@@ -503,6 +536,7 @@ struct ZoteroSource(PathBuf);
 #[async_trait]
 impl Endpoint for ZoteroSource {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let text = std::fs::read_to_string(&self.0)
             .map_err(|e| Error::Endpoint(format!("read zotero library: {e}")))?;
         let based = text.replacen("<rdf:RDF", "<rdf:RDF xml:base=\"http://zotero.local/\"", 1);
@@ -538,6 +572,7 @@ struct BooksGraph;
 #[async_trait]
 impl Endpoint for BooksGraph {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let construct = Iri::parse("urn:sparql:construct").expect("valid IRI");
         let req = Request::new(Verb::Source, construct)
             .with_arg("query", ArgRef::Inline(BOOK_CONSTRUCT.as_bytes().to_vec()))
@@ -580,6 +615,7 @@ struct CmsGraph;
 #[async_trait]
 impl Endpoint for CmsGraph {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let bookmarks = inv
             .issue(Request::new(
                 Verb::Source,
@@ -702,7 +738,8 @@ struct ApprovedGraph {
 
 #[async_trait]
 impl Endpoint for ApprovedGraph {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             self.tags.approved_turtle().into_bytes(),
@@ -716,6 +753,8 @@ impl Endpoint for ApprovedGraph {
             .summary("The human-approved tag overlay (dc:subject) merged into urn:cms:graph.")
             .verb(Verb::Source)
             .output(TURTLE)
+            // A private file read with std::fs: nothing but this declaration gates it.
+            .requires(FS_READ)
     }
 }
 
@@ -733,7 +772,8 @@ struct ZoteroLinksGraph {
 
 #[async_trait]
 impl Endpoint for ZoteroLinksGraph {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let turtle = std::fs::read(&self.tags.zotero_links).unwrap_or_default();
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
@@ -751,6 +791,8 @@ impl Endpoint for ZoteroLinksGraph {
             )
             .verb(Verb::Source)
             .output(TURTLE)
+            // A private file read with std::fs: nothing but this declaration gates it.
+            .requires(FS_READ)
     }
 }
 
@@ -762,7 +804,8 @@ struct SuggestionsGraph {
 
 #[async_trait]
 impl Endpoint for SuggestionsGraph {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             self.tags.suggestions_turtle().into_bytes(),
@@ -776,6 +819,8 @@ impl Endpoint for SuggestionsGraph {
             .summary("The provisional tag-suggestion overlay (cms:suggestedTag) merged into urn:cms:graph.")
             .verb(Verb::Source)
             .output(TURTLE)
+            // A private file read with std::fs: nothing but this declaration gates it.
+            .requires(FS_READ)
     }
 }
 
@@ -788,7 +833,8 @@ struct DismissedGraph {
 
 #[async_trait]
 impl Endpoint for DismissedGraph {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         Ok(Representation::new(
             ReprType::new("text/turtle").with_param("charset", "utf-8"),
             self.tags.dismissed_turtle().into_bytes(),
@@ -802,6 +848,8 @@ impl Endpoint for DismissedGraph {
             .summary("The dismissed-tag overlay (cms:dismissedTag) merged into urn:cms:graph.")
             .verb(Verb::Source)
             .output(TURTLE)
+            // A private file read with std::fs: nothing but this declaration gates it.
+            .requires(FS_READ)
     }
 }
 
@@ -868,6 +916,7 @@ fn tag_action_inputs(description: Description) -> Description {
 #[async_trait]
 impl Endpoint for TagApprove {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
         self.tags.approve(&book, &tag);
@@ -901,6 +950,7 @@ struct TagReject {
 #[async_trait]
 impl Endpoint for TagReject {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
         self.tags.reject(&book, &tag);
@@ -1301,6 +1351,7 @@ struct TagView;
 #[async_trait]
 impl Endpoint for TagView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let tag = inv
             .bindings
             .get("tag")
@@ -1385,6 +1436,7 @@ struct SearchView;
 #[async_trait]
 impl Endpoint for SearchView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let q = inv.inline_str("q").unwrap_or("").trim();
         if q.is_empty() {
             return Err(Error::MissingArgument("q".to_string()));
@@ -1452,6 +1504,7 @@ struct TagsIndex;
 #[async_trait]
 impl Endpoint for TagsIndex {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let query = "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              SELECT ?tag (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s dc:subject ?tag } \
              GROUP BY ?tag ORDER BY DESC(?n) LIMIT 200"
@@ -1482,6 +1535,7 @@ struct TypeView;
 #[async_trait]
 impl Endpoint for TypeView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         let ty = inv
             .bindings
             .get("type")
@@ -1550,6 +1604,7 @@ struct TypesIndex;
 #[async_trait]
 impl Endpoint for TypesIndex {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        serves(inv, &self.describe())?;
         // CMS content kinds only (cms:Book, cms:Bookmark) — a source's schema triples can
         // leave stray rdf:Property/rdfs:Class/owl:Ontology types in the graph.
         let query = "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \

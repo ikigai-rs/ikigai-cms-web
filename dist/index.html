@@ -93,9 +93,13 @@
   <header class="top">
     <h1>ikigai reading room</h1>
     <!-- Link-check indicator: htmx polls the status resource; shows run progress or the last-run
-         tally. Targets itself (not #room). Empty until the first pass. -->
+         tally. Targets itself (not #room). Empty until the first pass. The status is the private
+         collection's, so it is gated like the room: auth.js fires `cms:open` once a session
+         exists, and the poll runs only while the room is open (a signed-out page would otherwise
+         poll a refusal into the header every five seconds). -->
     <span id="linkcheck" class="linkcheck" hx-get="/r/urn:cms:linkstatus"
-          hx-trigger="load, every 5s" hx-target="this"></span>
+          hx-trigger="cms:open, every 5s [!document.getElementById('nav').hidden]"
+          hx-target="this"></span>
   </header>
 
   <!-- Passkey login. Shown until a session is established; auth.js runs the WebAuthn ceremony

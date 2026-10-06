@@ -41,6 +41,7 @@ pub(crate) struct PresentationsGraph {
 #[async_trait]
 impl Endpoint for PresentationsGraph {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
         let turtle = match &self.config {
             Some(cfg) => presentations_turtle(inv, &cfg.root, cfg.base_url.as_deref()).await,
             None => String::new(),

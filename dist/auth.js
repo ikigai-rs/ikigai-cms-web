@@ -30,8 +30,10 @@
     $("auth-logout").hidden = !canSignOut;
     if (open) {
       htmx.ajax("GET", "/r/urn:cms:tags", { target: "#room", swap: "innerHTML" });
+      htmx.trigger("#linkcheck", "cms:open");
     } else {
       $("room").innerHTML = "";
+      $("linkcheck").innerHTML = "";
     }
   }
 

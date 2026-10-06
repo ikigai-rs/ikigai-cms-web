@@ -1018,7 +1018,8 @@ pub struct LinkStatusView {
 
 #[async_trait]
 impl Endpoint for LinkStatusView {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
         let status_path = &self.status_path;
         let meta = read_meta(&meta_path(status_path));
         let cache = load_status(status_path);
@@ -1038,6 +1039,8 @@ impl Endpoint for LinkStatusView {
             .summary("The room's live link-check indicator: a small HTML fragment of the run progress or the last-run tally.")
             .verb(Verb::Source)
             .output(crate::native::HTML)
+            // Reads the private status cache with std::fs: nothing but this declaration gates it.
+            .requires(crate::native::FS_READ)
     }
 }
 
@@ -1082,6 +1085,7 @@ pub struct ReviewView {
 #[async_trait]
 impl Endpoint for ReviewView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
         let cache = load_status(&self.status_path);
         let now = unix_now();
         let xml = review_xml(&buckets(&cache, now), now);
@@ -1113,6 +1117,8 @@ impl Endpoint for ReviewView {
             .summary("The suggested-deletes review: the link-check removal candidates rendered as cards.")
             .verb(Verb::Source)
             .output(crate::native::HTML)
+            // Reads the private status cache with std::fs: nothing but this declaration gates it.
+            .requires(crate::native::FS_READ)
     }
 }
 
@@ -1296,6 +1302,7 @@ pub struct PurgeView {
 #[async_trait]
 impl Endpoint for PurgeView {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
         if inv.request.verb == Verb::Sink {
             self.execute(inv).await
         } else {
@@ -1312,9 +1319,10 @@ impl Endpoint for PurgeView {
     }
 
     fn describe(&self) -> Description {
-        // Two verbs, two contracts: the prompt is a read anyone in the room may see, the purge
-        // is the write. Per-verb ActionSpecs, so the write scope gates the Sink alone and the
-        // Source — served all along, but undeclared until now — is on the manifold.
+        // Two verbs, two contracts: the prompt is a read, the purge is the write. Per-verb
+        // ActionSpecs, so each verb carries its own scope — the prompt the read floor (it
+        // counts a private collection, so a signed-out visitor must not see it), the purge the
+        // write scope.
         Description::new(self.set.iri())
             .summary(
                 "Purge the reviewed removal set from the source file (Sink executes, Source \
@@ -1324,7 +1332,9 @@ impl Endpoint for PurgeView {
             .action(
                 ikigai_core::ActionSpec::new(Verb::Source)
                     .summary("the confirm prompt: the set's size, with Confirm and Cancel")
-                    .output(crate::native::HTML),
+                    .output(crate::native::HTML)
+                    // The size of a private collection's dead set, read from the status cache.
+                    .requires(crate::native::FS_READ),
             )
             .action(
                 ikigai_core::ActionSpec::new(Verb::Sink)
@@ -1472,6 +1482,7 @@ fn url_arg<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
 #[async_trait]
 impl Endpoint for LinkAction {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
         let url = url_arg(inv)?.to_string();
         match self.decision {
             LinkDecision::Remove => self.remove(inv, &url).await,
