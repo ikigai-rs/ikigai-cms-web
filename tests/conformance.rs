@@ -30,10 +30,11 @@
 //!
 //! Declared to the suite, stated once:
 //!
-//! - `cacheable` on `urn:cms:graph:bookmarks`, `urn:cms:graph:books`,
-//!   `urn:cms:graph:presentations` and `cms-style`: each marks `.cacheable()`, and the
-//!   declaration turns a sub-resolution that silently downgraded the effective expiry into
-//!   a red test. THAT is the ~2000× incident (#71): an uncacheable overlay joined into the
+//! - `cacheable` on `urn:cms:graph:books`, `urn:cms:graph:presentations` and `cms-style`:
+//!   each marks `.cacheable()`, and the declaration turns a sub-resolution that silently
+//!   downgraded the effective expiry into a red test. `urn:cms:graph:bookmarks` is NOT
+//!   declared: its org file is written outside the kernel and unwatched, so its jail is
+//!   uncached and the graph is live — a decision, measured, not a downgrade. THAT is the ~2000× incident (#71): an uncacheable overlay joined into the
 //!   books graph took a read from ~20µs to ~1.0s and 68 tests passed. The join belongs in
 //!   `urn:cms:graph`, the union that is live BY DESIGN — see
 //!   [`the_books_graph_stays_cached_beside_the_live_union`].
@@ -94,7 +95,6 @@ const FS_WRITE: &str = "urn:cap:fs:write:*";
 
 /// The bookmarks file, as a sub-path of the scratch jail (overriding the crate's default).
 const BOOKMARKS: &str = "bookmarks.org";
-const BOOKMARKS_IRI: &str = "urn:cms:src:bookmarks.org";
 const ZOTERO_IRI: &str = "urn:cms:src:zotero";
 /// A file present in BOTH jails (`urn:cms:src:*` and `urn:cms:deck:*`), because the suite
 /// applies a `file` fixture's binding to every entry that shares the id (PENDING #2).
@@ -272,7 +272,6 @@ fn suite() -> Suite {
         .pure("bookmarks")
         .pure("cms-style")
         .cacheable("cms-style")
-        .cacheable("urn:cms:graph:bookmarks")
         .cacheable("urn:cms:graph:books")
         .cacheable("urn:cms:graph:presentations")
         .opt_out(
@@ -450,14 +449,20 @@ fn the_books_graph_stays_cached_beside_the_live_union() {
     ));
     assert!(text(&books).contains("Rust in Action"), "{}", text(&books));
 
+    // The bookmarks graph is LIVE: the org file has writers outside the kernel (org-capture, a
+    // Dropbox sync) and nothing watches it, so its jail is uncached and the graph inherits that
+    // (a live answer carries no threads to cut). A cached copy is what let a purge write a stale
+    // file over an edit; a watcher that cuts `urn:cms:src:{path}` could earn the cache back.
     let bookmarks = source(kernel, "urn:cms:graph:bookmarks");
-    assert_eq!(bookmarks.expiry, Expiry::Never);
     assert_eq!(
-        foreign_threads(&bookmarks, &["urn:cms:graph:bookmarks"]),
-        BTreeSet::from([BOOKMARKS_IRI.to_string()]),
-        "the bookmarks graph is threaded to the org file it reads, and its own name: {:?}",
-        threads(&bookmarks)
+        bookmarks.expiry,
+        Expiry::Always,
+        "the bookmarks file is read fresh"
     );
+    assert!(!kernel.is_cached(
+        &request(Verb::Source, "urn:cms:graph:bookmarks", &[]),
+        &Capability::root()
+    ));
 
     let presentations = source(kernel, "urn:cms:graph:presentations");
     assert_eq!(presentations.expiry, Expiry::Never);

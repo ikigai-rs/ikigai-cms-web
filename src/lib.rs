@@ -28,6 +28,11 @@ pub use presentations::Presentations;
 #[cfg(not(target_family = "wasm"))]
 pub mod tagstore;
 
+// Locked, atomic read-modify-write of the room's own state files (the status cache and the tag
+// overlays), which have writers in the serving kernel, the maintenance kernel and the bins.
+#[cfg(not(target_family = "wasm"))]
+mod filelock;
+
 // Graph maintenance (the link-checker) — behind the `maintenance` feature, which adds
 // outbound HTTP. `urn:cms:linkcheck` caches each check for a week.
 #[cfg(feature = "maintenance")]

@@ -115,8 +115,8 @@ fn card_view_inputs(description: Description) -> Description {
 /// optional Zotero library (`My Library.rdf`) whose books join the same graph.
 ///
 /// Binds:
-/// - `urn:cms:src:{path}` — CMS source files, jailed to `src_dir`, cacheable +
-///   golden-threaded (a change to a source file invalidates everything derived).
+/// - `urn:cms:src:{path}` — CMS source files, jailed to `src_dir`, read fresh on every
+///   resolution (they are written outside the kernel and nothing watches them).
 /// - `urn:cms:src:zotero` — the Zotero RDF library (if configured), served as
 ///   RDF/XML with an injected base so its relative IRIs resolve.
 /// - `urn:cms:graph:bookmarks` — bookmarks as Turtle (org → [`ikigai_cms`]).
@@ -193,11 +193,24 @@ pub fn cms_spaces_with(
     tags: crate::tagstore::TagPaths,
     linkstatus: Option<PathBuf>,
 ) -> Vec<Arc<dyn Space>> {
-    // The CMS source jail: real files, read THROUGH the kernel (cacheable + watched),
-    // never with std::fs — so the derived graph is golden-threaded to them.
+    // The CMS source jail: real files, read THROUGH the kernel, never with std::fs.
+    //
+    // UNCACHED, deliberately. This comment used to say "cacheable + watched", and nothing
+    // watched: the bookmarks file is written OUTSIDE the kernel (org-capture, a Dropbox sync),
+    // so a cached read was served until a restart. Worse than stale, it was destructive — the
+    // purge and the per-card remove struck that cached copy and wrote it back over the edit,
+    // and backed up the same stale copy. ikigai-fs's own rule for `.cacheable()` is a root
+    // written through ikigai, and this one is not. The cost was measured (release build, a
+    // 2.1 MB / 11k-bookmark synthetic org file shaped like the live one, no books): the
+    // bookmarks graph re-reads and re-transrepts the file on each read (~0.03 ms → ~11 ms), a
+    // union read goes ~0.3 ms → 60-95 ms (the `cms:Bookmark` typing CONSTRUCT re-runs), a tag
+    // view ~105-140 ms → 225-320 ms, the tag index ~50-75 ms → 105-140 ms: about 2× on a page,
+    // less in the live room, where the cached books parse adds the same constant to both. A
+    // watcher that cuts `urn:cms:src:{path}` can earn the cache back; until one exists, a fresh
+    // read is the only correct one.
     let src = EndpointSpace::new().bind(
         UriTemplate::parse("urn:cms:src:{path}").expect("valid template"),
-        ikigai_fs::FileEndpoint::new(src_dir).cacheable(),
+        ikigai_fs::FileEndpoint::new(src_dir),
     );
     // The Zotero library source (its filename has a space, so it can't ride the
     // `urn:cms:src:{path}` template — a dedicated binding, present only if configured).
@@ -431,10 +444,11 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
     .cacheable())
 }
 
-/// `urn:cms:graph` — assemble the bookmark graph. Reads the org bookmarks file
-/// through the kernel and transrepts it to Turtle; cacheable and golden-threaded on
-/// the source (`inv.source` records the dependency, so a write/watch on the file
-/// recomputes the graph — and everything queried from it).
+/// `urn:cms:graph:bookmarks` — assemble the bookmark graph. Reads the org bookmarks file
+/// through the kernel and transrepts it to Turtle. Marked cacheable, because it is a pure
+/// function of the file — but its EFFECTIVE expiry is the source's, and the jail is uncached
+/// (see `cms_spaces_with`), so today every read re-derives. A watcher on the jail would make
+/// it cached again without touching this endpoint.
 struct BookmarkGraph {
     /// The `urn:cms:src:{path}` IRI of the bookmarks org file (configurable via
     /// `CMS_BOOKMARKS`; defaults to [`DEFAULT_BOOKMARKS`]).
