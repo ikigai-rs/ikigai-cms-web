@@ -95,14 +95,48 @@ async fn presentations_turtle(inv: &Invocation<'_>, root: &Path, base_url: Optio
 /// raw `std::fs` read. `None` if the file is absent/unreadable or outside `root`.
 async fn deck_source(inv: &Invocation<'_>, root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
+    // Each segment percent-encoded where an IRI cannot carry it raw: a deck under `talks/my talk`
+    // made an IRI with a space, `Iri::parse` refused it, the `?` turned that into `None`, and the
+    // deck vanished from the room with nothing said. The deck jail decodes the binding back.
     let rel_url = rel
         .components()
         .filter_map(|c| c.as_os_str().to_str())
+        .map(iri_segment)
         .collect::<Vec<_>>()
         .join("/");
-    let iri = Iri::parse(format!("urn:cms:deck:{rel_url}")).ok()?;
+    let iri = match Iri::parse(format!("urn:cms:deck:{rel_url}")) {
+        Ok(iri) => iri,
+        Err(e) => {
+            eprintln!("presentations: skipping {}: {e}", abs.display());
+            return None;
+        }
+    };
     let repr = inv.source(&iri).await.ok()?;
     String::from_utf8(repr.bytes).ok()
+}
+
+/// One path segment as IRI text: every byte an IRI path segment cannot carry raw — whitespace,
+/// controls, `%`, and the delimiters `<>"{}|\^`, `?` and `#` — percent-encoded; the rest (non-ASCII
+/// included, which an IRI allows) kept.
+fn iri_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for c in segment.chars() {
+        if c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                '%' | '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`' | '?' | '#'
+            )
+        {
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Every deck (a directory containing `deck.toml`) under `root`, recursively, sorted for a
