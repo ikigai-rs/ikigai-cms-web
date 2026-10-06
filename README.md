@@ -103,13 +103,21 @@ up nowhere near the config that caused it. The default derives exactly the
 
 The page opens a WebTransport connection to `cms-server`. **The room is gated by a
 passkey** (layer 3 above): the server resolves under a public ceiling until a verified passkey
-raises it, so on first run click **register passkey** (Touch ID) to enrol, then **sign
+raises it, so on first run click **register passkey** (Touch ID) to enroll, then **sign
 in** — the WebAuthn ceremony rides over the wire as `urn:auth:*`, the server (a
 `webauthn-rs` relying party) verifies it and mints the connection's capability. After
 sign-in the reading room loads; clicking a tag chip re-queries the graph. The passkey
 store persists through the OS keystore — the **macOS Keychain** (via `ikigai-secret`), a
 dev file store elsewhere — not a plaintext file. The RP origin defaults to
 `http://localhost:{page_port}` (override with `rp_origin`/`rp_id`).
+
+What the public ceiling reaches, over either face, is a closed list: the embedded
+stylesheets, the pure compute endpoints (SPARQL, XSLT, the org transreptor) and the kernel's
+own manifold and validator, all of which read only what the caller hands them or could read
+directly. Every graph, every tag and link overlay, the link-check status, the review and the
+purge prompts refuse it, and every endpoint refuses a verb it does not declare. The
+`server_tests/privacy.rs` walk holds this: it lists the public set by name and fails on any
+other binding a signed-out visitor is not refused on.
 
 Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any browser once WebTransport
 went Baseline in March 2026 — but the local page uses `serverCertificateHashes` to trust

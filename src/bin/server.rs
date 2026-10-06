@@ -1434,6 +1434,11 @@ fn error_reply(msg: &str) -> Reply {
     json_reply(serde_json::json!({ "error": msg }).to_string().into_bytes())
 }
 
+/// What a signed-out visitor can reach through `/r/`, and the catalog walk that keeps it that way.
+#[cfg(test)]
+#[path = "server_tests/privacy.rs"]
+mod privacy;
+
 #[cfg(test)]
 mod tests {
     use super::{
