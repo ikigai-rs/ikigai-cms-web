@@ -1562,12 +1562,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-fs"
-version = "0.1.6"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bceda2d9f22619a6267e70dfabdeb78ab8a1164cee8494cc58f936f5c3e9eda"
+checksum = "51e42d9424a0deba8cdaccdeeee88f35156ed4be77d4ae93647d58b73dafa491"
 dependencies = [
  "async-trait",
  "ikigai-core",
+ "rustix",
  "web-sys",
 ]
 
@@ -1611,14 +1612,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-secret"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f3dd5c42c87e05698be328ed7f5583de1296d62fde2bd93c6984f62e404e794"
+checksum = "4abde5d4a9d4c930e83afd777c14038da183dd9b74f86193e898c263b33bade9"
 dependencies = [
  "age",
  "async-trait",
  "ed25519-dalek",
  "ikigai-core",
+ "libc",
  "rand_core 0.6.4",
  "robius-authentication",
  "security-framework",

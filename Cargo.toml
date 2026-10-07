@@ -42,7 +42,7 @@ ikigai-sparql = "0.1.5"
 # through a `urn:cms:style:*` stylesheet to render cards. Native/server-side only.
 ikigai-xslt = "0.1.0"
 # Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
-ikigai-fs = "0.1.4"
+ikigai-fs = "0.1.8" # security floor (audit round 3, ledger #856): the jail authorizes the file it opens
 # Endpoint::invoke is async (dyn via async-trait) — the assembly + view endpoints read
 # through the kernel.
 async-trait = "0.1"
@@ -63,7 +63,7 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # secret space became THREE enumerable endpoints there (the store plus generate and unlock)
 # and tests/conformance.rs asserts the maintenance catalog exactly — under 0.1.5 that list is
 # a different set and the walk fails.
-ikigai-secret = { version = "0.1.6", optional = true }
+ikigai-secret = { version = "0.1.7", optional = true } # security floor (ledger #854): 0600 atomic, injective names
 # Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.6 = lenient
 # Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
 # failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.
