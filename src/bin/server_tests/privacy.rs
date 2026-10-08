@@ -284,6 +284,10 @@ fn every_resource_the_http_face_serves_is_refused_to_a_signed_out_visitor() {
             )),
             (true, Err(Error::Denied(_))) => {}
             (false, Err(e)) if not_served(&e) => {}
+            // Since ikigai-core 0.1.85 the floor covers EVERY verb (ledger #750), so a Source to a
+            // resource that declares only Sink is refused by its declared `requires` before the
+            // endpoint ever sees it: a refusal, and an earlier one than "does not serve".
+            (false, Err(Error::Denied(_))) => {}
             // The kernel's own operations refuse an undeclared verb themselves (as unresolved).
             (false, Err(_)) if pattern.starts_with("urn:kernel:") => {}
             (true, Err(other)) => problems.push(format!(

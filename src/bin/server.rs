@@ -294,9 +294,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capability(Capability::root());
         registry.set_resolver(Arc::clone(&maint) as Arc<dyn Resolver>);
         let schedule_pass = |iri: &'static str, label: &'static str| {
-            match ikigai_time::parse_schedule("24h")
-                .and_then(|s| registry.schedule_persistent(iri.into(), Verb::Source, s, true))
-            {
+            match ikigai_time::parse_schedule("24h").and_then(|s| {
+                // Root, deliberately: the same authority the startup resolve below runs at, so
+                // the scheduled pass and the immediate one cannot diverge. ikigai-time 0.4 makes
+                // the job's authority a required argument (ledger #79); narrowing a pass to
+                // the scopes it needs is a design question for its own arc, not this bump.
+                registry.schedule_persistent(iri.into(), Verb::Source, s, true, Capability::root())
+            }) {
                 Ok(id) => println!("{label}: scheduled daily (job {id})"),
                 Err(e) => eprintln!("{label}: schedule failed: {e}"),
             }
