@@ -41,6 +41,13 @@ serde_json = "1"
 # remove-by-URL (maintenance.rs `strike`) now asks THIS parser which URL a heading carries, so the
 # URL it strikes is exactly the dc:identifier the graph serves (ledger #882).
 ikigai-cms = "0.1.4"
+# Read back the Turtle ikigai-cms emits: `strike` (maintenance.rs) asks ikigai-cms which URL a
+# heading carries by transrepting the record and reading its dc:identifier, rather than parsing
+# org a second time (ledger #882). Both are already in the graph through ikigai-sparql's Oxigraph;
+# 0.2.0/0.3.0 are the first releases with `TurtleParser::for_slice` and the Term this matches.
+# Optional: only the maintenance feature (which owns `strike`) links them.
+oxttl = { version = "0.2.0", optional = true }
+oxrdf = { version = "0.3.0", optional = true }
 # SPARQL over graph=<uri> sources resolved through the kernel (Oxigraph in-memory).
 ikigai-sparql = "0.1.5"
 # XSLT transform (urn:xslt:transform, xrust) — the view pipes its CONSTRUCT'd RDF/XML
@@ -131,7 +138,7 @@ server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid
 # ikigai-secret: the Zotero link pass reads its API key as `urn:secret:zotero-api-key` through the
 # kernel, so the maintenance kernel mounts the secret space (the server feature already had the dep
 # for the passkey store; maintenance needs it in its own right).
-maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
+maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:oxttl", "dep:oxrdf", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
 
 [[bin]]
 name = "cms-server"
