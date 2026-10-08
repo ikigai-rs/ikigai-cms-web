@@ -1720,40 +1720,72 @@ async fn strike_bookmarks(
 /// Remove the org entries whose bookmark URL is in `removable`: drop each matching `*`-heading and
 /// the non-heading lines under it (its property drawer/body), keeping everything else verbatim.
 /// Returns the new content and how many entries were struck.
+///
+/// Which URL a heading carries is ikigai-cms's answer, not a second parser's (ledger #882): the
+/// URLs a removal names come from the graph's `dc:identifier`, which ikigai-cms derives with org's
+/// link escapes removed and a wrapped URL joined, and it alone decides which headings are
+/// bookmarks (a TODO keyword and indentation are tolerated; prose before the link is not one). So
+/// each record is transrepted on its own through [`ikigai_cms::bookmarks_to_turtle`] and struck
+/// when the identifiers it yields are all removable.
+///
+/// A record runs from a line whose first non-blank character is `*` to the next such line. That
+/// is a superset of ikigai-cms's headings (it also cuts at `*bold*` prose), so the error it can
+/// make is the safe one: a record cut short yields no bookmark and is kept, never struck.
 fn strike(content: &str, removable: &HashSet<&str>) -> (String, usize) {
     let lines: Vec<&str> = content.lines().collect();
     let mut out = String::with_capacity(content.len());
     let mut removed = 0;
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i];
-        if heading_url(line).is_some_and(|u| removable.contains(u.as_str())) {
-            // Drop the heading and its subtree (following non-heading lines).
+        let end = (i + 1..lines.len())
+            .find(|&j| starts_record(lines[j]))
+            .unwrap_or(lines.len());
+        let record = &lines[i..end];
+        let urls = if starts_record(lines[i]) {
+            record_urls(record)
+        } else {
+            Vec::new()
+        };
+        if !urls.is_empty() && urls.iter().all(|u| removable.contains(u.as_str())) {
             removed += 1;
-            i += 1;
-            while i < lines.len() && !lines[i].starts_with('*') {
-                i += 1;
+        } else {
+            for line in record {
+                out.push_str(line);
+                out.push('\n');
             }
-            continue;
         }
-        out.push_str(line);
-        out.push('\n');
-        i += 1;
+        i = end;
     }
     (out, removed)
 }
 
-/// The bookmark URL in an org heading `*… [[url][title]]` (or `[[url]]`), or `None` if the line is
-/// not a heading or has no link.
-fn heading_url(line: &str) -> Option<String> {
-    if !line.starts_with('*') {
-        return None;
-    }
-    let start = line.find("[[")? + 2;
-    let rest = &line[start..];
-    let end = rest.find([']', '['])?; // up to the `][` separator or the closing `]]`
-    Some(rest[..end].to_string())
+/// Whether a line opens a record for [`strike`]: its first character past a byte-order mark and
+/// indentation is `*`.
+fn starts_record(line: &str) -> bool {
+    line.trim_start_matches('\u{FEFF}')
+        .trim_start()
+        .starts_with('*')
 }
+
+/// The bookmark URLs ikigai-cms reads from one record: the `dc:identifier` literals of its Turtle.
+fn record_urls(record: &[&str]) -> Vec<String> {
+    if !record.iter().any(|line| line.contains("[[")) {
+        return Vec::new(); // no link, no bookmark: spare the transreption
+    }
+    let ttl = ikigai_cms::bookmarks_to_turtle(&record.join("\n"));
+    oxttl::TurtleParser::new()
+        .for_slice(ttl.as_bytes())
+        .filter_map(std::result::Result::ok)
+        .filter(|t| t.predicate.as_str() == DC_IDENTIFIER)
+        .filter_map(|t| match t.object {
+            oxrdf::Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The predicate ikigai-cms carries a bookmark's URL on.
+const DC_IDENTIFIER: &str = "http://purl.org/dc/elements/1.1/identifier";
 
 /// Wrap an HTML string as an uncacheable text/html representation.
 fn fragment(html: String) -> Representation {
@@ -3662,18 +3694,62 @@ mod tests {
         );
     }
 
+    /// Ledger #882: the URLs a removal names come from the graph, so they are ikigai-cms's
+    /// `dc:identifier` — org's link escapes removed, a wrapped URL joined. `strike` must find a
+    /// heading by THAT URL, and must agree with ikigai-cms about which headings are bookmarks:
+    /// an indented link heading is one, a heading of prose ABOUT a link is not.
     #[test]
-    fn heading_url_extracts_the_link_target() {
+    fn strike_matches_the_url_the_graph_serves() {
+        let content = [
+            "* Bookmarks",
+            r"** [[https://x.example/a\[1\]][Escaped]]",
+            "   :TAGS: escaped",
+            "** TODO [[https://todo.example][Todo]]",
+            "   ** [[https://indented.example][Indented]]",
+            "** [[https://wrap.example/very-long-",
+            "   path][Wrapped]]",
+            "** Notes on [[https://prose.example][a link]]",
+            "   prose body",
+            "** [[https://keep.example][Keep]]",
+            "",
+        ]
+        .join("\n");
+        // What the graph serves for this file is the contract: every URL below but the prose
+        // heading's is a dc:identifier there.
+        let ttl = ikigai_cms::bookmarks_to_turtle(&content);
+        for url in [
+            "https://x.example/a[1]",
+            "https://todo.example",
+            "https://indented.example",
+            "https://wrap.example/very-long-path",
+        ] {
+            assert!(ttl.contains(&format!("\"{url}\"")), "{url} in {ttl}");
+        }
+        assert!(!ttl.contains("prose.example"), "{ttl}");
+
+        let removable: HashSet<&str> = [
+            "https://x.example/a[1]",
+            "https://todo.example",
+            "https://indented.example",
+            "https://wrap.example/very-long-path",
+            "https://prose.example",
+        ]
+        .into_iter()
+        .collect();
+        let (out, removed) = strike(&content, &removable);
+        assert_eq!(removed, 4, "{out}");
         assert_eq!(
-            heading_url("** [[https://x/y][Title]]").as_deref(),
-            Some("https://x/y")
+            out,
+            [
+                "* Bookmarks",
+                "** Notes on [[https://prose.example][a link]]",
+                "   prose body",
+                "** [[https://keep.example][Keep]]",
+                "",
+            ]
+            .join("\n"),
+            "the four bookmarks and their bodies are struck; prose about a link is not a bookmark"
         );
-        assert_eq!(
-            heading_url("** [[https://x/y]]").as_deref(),
-            Some("https://x/y")
-        );
-        assert_eq!(heading_url("   indented [[https://x]]"), None); // not a heading
-        assert_eq!(heading_url("** no link here"), None);
     }
 
     #[test]

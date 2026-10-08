@@ -1520,6 +1520,8 @@ dependencies = [
  "ikigai-time",
  "ikigai-wire",
  "ikigai-xslt",
+ "oxrdf",
+ "oxttl",
  "reqwest",
  "serde",
  "serde_json",
