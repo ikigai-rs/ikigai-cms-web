@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.ikigai-rs.cms</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/brian/.cargo/bin/cms-server</string>
+  </array>
+  <!-- The semantic-CMS reading room. All configuration lives in
+       ~/.config/ikigai/cms.toml (page_port 8090 = the URL you open, wire_port 4434 =
+       the internal WebTransport face); flags would override it, but there are none
+       here on purpose: config home, not flags, not env vars.
+
+       This file is versioned in ikigai-cms-web at deploy/macos/; the copy launchd
+       loads lives in ~/Library/LaunchAgents/. Copying it there changes nothing until
+       the next bootstrap.
+
+       Points at ~/.cargo/bin rather than the repo's target/release build: a target/
+       binary dies on `cargo clean` and gets silently swapped by the next debug build,
+       so launchd would serve whatever last landed there.
+
+       PREREQUISITE: the install command under "Install as a service" in the repo's
+       README. It builds the server feature against the committed lock and replaces
+       the installed binary. It is not spelled out here because its flags begin with
+       two hyphens, and two hyphens in a row are illegal inside an XML comment:
+       plutil tolerates them, but Python's plistlib and every standard XML parser
+       reject the whole file. Every binary in this crate sits behind a required
+       feature, so an install WITHOUT the server feature compiles everything, warns
+       that no binaries are available, and exits 0 having installed nothing.
+
+       TWO GRANT HAZARDS on first bootstrap (see the LWCR/TCC notes): it reads the
+       source jail under ~/Dropbox/org-mode-files, and the passkey store is the macOS
+       Keychain; both can be denied silently to a launchd-spawned process. Bootstrap
+       it with someone at the screen, then check /tmp/ikigai-cms.log for a clean start
+       rather than assuming. Bootout, wait, then bootstrap after any edit; never
+       kickstart. -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/tmp/ikigai-cms.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ikigai-cms.log</string>
+</dict></plist>
