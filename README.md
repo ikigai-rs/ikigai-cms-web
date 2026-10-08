@@ -63,6 +63,31 @@ llm_provider = "mlx"              # which ~/.config/ikigai/llm.json provider the
 URL you open. The RP origin defaults to that page origin, so the passkey can't drift
 from the URL you open.
 
+## Install as a service
+
+On a Mac the room runs under launchd as `dev.ikigai-rs.cms`, from the installed binary in
+`~/.cargo/bin`, never a `target/` build. Install (or reinstall) it from this checkout:
+
+```sh
+cargo install --path . --features server --locked --force
+```
+
+Every binary in this crate sits behind a required feature, so an install without
+`--features server` compiles the whole graph, warns that no binaries are available, and
+exits 0 having installed nothing. `--locked` builds the graph the committed `Cargo.lock`
+froze instead of re-resolving it against today's registry.
+
+The plist is versioned here, at
+[`deploy/macos/dev.ikigai-rs.cms.plist`](deploy/macos/dev.ikigai-rs.cms.plist); launchd
+loads its copy from `~/Library/LaunchAgents/`. After an install, re-register the agent
+(on Brian's machines: `just -f ~/git-personal/ikigai-devtools/justfile reregister --only
+dev.ikigai-rs.cms`), which waits between the bootout and the bootstrap. Do it with someone
+at the screen: a replaced binary can re-prompt for the Keychain (the passkey store) and the
+source jail under `~/Dropbox`, and a denial is silent until `/tmp/ikigai-cms.log` says so.
+
+The browser codec in `dist/` does not need rebuilding for a dependency bump unless
+`ikigai-wire` moved; `./build-wasm.sh` rebuilds it when it did.
+
 ### Reaching the room from another machine
 
 `bind` is where the page listens; it defaults to `127.0.0.1`, and **moving it off
@@ -149,8 +174,11 @@ The kernel passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conform
 `content` and declaring `urn:cap:fs:write:*`, every jail-derived Source declaring
 `urn:cap:fs:read:*` — so a caller holding no fs grant is refused with a typed `Denied`
 at the view, by the kernel, not three sub-resolutions down. The only findings left are
-NAMES (the ids are full IRIs, held for the ecosystem-wide rename) and the ones inherited
-from `ikigai-fs`/`ikigai-sparql`/`ikigai-xslt`/`ikigai-cms` at their published versions.
+NAMES (the ids are full IRIs, held for the ecosystem-wide rename), and the test holds the
+composed endpoints (`ikigai-fs`, `ikigai-sparql`, `ikigai-xslt`, `ikigai-cms`, and in the
+maintenance kernel `ikigai-http`, `ikigai-llm`, `ikigai-secret`) to the same: each one the
+suite cannot call unaided carries a fixture, so the walk probes it rather than recording a
+failed call.
 
 The room coins one vocabulary, **`cms:`** = `https://ikigai-rs.dev/ns/cms#`, beside
 Dublin Core Elements 1.1: the kinds `cms:Book`, `cms:Bookmark`, `cms:Presentation`;
@@ -183,3 +211,21 @@ room"), a `cms.toml` naming `src_dir` and `dist`, and a passkey enrolled on firs
 The page binds loopback, and moving it off loopback is refused unless a TLS terminator
 fronts the room — see "Reaching the room from another machine" for why that is
 arithmetic rather than caution.
+
+### 2026-10-08: the audit releases
+
+- **Dependencies.** `ikigai-llm` 0.13 (audit round 5: ports enforced, keys sent, URL
+  credentials redacted, live probes no longer cached), `ikigai-cms` 0.1.4 (every heading is a
+  record boundary; org link escapes removed), `ikigai-secret` 0.1.8, `ikigai-time` 0.4 (a
+  scheduled pass now states the authority it fires under), `ikigai-conformance` 0.5. Three of
+  those pins were ceilings under Cargo's 0.x caret rules and could not see the release.
+- **Removing a link matches the graph.** Remove-by-URL used its own reading of an org
+  heading, so an escaped or wrapped link target, or an indented heading, could not be removed,
+  and a heading of prose about a link could. It now asks `ikigai-cms` which URL a heading
+  carries, the same `dc:identifier` the room shows.
+- **MSRV declared** (`rust-version = "1.89"`, for `File::lock`), so CI checks it.
+- **The launchd plist is versioned** in `deploy/macos/`, with its install pointer fixed and
+  its comment well-formed XML.
+
+Reinstall: `cargo install --path . --features server --locked --force` from this checkout,
+then re-register `dev.ikigai-rs.cms` (see "Install as a service").

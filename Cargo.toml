@@ -2,6 +2,11 @@
 name = "ikigai-cms-web"
 version = "0.0.0"
 edition = "2021"
+# The true minimum (ledger #209): `File::lock`/`unlock` (src/filelock.rs, the overlay and cache
+# writers' advisory lock) are stable since 1.89, above the 1.88 the dependency graph needs
+# (time, wtransport, webauthn-rs). Declared so the shared CI's msrv job runs on it instead of
+# skipping and reading as green.
+rust-version = "1.89"
 publish = false
 description = "The semantic-CMS reading room: a WebTransport-served kernel over the CMS graph, with an htmx + WebGPU browser front-end. Rung 1 = build_cms_kernel composes the bookmark graph (org → Turtle) + SPARQL over it."
 license = "MIT OR Apache-2.0"
