@@ -15,13 +15,13 @@
 //!
 //! The kernel composes four other crates' endpoints (`file` from ikigai-fs, `bookmarks`
 //! from ikigai-cms, `sparql-*` from ikigai-sparql, `xslt-transform` from ikigai-xslt), and
-//! the suite walks everything bound (PENDING #17). Each of those adopted the suite in its
-//! own repo, but the adopted releases are not on crates.io yet, so at the pinned versions
-//! they report findings this crate cannot fix. [`assert_findings`] therefore holds this
-//! module's own ids to ZERO findings other than NAMES, and every other finding to the pinned
-//! [`INHERITED`] set — a finding against an id neither list knows is red. When the
-//! dependencies are bumped to their conformant releases, the inherited count in the printed
-//! report drops on its own.
+//! the suite walks everything bound (PENDING #17). [`assert_findings`] holds this module's
+//! own ids AND the dependencies' ids in [`INHERITED`] to zero findings other than NAMES — a
+//! finding against an id neither list knows is red. The composed endpoints the suite cannot
+//! call with its minimal inputs (the four SPARQL forms, the XSLT transform, ikigai-http's six
+//! verbs, `llm-select`) carry fixtures, so the walk probes them rather than recording a
+//! failed call: under ikigai-conformance 0.2 those failed calls were the "inherited"
+//! findings, and they certified nothing.
 //!
 //! NAMES: every id here is a full IRI (`urn:cms:graph`), which is not kebab-case. Not
 //! renamed — the ids are live MCP tool names, renamed in one coordinated pass (wave two,
@@ -99,6 +99,25 @@ const ZOTERO_IRI: &str = "urn:cms:src:zotero";
 /// A file present in BOTH jails (`urn:cms:src:*` and `urn:cms:deck:*`), because the suite
 /// applies a `file` fixture's binding to every entry that shares the id (PENDING #2).
 const SCRATCH_FILE: &str = "conformance.txt";
+
+/// The SPARQL fixtures: one per form, over the empty default graph (no `graph=`). The
+/// CONSTRUCT's template uses a defined term, so VOCABULARY has something real to read.
+const SPARQL_SELECT: &str = "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1";
+const SPARQL_ASK: &str = "ASK { ?s ?p ?o }";
+const SPARQL_DESCRIBE: &str = "DESCRIBE <urn:example:conformance>";
+const SPARQL_CONSTRUCT: &str =
+    "CONSTRUCT { <urn:example:conformance> <http://purl.org/dc/elements/1.1/title> \"x\" } WHERE {}";
+
+/// The XSLT fixture, both inputs inline: a one-bookmark RDF/XML document and a card stylesheet
+/// with no `xsl:output` (XSLT's default method, html).
+const XSLT_DOC: &str = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <rdf:Description rdf:about="urn:example:conformance"><dc:title>x</dc:title></rdf:Description>
+</rdf:RDF>"#;
+const XSLT_STYLE: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+  xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <xsl:template match="/"><h1><xsl:value-of select="//dc:title"/></h1></xsl:template>
+</xsl:stylesheet>"#;
 
 /// The bookmarks: two entries, two tags each, so the tag axis has something to join.
 const ORG: &str = "\
@@ -182,8 +201,8 @@ const OURS_MAINTENANCE: &[&str] = &[
     "urn:cms:link-keep",
 ];
 
-/// The dependencies' ids the walk also sees, at the versions the lock pins. Their findings
-/// are theirs (each has adopted the suite; the releases are not published yet).
+/// The dependencies' ids the walk also sees, at the versions the lock pins. Held to NAMES
+/// only, like this module's own: their ids are theirs to rename.
 const INHERITED: &[&str] = &[
     "file",
     "bookmarks",
@@ -269,6 +288,24 @@ fn suite() -> Suite {
         .namespace(CMS)
         .namespace(DC)
         .fixture(Fixture::new("file", Verb::Source).binding("path", SCRATCH_FILE))
+        // The composed endpoints need a valid call the suite cannot guess; without one their
+        // probes fail and the walk certifies nothing about them. Each declares what its own
+        // repo's walk declares: a function of the query (no `graph=`) or of two inline
+        // documents, so pure.
+        .fixture(Fixture::new("sparql-select", Verb::Source).arg("query", SPARQL_SELECT))
+        .fixture(Fixture::new("sparql-ask", Verb::Source).arg("query", SPARQL_ASK))
+        .fixture(Fixture::new("sparql-describe", Verb::Source).arg("query", SPARQL_DESCRIBE))
+        .fixture(Fixture::new("sparql-construct", Verb::Source).arg("query", SPARQL_CONSTRUCT))
+        .fixture(
+            Fixture::new("xslt-transform", Verb::Source)
+                .arg("src", XSLT_DOC)
+                .arg("stylesheet", XSLT_STYLE),
+        )
+        .pure("sparql-select")
+        .pure("sparql-ask")
+        .pure("sparql-describe")
+        .pure("sparql-construct")
+        .pure("xslt-transform")
         .pure("bookmarks")
         .pure("cms-style")
         .cacheable("cms-style")
@@ -371,6 +408,15 @@ fn assert_findings(report: &Report, kernel: &Kernel, ours: &[&str], inherited: &
             assert!(
                 inherited.contains(id),
                 "a finding against an endpoint this file does not list: {finding}"
+            );
+            // With a fixture for every composed endpoint the suite cannot call unaided, the
+            // dependencies' only findings are their own ids' NAMES. Anything else is a probe
+            // that failed or a recipe a dependency broke: either way, not something to inherit
+            // silently.
+            assert_eq!(
+                finding.check,
+                Check::Names,
+                "a dependency's finding other than NAMES: {finding}"
             );
             theirs += 1;
         }
@@ -988,6 +1034,9 @@ fn the_maintenance_kernel_conforms() {
         }
     }
 
+    /// Where the walk points ikigai-http's verbs: any URL with a host, answered by `Canned`.
+    const CANNED_URL: &str = "https://conformance.example/";
+
     let dir = tempfile::tempdir().expect("tempdir");
     let (src, zotero, _presentations, tags, status) = scratch(dir.path());
     let secrets = ikigai_secret::FileBackend::new(dir.path().join("secrets"));
@@ -1038,6 +1087,25 @@ fn the_maintenance_kernel_conforms() {
         // endpoint reads deck files and is threaded to them — a declaration certifies
         // behavior over the kernel passed (the suite's PENDING #18/#30).
         .pure("urn:cms:graph:presentations")
+        // ikigai-http's six verbs need a URL with a host (the suite's `x` has none); the
+        // canned transport answers it, so nothing leaves the process. GET and HEAD are live
+        // by ikigai-http's own declaration.
+        .fixture(Fixture::new("httpGet", Verb::Source).arg("url", CANNED_URL))
+        .fixture(Fixture::new("httpHead", Verb::Exists).arg("url", CANNED_URL))
+        .fixture(Fixture::new("httpPost", Verb::Sink).arg("url", CANNED_URL))
+        .fixture(Fixture::new("httpPut", Verb::Sink).arg("url", CANNED_URL))
+        .fixture(Fixture::new("httpPatch", Verb::Sink).arg("url", CANNED_URL))
+        .fixture(Fixture::new("httpDelete", Verb::Delete).arg("url", CANNED_URL))
+        .live("httpGet")
+        .live("httpHead")
+        // `needs=x` is a grammar error; ikigai-llm's own walk selects with `cost=local`.
+        .fixture(Fixture::new("llm-select", Verb::Source).arg("needs", "cost=local"))
+        // A function of the registry, which this kernel fixes at construction and never
+        // reloads: nothing here could cut `urn:llm:config`, and nothing needs to. So it is
+        // declared pure over THIS kernel (a host that reloads its registry cuts that thread
+        // and would declare otherwise), and held cacheable.
+        .pure("llm-config")
+        .cacheable("llm-config")
         .run_blocking(&kernel);
     eprintln!("{report}");
 
