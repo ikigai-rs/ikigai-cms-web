@@ -183,7 +183,7 @@ pub struct RecentLog {
 impl RecentLog {
     /// Record a view under `principal`, most-recent-first, de-duplicated by IRI **and
     /// scope** (a repeat visit moves it to the front; a tag and that tag within a type are
-    /// separate entries), capped at [`RECENT_CAP`].
+    /// separate entries), capped at `RECENT_CAP`.
     pub fn record(&self, principal: &str, entry: Recent) {
         let mut map = self.by_principal.lock().unwrap();
         let trail = map.entry(principal.to_string()).or_default();
