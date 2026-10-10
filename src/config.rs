@@ -18,8 +18,21 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+
+/// The anonymous door's SPARQL time budget when `cms.toml` names none: **1 second** (ledger
+/// #964). ikigai-sparql measured the heaviest legitimate query in the ecosystem — this room's
+/// book CONSTRUCT over a 4.4 MB Zotero export — at 18 ms (release), so 1 s is ~50 times that,
+/// and it ends an anonymous cross product or a long property path in a second instead of
+/// pinning a core for minutes.
+pub const DEFAULT_ANONYMOUS_SPARQL_BUDGET: Duration = Duration::from_millis(1000);
+
+/// The ceiling of the room's SPARQL space: the most time ANY evaluation may take, the room's own
+/// views included, and so the most an anonymous budget can usefully be. The room builds its space
+/// with `ikigai_sparql::space()`, whose ceiling is this.
+pub const SPARQL_SPACE_CEILING: Duration = ikigai_sparql::budget::DEFAULT_BUDGET;
 
 /// The raw, all-optional shape both the TOML file and the CLI flags fill.
 /// `None` = "not stated" — [`Raw::resolve`] applies defaults and validates.
@@ -58,6 +71,10 @@ struct Raw {
     dist: Option<String>,
     /// Ungate the HTTP face for localhost dev (no passkey). Default off.
     dev_open: Option<bool>,
+    /// The time budget, in milliseconds, stamped on every `urn:sparql:*` request a caller with
+    /// no signed-in session makes, over HTTP or the wire. Default
+    /// [`DEFAULT_ANONYMOUS_SPARQL_BUDGET`]; see [`CmsConfig::anonymous_sparql_budget`].
+    anonymous_sparql_budget_ms: Option<u64>,
     /// Run the daily link-check pass in cms-server. Default off.
     linkcheck: Option<bool>,
     /// Run the daily tag-suggest pass in cms-server. Default off.
@@ -96,6 +113,13 @@ pub struct CmsConfig {
     pub rp_origin: String,
     pub dist: PathBuf,
     pub dev_open: bool,
+    /// The time budget the room stamps as `budget=` on every `urn:sparql:*` request from a
+    /// caller with no signed-in session — the anonymous door, over HTTP (`/r/`) and the wire
+    /// alike (ledger #964). A caller's own `budget=` survives only when it is tighter. Signed-in
+    /// callers and the room's own views are not stamped: they run under the SPARQL space's
+    /// ceiling ([`SPARQL_SPACE_CEILING`]). Between 1 ms and that ceiling; default
+    /// [`DEFAULT_ANONYMOUS_SPARQL_BUDGET`].
+    pub anonymous_sparql_budget: Duration,
     pub linkcheck: bool,
     pub tagsuggest: bool,
     pub linkstatus: Option<PathBuf>,
@@ -305,6 +329,12 @@ fn apply_flags(raw: &mut Raw, args: &[String]) -> Result<(), String> {
             "--tags-suggestions" => raw.tags_suggestions = Some(value),
             "--tags-dismissed" => raw.tags_dismissed = Some(value),
             "--zotero-links" => raw.zotero_links = Some(value),
+            "--anonymous-sparql-budget-ms" => {
+                raw.anonymous_sparql_budget_ms =
+                    Some(value.parse().map_err(|_| {
+                        format!("{flag} {value}: not a whole number of milliseconds")
+                    })?)
+            }
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -573,6 +603,10 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         })
         .unwrap_or_else(|| format!("http://localhost:{page_port}"));
     let dev_open = raw.dev_open.unwrap_or(false);
+    let anonymous_sparql_budget = match raw.anonymous_sparql_budget_ms {
+        None => DEFAULT_ANONYMOUS_SPARQL_BUDGET,
+        Some(ms) => check_anonymous_budget(ms)?,
+    };
     // Where the room is reachable and where the passkey ceremony can run are one decision, not
     // two: refuse the pairs that cannot work rather than start a room nobody can sign in to.
     check_reachable(bind, &rp_origin, page_port, dev_open)?;
@@ -597,6 +631,7 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
             .map(|s| expand(home, &s))
             .unwrap_or_else(|| PathBuf::from("dist")),
         dev_open,
+        anonymous_sparql_budget,
         linkcheck: raw.linkcheck.unwrap_or(false),
         tagsuggest: raw.tagsuggest.unwrap_or(false),
         linkstatus: raw.linkstatus.map(|s| expand(home, &s)),
@@ -605,6 +640,23 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         extra_cert_sans: raw.cert_sans.unwrap_or_default(),
         limit: None,
     })
+}
+
+/// An operator-stated anonymous budget, refused when it cannot mean what it says: `0` would refuse
+/// every anonymous query (ikigai-sparql refuses a zero `budget=` as malformed), and anything above
+/// the space's ceiling would be silently cut to that ceiling, so the file would claim a budget the
+/// room never applies.
+fn check_anonymous_budget(ms: u64) -> Result<Duration, String> {
+    let ceiling = SPARQL_SPACE_CEILING.as_millis();
+    if ms == 0 || u128::from(ms) > ceiling {
+        return Err(format!(
+            "anonymous_sparql_budget_ms {ms}: give a whole number of milliseconds from 1 to \
+             {ceiling}. It is the time budget stamped on an anonymous caller's SPARQL, and the \
+             room's SPARQL space stops every query at {ceiling} ms, so a larger budget would \
+             never apply"
+        ));
+    }
+    Ok(Duration::from_millis(ms))
 }
 
 fn probe_path(
@@ -656,6 +708,9 @@ config: cms.toml in the ikigai config home ($XDG_CONFIG_HOME/ikigai, else
   --rp-origin <origin>     WebAuthn relying-party origin
   --dist <dir>             reading-room page directory (default ./dist)
   --dev-open               ungate the HTTP face (localhost dev)
+  --anonymous-sparql-budget-ms <ms>
+                           time budget on a signed-out caller's urn:sparql:* query
+                           (default 1000; at most the SPARQL space's 5000)
   --linkcheck              run the daily link-check pass
   --tagsuggest             run the daily tag-suggest pass
   --linkstatus <file>      link-status cache path
@@ -1088,5 +1143,42 @@ mod tests {
         assert_eq!(cfg.zotero.as_deref(), Some(&*home.path().join("lib.rdf")));
         assert_eq!(cfg.deck_base, None);
         assert_eq!(cfg.limit.as_deref(), Some("5"));
+    }
+
+    /// The anonymous door's SPARQL budget (ledger #964): 1 s unless the file or a flag says
+    /// otherwise, the flag winning, and refused when it could not mean what it says.
+    #[test]
+    fn the_anonymous_sparql_budget_defaults_to_a_second_and_is_configurable() {
+        let home = fake_home();
+        let cfg = load_args(home.path(), &[]).expect("defaults");
+        assert_eq!(cfg.anonymous_sparql_budget, Duration::from_millis(1000));
+        assert_eq!(cfg.anonymous_sparql_budget, DEFAULT_ANONYMOUS_SPARQL_BUDGET);
+
+        let dir = home.path().join(".config/ikigai");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cms.toml"), "anonymous_sparql_budget_ms = 750\n").unwrap();
+        let cfg = load_args(home.path(), &[]).expect("file");
+        assert_eq!(cfg.anonymous_sparql_budget, Duration::from_millis(750));
+        let cfg = load_args(home.path(), &["--anonymous-sparql-budget-ms", "250"]).expect("flag");
+        assert_eq!(
+            cfg.anonymous_sparql_budget,
+            Duration::from_millis(250),
+            "the flag wins"
+        );
+        let cfg = load_args(home.path(), &["--anonymous-sparql-budget-ms", "5000"]).expect("max");
+        assert_eq!(cfg.anonymous_sparql_budget, SPARQL_SPACE_CEILING);
+
+        for bad in ["0", "5001", "1s", "-1"] {
+            let err =
+                load_args(home.path(), &["--anonymous-sparql-budget-ms", bad]).expect_err(bad);
+            assert!(
+                err.contains("--anonymous-sparql-budget-ms")
+                    || err.contains("anonymous_sparql_budget_ms"),
+                "{bad}: {err}"
+            );
+        }
+        std::fs::write(dir.join("cms.toml"), "anonymous_sparql_budget_ms = 0\n").unwrap();
+        let err = load_args(home.path(), &[]).expect_err("zero in the file");
+        assert!(err.contains("from 1 to 5000"), "{err}");
     }
 }

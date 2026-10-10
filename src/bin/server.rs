@@ -25,6 +25,13 @@
 //! `{Passkey → scopes}` store persists through the OS keystore (macOS Keychain via
 //! `ikigai-secret`), not a plaintext file.
 //!
+//! **The anonymous door is time-budgeted** (ledger #964). The room serves `urn:sparql:*` to callers
+//! with no signed-in session, over both faces, so one request could pin a core for minutes. Every
+//! such request is stamped with `budget=` [`config::CmsConfig::anonymous_sparql_budget`]
+//! milliseconds (default 1 s) before it reaches the kernel — see [`stamp_anonymous_budget`].
+//!
+//! [`config::CmsConfig::anonymous_sparql_budget`]: ikigai_cms_web::config::CmsConfig::anonymous_sparql_budget
+//!
 //! Run: `cargo run --features server --bin cms-server` — configured by
 //! `cms.toml` in the ikigai config home + CLI flags (`--help` lists them); no env vars.
 
@@ -230,6 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // nothing). `dev_open` elevates the HTTP face to the full entitlement without login
     // (localhost dev only); the wire stays passkey-gated regardless. Default off.
     let dev_open = cfg.dev_open;
+    // What a signed-out caller's SPARQL may cost, on both faces (ledger #964).
+    let anonymous_budget = cfg.anonymous_sparql_budget;
+    println!(
+        "anonymous SPARQL budget: {} ms (anonymous_sparql_budget_ms)",
+        anonymous_budget.as_millis()
+    );
     if dev_open {
         println!("HTTP resolve face: /r/{{iri}} — DEV-OPEN (ungated; localhost only)");
     }
@@ -246,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&entitlement),
         page_origin,
         dev_open,
+        anonymous_budget,
     ));
 
     // Optionally run the maintenance passes on recurring `urn:time` jobs, each default-off:
@@ -351,7 +365,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entitlement = Arc::clone(&entitlement);
         let recent = Arc::clone(&recent);
         tokio::spawn(async move {
-            if let Err(e) = serve(incoming, kernel, rp, http_auth, entitlement, recent).await {
+            let served = serve(
+                incoming,
+                kernel,
+                rp,
+                http_auth,
+                entitlement,
+                recent,
+                anonymous_budget,
+            );
+            if let Err(e) = served.await {
                 eprintln!("session ended: {e}");
             }
         });
@@ -753,6 +776,7 @@ async fn serve_http(
     entitlement: Arc<Vec<String>>,
     page_origin: Arc<PageOrigin>,
     dev_open: bool,
+    anonymous_budget: Duration,
 ) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -786,6 +810,7 @@ async fn serve_http(
                         &entitlement,
                         &page_origin,
                         dev_open,
+                        anonymous_budget,
                     )
                     .await;
                 });
@@ -809,6 +834,7 @@ async fn handle_http(
     entitlement: &[String],
     page_origin: &PageOrigin,
     dev_open: bool,
+    anonymous_budget: Duration,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -891,7 +917,14 @@ async fn handle_http(
             borrowed(s, c, b)
         } else if let Some(target) = req.target.strip_prefix("/r/") {
             let (cap, principal) = session_cap(auth, sid, entitlement, dev_open);
-            let (s, c, b) = resolve_http(kernel, recent, &cap, principal.as_deref(), target);
+            let (s, c, b) = resolve_http_within(
+                kernel,
+                recent,
+                &cap,
+                principal.as_deref(),
+                target,
+                anonymous_budget,
+            );
             (s, Cow::Owned(c), b, None)
         } else {
             let (s, c, b) = match safe_rel(&req.target) {
@@ -1063,12 +1096,18 @@ fn form_param(body: &[u8], key: &str) -> Option<String> {
 /// the wire runs. `urn:cms:recent` is a session resource (this principal's trail), rendered here
 /// rather than in the kernel; every other resolved view is noted to the trail. Args ride as
 /// query params. A resolve error becomes an inline error fragment so htmx swaps something visible.
-fn resolve_http(
+///
+/// A caller with no signed-in session (`principal` is `None`: the public room, and `dev_open`'s
+/// unauthenticated localhost) has `anonymous_budget` stamped on any `urn:sparql:*` request — see
+/// [`stamp_anonymous_budget`]. A query stopped at that budget answers like every other resolution
+/// error on this face: `200 OK` with a `cms-error` fragment naming the timeout.
+fn resolve_http_within(
     kernel: &Kernel,
     recent: &RecentLog,
     cap: &Capability,
     principal: Option<&str>,
     target: &str,
+    anonymous_budget: Duration,
 ) -> (&'static str, String, Vec<u8>) {
     let html = || "text/html; charset=utf-8".to_string();
     let (iri_enc, query) = target.split_once('?').unwrap_or((target, ""));
@@ -1098,6 +1137,9 @@ fn resolve_http(
     for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
         request = request.with_arg(k, ArgRef::Inline(percent_decode(v).into_bytes()));
     }
+    if principal.is_none() {
+        request = stamp_anonymous_budget(request, anonymous_budget);
+    }
     match Resolver::issue_as(kernel, request, cap) {
         Ok((repr, _)) => {
             note_recent(recent, principal, &iri, scope.as_deref());
@@ -1106,6 +1148,66 @@ fn resolve_http(
         // The error text routinely quotes the caller's own input (a query, a stylesheet's
         // complaint about `content`), so it is escaped: unescaped, any `/r/` URL was a script.
         Err(e) => ("200 OK", html(), error_fragment("p", &e.to_string())),
+    }
+}
+
+/// [`resolve_http_within`] at the default anonymous budget — the `/r/` route as a test drives it.
+#[cfg(test)]
+fn resolve_http(
+    kernel: &Kernel,
+    recent: &RecentLog,
+    cap: &Capability,
+    principal: Option<&str>,
+    target: &str,
+) -> (&'static str, String, Vec<u8>) {
+    resolve_http_within(
+        kernel,
+        recent,
+        cap,
+        principal,
+        target,
+        ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
+    )
+}
+
+/// Stamp the anonymous door's SPARQL time budget on `request` (ledger #964): a `urn:sparql:*`
+/// request leaves carrying `budget=` at most `budget` milliseconds; anything else is untouched.
+///
+/// **Why here, at the door, and not as the SPARQL space's ceiling.** The room's own views, tag
+/// overlays, maintenance passes and Zotero lookups resolve their SPARQL through the SAME kernel
+/// (`build_cms_kernel_with` mounts one `ikigai_sparql::space()`), so a 1 s ceiling on the space
+/// would cap the room's own work too. The space keeps its 5 s ceiling, which still bounds every
+/// path in; this narrows only what an anonymous caller hands the door. The views' sub-requests are
+/// built by the views and never carry this argument, so nothing cached takes a dependency on a
+/// door-budgeted request.
+///
+/// ikigai-sparql makes `budget=` tighten-only, but that is a property of the module the door
+/// should not lean on alone: the caller's own `budget=` is KEPT only when it is an inline whole
+/// number of milliseconds no larger than the door's, and otherwise OVERWRITTEN — a larger one, a
+/// malformed one, or one sent by reference (which ikigai-sparql reads as no budget at all, i.e.
+/// its 5 s ceiling). The prefix is matched without regard to ASCII case.
+fn stamp_anonymous_budget(request: Request, budget: Duration) -> Request {
+    const SPARQL: &str = "urn:sparql:";
+    let is_sparql = request
+        .target
+        .as_str()
+        .get(..SPARQL.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(SPARQL));
+    if !is_sparql {
+        return request;
+    }
+    let door_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+    let tighter = match request.args.get("budget") {
+        Some(ArgRef::Inline(bytes)) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .is_some_and(|ms| (1..=door_ms).contains(&ms)),
+        _ => false,
+    };
+    if tighter {
+        request
+    } else {
+        request.with_arg("budget", ArgRef::Inline(door_ms.to_string().into_bytes()))
     }
 }
 
@@ -1285,6 +1387,7 @@ async fn serve(
     http_auth: Arc<HttpAuth>,
     entitlement: Arc<Vec<String>>,
     recent: Arc<RecentLog>,
+    anonymous_budget: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = incoming.await?.accept().await?;
     // Public until a verified passkey raises the ceiling.
@@ -1309,6 +1412,7 @@ async fn serve(
             &recent,
             &mut session,
             &bytes,
+            anonymous_budget,
         );
         send.write_all(&reply).await?;
         send.finish().await?;
@@ -1317,7 +1421,9 @@ async fn serve(
 
 /// Decode a `Call` and answer it. `urn:auth:*` Calls are handled by the session layer
 /// (the passkey ceremony); everything else resolves against the kernel **under the
-/// connection's ceiling** — so the room is gated until a verified passkey raises it.
+/// connection's ceiling** — so the room is gated until a verified passkey raises it. Until then
+/// the session is anonymous, and its `urn:sparql:*` requests carry `anonymous_budget`
+/// ([`stamp_anonymous_budget`]), exactly as on the HTTP face.
 #[allow(clippy::too_many_arguments)]
 fn handle(
     kernel: &Kernel,
@@ -1327,7 +1433,17 @@ fn handle(
     recent: &RecentLog,
     session: &mut Session,
     bytes: &[u8],
+    anonymous_budget: Duration,
 ) -> Vec<u8> {
+    // Signed in ⇔ a principal: both login paths and the HTTP resume set it with the ceiling, and
+    // logout clears both.
+    let budgeted = |req: Request, session: &Session| {
+        if session.principal.is_none() {
+            stamp_anonymous_budget(req, anonymous_budget)
+        } else {
+            req
+        }
+    };
     let reply = match decode::<Call>(bytes) {
         Ok(Call::Issue(req)) if req.target.as_str().starts_with("urn:auth:") => {
             handle_auth(rp, entitlement, http_auth, session, &req)
@@ -1342,6 +1458,7 @@ fn handle(
             let scope = inline_arg(&req, "type")
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
+            let req = budgeted(req, session);
             let reply = resolve(kernel, &session.ceiling, req);
             if matches!(reply, Reply::Resolved(..)) {
                 note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
@@ -1354,6 +1471,7 @@ fn handle(
             let scope = inline_arg(&req, "type")
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
+            let req = budgeted(req, session);
             let reply = resolve(kernel, &session.ceiling.clamp(&carried), req);
             if matches!(reply, Reply::Resolved(..)) {
                 note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
@@ -1967,6 +2085,7 @@ mod tests {
             Arc::new(ent),
             Arc::new(super::PageOrigin::parse("http://localhost:8080").unwrap()),
             true, // dev-open, so /r/ resolves under the entitlement
+            ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
         ));
 
         async fn get(port: u16, target: &str) -> String {

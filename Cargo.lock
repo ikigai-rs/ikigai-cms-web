@@ -1630,14 +1630,15 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.1.11"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c38b1b823f86ceeadd50d281d258d1586b83a1e178936120a547eb1aec197"
+checksum = "2ae9e23016b40fe027260e73f4d8c15229aa7bf4728b4b5f4ea1e82c51f4714f"
 dependencies = [
  "async-trait",
  "ikigai-core",
  "ikigai-vocab",
  "oxigraph",
+ "spargebra",
 ]
 
 [[package]]
