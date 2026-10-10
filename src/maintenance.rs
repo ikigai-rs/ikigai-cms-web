@@ -11,7 +11,7 @@
 //! 404s is `gone`. Each check passes `max_age`, so in the long-lived server a URL checked within the
 //! week is a cache hit.
 //!
-//! The checks run as **parked futures** bounded at [`CONCURRENCY`] in flight — no thread pool. The
+//! The checks run as **parked futures** bounded at `CONCURRENCY` in flight — no thread pool. The
 //! transport captures a tokio [`Handle`] and spawns each request onto it, so the fan-out works
 //! even when the pass is driven synchronously off the `urn:time` timer thread (which has no tokio
 //! reactor of its own).
@@ -242,7 +242,7 @@ pub struct Status {
     pub url: String,
     pub subject: String,
     pub title: String,
-    /// `ok` | `gone` | `nxdomain` | `unreachable` | `refused` — see [`Outcome`], whose variants
+    /// `ok` | `gone` | `nxdomain` | `unreachable` | `refused` — see `Outcome`, whose variants
     /// these name one-for-one. The three broken kinds are three different *kinds of evidence*,
     /// never collapsed: only `gone` and `nxdomain` are evidence the thing is dead.
     pub status: String,
@@ -258,7 +258,7 @@ pub struct Status {
     pub broken_count: u32,
     /// Unix seconds the human said **keep** — reviewed and decided, stop offering it. 0 = undecided.
     /// It is the escape hatch for a link the checker cannot verify but the human can (a bot-walled
-    /// publisher opens fine in a browser), so it has to outlive the runs: [`merge`] carries it
+    /// publisher opens fine in a browser), so it has to outlive the runs: `merge` carries it
     /// across every later pass, it drops the URL out of every review bucket and every removal set,
     /// and it demotes the URL to a weekly background re-check instead of an every-run one.
     #[serde(default)]
@@ -313,7 +313,7 @@ pub fn removable(s: &Status) -> bool {
     s.status == "gone"
 }
 
-/// Whether the *domain* is gone: a two-sighting-confirmed NXDOMAIN (see [`merge`]). Stronger
+/// Whether the *domain* is gone: a two-sighting-confirmed NXDOMAIN (see `merge`). Stronger
 /// evidence than a 404 and much easier to act on in bulk — a 404 says one page left a live server,
 /// this says the name no longer resolves at all — so it is its own reviewed set
 /// ([`RemovalSet::NxDomain`]) rather than being folded in with the 404s.
@@ -349,12 +349,12 @@ pub fn durably_unreachable(s: &Status, now: u64) -> bool {
 #[derive(Clone, Copy)]
 pub enum RemovalSet {
     /// The domain no longer resolves: NXDOMAIN, confirmed by two sightings ≥
-    /// [`NXDOMAIN_CONFIRM_GAP_SECS`] apart (see [`dead_domain`]).
+    /// `NXDOMAIN_CONFIRM_GAP_SECS` apart (see [`dead_domain`]).
     NxDomain,
     /// Definitively dead: HTTP 404/410, GET-confirmed.
     Gone,
-    /// Durably unreachable: failed the patient re-check across ≥[`DURABLE_RUNS`] runs over
-    /// ≥[`DURABLE_SECS`] (see [`durably_unreachable`]).
+    /// Durably unreachable: failed the patient re-check across ≥`DURABLE_RUNS` runs over
+    /// ≥`DURABLE_SECS` (see [`durably_unreachable`]).
     DurableUnreachable,
 }
 
@@ -538,7 +538,7 @@ pub struct Meta {
     pub total: usize,
     /// Unix seconds of the last progress tick — a liveness heartbeat. A `running: true` meta with a
     /// stale heartbeat is a pass that was killed before it could clear the flag (see
-    /// [`STALE_META_SECS`]).
+    /// `STALE_META_SECS`).
     #[serde(default)]
     pub heartbeat: u64,
     /// Unix seconds the last pass finished.
@@ -1546,7 +1546,7 @@ pub enum LinkDecision {
     /// path the bulk purges use, just with a candidate set of exactly one.
     Remove,
     /// Reviewed and kept: never offer this URL again. Persisted as `kept_at` in the status cache
-    /// so it survives every later pass (see [`Status::kept_at`] and [`merge`]).
+    /// so it survives every later pass (see [`Status::kept_at`] and `merge`).
     Keep,
 }
 

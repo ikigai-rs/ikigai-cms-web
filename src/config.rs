@@ -14,7 +14,7 @@
 //! file where a *legal-looking* combination has to be refused: `http://localhost` is a **secure
 //! context** and `http://192.168.1.5` is not, so a room bound to a non-loopback address and
 //! served over plain HTTP has a passkey gate that cannot function at all. See
-//! [`check_reachable`] — a room whose front door can never open must not start.
+//! `check_reachable` — a room whose front door can never open must not start.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -101,7 +101,7 @@ pub struct CmsConfig {
     pub wire_port: u16,
     pub page_port: u16,
     /// Where the reading-room page listens. Validated against `rp_origin` at load
-    /// ([`check_reachable`]): a non-loopback bind is only legal behind an `https` origin.
+    /// (`check_reachable`): a non-loopback bind is only legal behind an `https` origin.
     pub bind: IpAddr,
     pub src_dir: PathBuf,
     pub bookmarks: Option<String>,
