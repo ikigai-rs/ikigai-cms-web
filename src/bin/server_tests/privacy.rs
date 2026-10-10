@@ -35,7 +35,9 @@ use ikigai_resolve::Resolver;
 /// - `urn:cms:bookmarks`: ikigai-cms's by-value transreptor (org text in, Turtle out).
 /// - `urn:sparql:{select,ask,describe,construct}` and `urn:xslt:transform`: pure compute over
 ///   what the caller hands them; every `graph=` / `stylesheet=` they resolve is issued under the
-///   CALLER's capability, so they can read nothing the caller could not read directly.
+///   CALLER's capability, so they can read nothing the caller could not read directly. The
+///   transform is public only with the room's own stylesheets: the door refuses a signed-out
+///   caller any other `stylesheet=`, by value or by reference (ledger #1039).
 /// - `urn:kernel:actions` and `urn:kernel:validate`: the kernel's own operations that core leaves
 ///   open. The manifold is filtered by the CALLER's capability, so the public ceiling is offered
 ///   only this list; validation is a pre-flight that runs nothing. Every other `urn:kernel:*`
@@ -410,4 +412,250 @@ fn dev_open_still_reads_the_overlays() {
         "urn:cms:graph:tags-approved",
     );
     assert!(String::from_utf8_lossy(&body).contains(SECRET_TAG));
+}
+
+/// A stylesheet that proves it ran: its whole output is this marker.
+const INLINE_RAN: &str = "INLINE-STYLESHEET-RAN";
+
+fn inline_stylesheet() -> String {
+    format!(
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">\
+         <xsl:output method=\"text\"/><xsl:template match=\"/\">{INLINE_RAN}</xsl:template>\
+         </xsl:stylesheet>"
+    )
+}
+
+/// Every byte but an ASCII letter or digit, percent-encoded: a value as a `/r/` query carries it.
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Ledger #1039 (Brian's decision on ledger #916): a signed-out caller may style only with the
+/// room's own named stylesheets. Reproduced on 74f77c2, where an anonymous
+/// `GET /r/urn:xslt:transform` carrying the stylesheet by value ran it and answered the marker.
+/// Every other spelling of "a stylesheet the room does not own" is refused the same way.
+#[test]
+fn a_signed_out_visitor_cannot_supply_a_stylesheet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, _) = room(dir.path());
+    let inline = enc(&inline_stylesheet());
+    for target in [
+        // By value: the reproduction.
+        format!("urn:xslt:transform?stylesheet={inline}&content=%3Ca%2F%3E"),
+        // By value after leading whitespace, which the endpoint still reads as a document.
+        format!("urn:xslt:transform?stylesheet=%20%0A{inline}&content=%3Ca%2F%3E"),
+        // A room style first and the caller's second: the request carries the last.
+        format!(
+            "urn:xslt:transform?stylesheet=urn:cms:style:review\
+             &stylesheet={inline}&content=%3Ca%2F%3E"
+        ),
+        // By reference to a public resource that is not a room style.
+        "urn:xslt:transform?stylesheet=urn:cms:bookmarks&content=%3Ca%2F%3E".to_string(),
+        // A case variant of the door (the kernel does not resolve it; the door refuses it first).
+        format!("URN:XSLT:TRANSFORM?stylesheet={inline}&content=%3Ca%2F%3E"),
+    ] {
+        let body = public_get(&kernel, &target);
+        assert!(
+            !body.contains(INLINE_RAN),
+            "a signed-out GET ran its own stylesheet: {target} -> {body}"
+        );
+        assert!(
+            body.contains("cms-error") && body.contains("denied"),
+            "{target}: refused, but not as a denial: {body}"
+        );
+    }
+}
+
+/// The typed form of that refusal, and what is NOT refused: no `stylesheet` at all is the
+/// endpoint's own missing-argument answer, and every other resource passes the door untouched.
+#[test]
+fn the_door_refuses_a_foreign_stylesheet_as_denied() {
+    let xslt = |stylesheet: Option<ikigai_core::ArgRef>| {
+        let mut r = Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
+            .with_arg("content", ikigai_core::ArgRef::Inline(b"<a/>".to_vec()));
+        if let Some(s) = stylesheet {
+            r = r.with_arg("stylesheet", s);
+        }
+        r
+    };
+    let inline = |s: &str| Some(ikigai_core::ArgRef::Inline(s.as_bytes().to_vec()));
+    for refused in [
+        inline(&inline_stylesheet()),
+        inline("urn:sparql:construct"),
+        inline("https://example.org/evil.xsl"),
+        inline(" urn:cms:style:review"),
+        Some(ikigai_core::ArgRef::Reference(
+            Iri::parse("urn:cms:style:review").unwrap(),
+        )),
+        Some(ikigai_core::ArgRef::Inline(vec![0xff, 0xfe])),
+    ] {
+        let shown = format!("{refused:?}");
+        match super::refuse_anonymous_stylesheet(&xslt(refused)) {
+            Err(Error::Denied(m)) => assert!(m.contains("urn:cms:style:"), "{m}"),
+            other => panic!("{shown}: expected Denied, got {other:?}"),
+        }
+    }
+    for admitted in [
+        None,
+        inline("urn:cms:style:review"),
+        inline("urn:cms:style:catalog"),
+    ] {
+        let shown = format!("{admitted:?}");
+        assert!(
+            super::refuse_anonymous_stylesheet(&xslt(admitted)).is_ok(),
+            "{shown} was refused"
+        );
+    }
+    let other = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap()).with_arg(
+        "stylesheet",
+        ikigai_core::ArgRef::Inline(inline_stylesheet().into_bytes()),
+    );
+    assert!(super::refuse_anonymous_stylesheet(&other).is_ok());
+}
+
+/// What the rule must not cost: the room's own stylesheets still style a signed-out caller's
+/// document, and a signed-in session may still send its own.
+#[test]
+fn named_styles_stay_public_and_a_signed_in_reader_may_send_a_stylesheet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, entitlement) = room(dir.path());
+    let review = public_get(
+        &kernel,
+        "urn:xslt:transform?stylesheet=urn:cms:style:review\
+         &content=%3Crev%3Areview%20xmlns%3Arev%3D%22urn%3Acms%3Areview%23%22%2F%3E",
+    );
+    assert!(
+        review.contains(".cms-review") && !review.contains("cms-error"),
+        "a room style no longer serves a signed-out caller: {review}"
+    );
+
+    let auth = HttpAuth::default();
+    auth.sessions.lock().unwrap().insert(
+        "sid".into(),
+        HttpSession {
+            scopes: Some(entitlement.clone()),
+            principal: Some("reader".into()),
+            pending: None,
+            wire_token: None,
+        },
+    );
+    let (cap, who) = session_cap(&auth, Some("sid"), &entitlement, false);
+    let (_s, _c, body) = resolve_http(
+        &kernel,
+        &RecentLog::default(),
+        &cap,
+        who.as_deref(),
+        &format!(
+            "urn:xslt:transform?stylesheet={}&content=%3Ca%2F%3E",
+            enc(&inline_stylesheet())
+        ),
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(body.trim(), INLINE_RAN, "signed in: {body}");
+}
+
+/// The wire's anonymous door is the same door: a never-signed-in WebTransport session is refused
+/// its own stylesheet on `Issue` and on `IssueAs`, and a signed-in one is served.
+#[test]
+fn an_anonymous_wire_session_cannot_supply_a_stylesheet() {
+    use ikigai_wire::{decode, encode, Call, Reply};
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, entitlement) = room(dir.path());
+    let rp = ikigai_cms_web::session::Rp::new(
+        "localhost",
+        "http://localhost:8080",
+        std::sync::Arc::new(ikigai_secret::FileBackend::new(dir.path().join("keys"))),
+    )
+    .expect("a relying party over a scratch keystore");
+    let req = Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
+        .with_arg(
+            "stylesheet",
+            ikigai_core::ArgRef::Inline(inline_stylesheet().into_bytes()),
+        )
+        .with_arg("content", ikigai_core::ArgRef::Inline(b"<a/>".to_vec()));
+    let ask = |session: &mut super::Session, call: Call| {
+        let reply = super::handle(
+            &kernel,
+            &rp,
+            &HttpAuth::default(),
+            &entitlement,
+            &RecentLog::default(),
+            session,
+            &encode(&call).unwrap(),
+            ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
+        );
+        decode::<Reply>(&reply).unwrap()
+    };
+    let mut anonymous = super::Session {
+        ceiling: Capability::scoped(Vec::<String>::new()),
+        auth_state: None,
+        reg_state: None,
+        principal: None,
+    };
+    for call in [
+        Call::Issue(req.clone()),
+        Call::IssueAs(req.clone(), Capability::root()),
+    ] {
+        match ask(&mut anonymous, call) {
+            Reply::Error(e) => assert!(e.contains("denied"), "{e}"),
+            other => panic!("an anonymous wire session ran its own stylesheet: {other:?}"),
+        }
+    }
+    let mut signed_in = super::Session {
+        ceiling: Capability::scoped(entitlement.clone()),
+        auth_state: None,
+        reg_state: None,
+        principal: Some("reader".into()),
+    };
+    match ask(&mut signed_in, Call::Issue(req)) {
+        Reply::Resolved(repr, _) => {
+            assert_eq!(String::from_utf8_lossy(&repr.bytes).trim(), INLINE_RAN)
+        }
+        other => panic!("signed in: {other:?}"),
+    }
+}
+
+/// The public door still hands the XSLT engine a CALLER'S DOCUMENT (`content=`) under a room
+/// style, so the room must run an engine that bounds caller XML: ikigai-xslt 0.2.1 (ledger #916).
+/// Below it, ~114 nested elements abort the release process and ~24 the debug one. Here a
+/// signed-out caller's 300-deep document, and a signed-in caller's stylesheet nesting 40
+/// brackets in one XPath, are each answered with a refusal rather than taking the room down.
+#[test]
+fn caller_xml_too_deep_is_refused_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, entitlement) = room(dir.path());
+    let deep = format!("{}{}", "%3Ca%3E".repeat(300), "%3C%2Fa%3E".repeat(300));
+    let body = public_get(
+        &kernel,
+        &format!("urn:xslt:transform?stylesheet=urn:cms:style:review&content={deep}"),
+    );
+    assert!(body.contains("cms-error"), "{body}");
+
+    let brackets = format!("{}1{}", "(".repeat(40), ")".repeat(40));
+    let style = format!(
+        "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">\
+         <xsl:template match=\"/\"><xsl:value-of select=\"{brackets}\"/></xsl:template>\
+         </xsl:stylesheet>"
+    );
+    let cap = Capability::scoped(entitlement);
+    let (_s, _c, body) = resolve_http(
+        &kernel,
+        &RecentLog::default(),
+        &cap,
+        Some("reader"),
+        &format!(
+            "urn:xslt:transform?stylesheet={}&content=%3Ca%2F%3E",
+            enc(&style)
+        ),
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("cms-error"), "{body}");
 }

@@ -1494,9 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-cms"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6393fe4e56d8046c922e6a8ed1c645bd3c8c305d3aba77205b09d100891723"
+checksum = "df50b47eee4f2fd085906561d7be8316e7c02ba6d0739da990b9294514d14185"
 dependencies = [
  "ikigai-core",
 ]
@@ -1537,9 +1537,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-conformance"
-version = "0.5.1"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae296780f0514f2869f9d32f3d71c05fba6b9b34cde228199200459c173cf4a8"
+checksum = "5f3d0281cc6f087acc6561d1b3c6e3b9f45ff6d030b0ce6f94c25bcd1c6584b8"
 dependencies = [
  "futures",
  "ikigai-core",
@@ -1550,9 +1550,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.86"
+version = "0.1.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a92bf4ff6eed58847c27c810a946b281cb0104d7f8948d607f4f9140764a43e1"
+checksum = "f3687ff94ace80d29d4d73b664fb7b69d5a70a4c5bd5d51e151be08690a45937"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1587,9 +1587,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-llm"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a906b2c948de40e0a0f73155e09dfdf4b9b38d5d23f6c7902009dd2b2fc13f5"
+checksum = "c7e45111c0b0492f8dc7c0880f8a0169e43f453747c032fec9e44d60f2e5b40c"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -1600,10 +1600,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "ikigai-resolve"
-version = "0.1.41"
+name = "ikigai-rdf"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8985ce9d97b562c19d528793de2bed5ec174c0d0ede9f067ef15affcb8f38d25"
+checksum = "691a2e7d51818c6f3807caf98251e796b91788d39aa6b0a4a65cae679536d6e9"
+dependencies = [
+ "async-trait",
+ "getrandom 0.3.4",
+ "ikigai-core",
+ "oxrdf",
+ "oxrdfio",
+ "quick-xml",
+]
+
+[[package]]
+name = "ikigai-resolve"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e7b5c0ded3b3710f2d0b225c09b2f23705e34bdae69c562de86337550458efe"
 dependencies = [
  "async-trait",
  "futures",
@@ -1630,14 +1644,16 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.1.12"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ae9e23016b40fe027260e73f4d8c15229aa7bf4728b4b5f4ea1e82c51f4714f"
+checksum = "4eb3758d30ce73eeddd0281d3ed0b0d3d7379c364ba514fd1aa62b04b61122a8"
 dependencies = [
  "async-trait",
  "ikigai-core",
+ "ikigai-rdf",
  "ikigai-vocab",
  "oxigraph",
+ "oxiri",
  "spargebra",
 ]
 
@@ -1653,9 +1669,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.86"
+version = "0.1.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10445e240d7e5243a5e2e20c8397c9bf17765ccdecde3aef457fe98aea4a4bb5"
+checksum = "e026bf10754d646becd25cf072e068930b9ae4ea55d4ebced3d97b62f996f96b"
 dependencies = [
  "ikigai-core",
  "serde_json",
@@ -1663,9 +1679,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.1.20"
+version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "863bdbe793dc5d7fe65cd56661732cb6f2b5e7e5e18156941db68865b5d2d946"
+checksum = "e5bc3dadfb70804e54778e714fe7429c8d10231f956d2131092368c5325c51b2"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -1675,12 +1691,13 @@ dependencies = [
 
 [[package]]
 name = "ikigai-xslt"
-version = "0.1.3"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bff3a34625f21bc3540d21158d0a7f8dd58ec2a7b3029dcfe8b6e2e26acd3ff"
+checksum = "877f814e03d7f1944b2666a4cd11514940a416d85d1b2c734220ae4714cf7d0a"
 dependencies = [
  "async-trait",
  "ikigai-core",
+ "qualname",
  "xrust",
 ]
 
@@ -2112,7 +2129,7 @@ dependencies = [
  "sparesults",
  "spareval",
  "spargebra",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2140,7 +2157,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "ryu-js",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2155,7 +2172,7 @@ dependencies = [
  "oxsdatatypes",
  "rand 0.9.5",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2168,7 +2185,7 @@ dependencies = [
  "oxrdf",
  "oxrdfxml",
  "oxttl",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2181,7 +2198,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "quick-xml",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2191,7 +2208,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c17c2ae62ac34fda465f6331105906c0e17b4e088dac3249e1f229b962062503"
 dependencies = [
  "js-sys",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2204,7 +2221,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxrdf",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3271,7 +3288,7 @@ dependencies = [
  "memchr",
  "oxrdf",
  "quick-xml",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3294,7 +3311,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparopt",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3308,7 +3325,7 @@ dependencies = [
  "oxrdf",
  "peg",
  "rand 0.9.5",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

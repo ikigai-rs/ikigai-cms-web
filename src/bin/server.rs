@@ -29,6 +29,9 @@
 //! with no signed-in session, over both faces, so one request could pin a core for minutes. Every
 //! such request is stamped with `budget=` [`config::CmsConfig::anonymous_sparql_budget`]
 //! milliseconds (default 1 s) before it reaches the kernel — see [`stamp_anonymous_budget`].
+//! And it **styles only with the room's own stylesheets** (ledger #1039): an anonymous
+//! `urn:xslt:transform` whose `stylesheet` is not `urn:cms:style:{name}` is refused as `Denied`
+//! before it reaches the XSLT engine — see [`refuse_anonymous_stylesheet`].
 //!
 //! [`config::CmsConfig::anonymous_sparql_budget`]: ikigai_cms_web::config::CmsConfig::anonymous_sparql_budget
 //!
@@ -1100,7 +1103,9 @@ fn form_param(body: &[u8], key: &str) -> Option<String> {
 /// A caller with no signed-in session (`principal` is `None`: the public room, and `dev_open`'s
 /// unauthenticated localhost) has `anonymous_budget` stamped on any `urn:sparql:*` request — see
 /// [`stamp_anonymous_budget`]. A query stopped at that budget answers like every other resolution
-/// error on this face: `200 OK` with a `cms-error` fragment naming the timeout.
+/// error on this face: `200 OK` with a `cms-error` fragment naming the timeout. The same caller
+/// styles only with the room's own stylesheets ([`refuse_anonymous_stylesheet`]); the refusal
+/// answers the same way, as a `cms-error` fragment.
 fn resolve_http_within(
     kernel: &Kernel,
     recent: &RecentLog,
@@ -1138,7 +1143,10 @@ fn resolve_http_within(
         request = request.with_arg(k, ArgRef::Inline(percent_decode(v).into_bytes()));
     }
     if principal.is_none() {
-        request = stamp_anonymous_budget(request, anonymous_budget);
+        request = match anonymous_door(request, anonymous_budget) {
+            Ok(request) => request,
+            Err(e) => return ("200 OK", html(), error_fragment("p", &e.to_string())),
+        };
     }
     match Resolver::issue_as(kernel, request, cap) {
         Ok((repr, _)) => {
@@ -1168,6 +1176,57 @@ fn resolve_http(
         target,
         ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
     )
+}
+
+/// What the anonymous door does to a request from a caller with no signed-in session, on both
+/// faces: refuse a stylesheet the room does not own ([`refuse_anonymous_stylesheet`]), then stamp
+/// the SPARQL time budget ([`stamp_anonymous_budget`]).
+fn anonymous_door(request: Request, budget: Duration) -> ikigai_core::Result<Request> {
+    refuse_anonymous_stylesheet(&request)?;
+    Ok(stamp_anonymous_budget(request, budget))
+}
+
+/// The prefix of the room's own stylesheets: `urn:cms:style:{name}`, a closed set embedded at
+/// build time.
+const ROOM_STYLE: &str = "urn:cms:style:";
+
+/// Refuse an anonymous `urn:xslt:transform` whose `stylesheet` is anything but one of the room's
+/// own (ledger #1039; Brian's decision on ledger #916): a signed-out caller may style with
+/// `urn:cms:style:{name}` and with nothing else, so neither a stylesheet sent by value nor a
+/// reference to any other resource reaches the XSLT engine from the public door. The refusal is
+/// [`Error::Denied`](ikigai_core::Error::Denied): a signed-in session sending the same request is
+/// served.
+///
+/// **Why the door is the whole gate.** The kernel resolves the xslt endpoint only at the exact
+/// IRI `urn:xslt:transform` (a case variant is unresolved) and reads no arguments off an IRI, so
+/// a sub-request naming `urn:xslt:transform?stylesheet=…` (a SPARQL `graph=`, the endpoint's own
+/// `src=`) resolves nothing. The room's own views issue the transform themselves with
+/// `urn:cms:style:{name}`, never through this door. What is checked is the BUILT request, so a
+/// repeated query key is seen as the endpoint will see it.
+///
+/// A missing `stylesheet` passes: the endpoint refuses it itself, naming the argument. The
+/// target is matched without regard to ASCII case, which can only refuse more.
+fn refuse_anonymous_stylesheet(request: &Request) -> ikigai_core::Result<()> {
+    const XSLT: &str = "urn:xslt:transform";
+    if !request.target.as_str().eq_ignore_ascii_case(XSLT) {
+        return Ok(());
+    }
+    let room_style = match request.args.get("stylesheet") {
+        None => return Ok(()),
+        Some(ArgRef::Inline(bytes)) => {
+            std::str::from_utf8(bytes).is_ok_and(|s| s.starts_with(ROOM_STYLE))
+        }
+        // By reference or by content id: a stylesheet the room does not name.
+        Some(_) => false,
+    };
+    if room_style {
+        Ok(())
+    } else {
+        Err(ikigai_core::Error::Denied(format!(
+            "a signed-out caller may style only with the room's own stylesheets \
+             (`stylesheet={ROOM_STYLE}{{name}}`); sign in to supply another"
+        )))
+    }
 }
 
 /// Stamp the anonymous door's SPARQL time budget on `request` (ledger #964): a `urn:sparql:*`
@@ -1422,8 +1481,9 @@ async fn serve(
 /// Decode a `Call` and answer it. `urn:auth:*` Calls are handled by the session layer
 /// (the passkey ceremony); everything else resolves against the kernel **under the
 /// connection's ceiling** — so the room is gated until a verified passkey raises it. Until then
-/// the session is anonymous, and its `urn:sparql:*` requests carry `anonymous_budget`
-/// ([`stamp_anonymous_budget`]), exactly as on the HTTP face.
+/// the session is anonymous: its `urn:sparql:*` requests carry `anonymous_budget`
+/// ([`stamp_anonymous_budget`]) and it styles only with the room's own stylesheets
+/// ([`refuse_anonymous_stylesheet`]), exactly as on the HTTP face.
 #[allow(clippy::too_many_arguments)]
 fn handle(
     kernel: &Kernel,
@@ -1437,11 +1497,11 @@ fn handle(
 ) -> Vec<u8> {
     // Signed in ⇔ a principal: both login paths and the HTTP resume set it with the ceiling, and
     // logout clears both.
-    let budgeted = |req: Request, session: &Session| {
+    let door = |req: Request, session: &Session| {
         if session.principal.is_none() {
-            stamp_anonymous_budget(req, anonymous_budget)
+            anonymous_door(req, anonymous_budget)
         } else {
-            req
+            Ok(req)
         }
     };
     let reply = match decode::<Call>(bytes) {
@@ -1458,8 +1518,10 @@ fn handle(
             let scope = inline_arg(&req, "type")
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
-            let req = budgeted(req, session);
-            let reply = resolve(kernel, &session.ceiling, req);
+            let reply = match door(req, session) {
+                Ok(req) => resolve(kernel, &session.ceiling, req),
+                Err(e) => Reply::Error(e.to_string()),
+            };
             if matches!(reply, Reply::Resolved(..)) {
                 note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
             }
@@ -1471,8 +1533,10 @@ fn handle(
             let scope = inline_arg(&req, "type")
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .map(str::to_string);
-            let req = budgeted(req, session);
-            let reply = resolve(kernel, &session.ceiling.clamp(&carried), req);
+            let reply = match door(req, session) {
+                Ok(req) => resolve(kernel, &session.ceiling.clamp(&carried), req),
+                Err(e) => Reply::Error(e.to_string()),
+            };
             if matches!(reply, Reply::Resolved(..)) {
                 note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
             }
