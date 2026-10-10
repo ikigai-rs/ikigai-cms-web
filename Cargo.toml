@@ -45,7 +45,9 @@ serde_json = "1"
 # stripped, and org's link escapes come off before the identifier is taken. The room's
 # remove-by-URL (maintenance.rs `strike`) now asks THIS parser which URL a heading carries, so the
 # URL it strikes is exactly the dc:identifier the graph serves (ledger #882).
-ikigai-cms = "0.1.4"
+# 0.2.0 is a CEILING crossing (`^0.1.4` = `<0.2.0`, ledger #1039): its space() names itself
+# `urn:iki:space:cms` (ledger #987). The parser and `bookmarks_to_turtle` are unchanged from 0.1.4.
+ikigai-cms = "0.2.0"
 # Read back the Turtle ikigai-cms emits: `strike` (maintenance.rs) asks ikigai-cms which URL a
 # heading carries by transrepting the record and reading its dc:identifier, rather than parsing
 # org a second time (ledger #882). Both are already in the graph through ikigai-sparql's Oxigraph;
@@ -60,10 +62,19 @@ oxrdf = { version = "0.3.0", optional = true }
 # anonymous `urn:sparql:*` request (`anonymous_sparql_budget_ms`, src/bin/server.rs). Below it
 # that argument does not exist and an anonymous query runs unbounded. The `0.1.5` this replaces
 # was stale, not a ceiling: the lock had already moved to 0.1.11 (ledger #962).
-ikigai-sparql = "0.1.12"
+# 0.2.1 is a CEILING crossing (`^0.1.12` = `<0.2.0`, ledger #1039) and a real floor: 0.2.0 names
+# the space `urn:iki:space:sparql` (ledger #987) and bounds every answer's size (ledger #970);
+# 0.2.1 runs the query on a thread sized for the build, so debug and release agree (ledger #1025).
+ikigai-sparql = "0.2.1"
 # XSLT transform (urn:xslt:transform, xrust) — the view pipes its CONSTRUCT'd RDF/XML
 # through a `urn:cms:style:*` stylesheet to render cards. Native/server-side only.
-ikigai-xslt = "0.1.0"
+# 0.2.1 is a SECURITY floor and the `0.1.0` it replaces was a CEILING (`^0.1.0` = `<0.2.0`, so the
+# room could never receive the fix; ledger #1039): below it, ~114 nested elements of caller XML,
+# or ~13 nested brackets in one XPath, overflow the stack and ABORT the process (ledger #916). The
+# public door still hands the engine a caller's document under a room style, so this is the bound
+# that keeps one anonymous GET from taking the room down (server_tests/privacy.rs pins it).
+# 0.2.0, crossed on the way, names the space `urn:iki:space:xslt` (ledger #987).
+ikigai-xslt = "0.2.1"
 # Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
 ikigai-fs = "0.1.8" # security floor (audit round 3, ledger #856): the jail authorizes the file it opens
 # Endpoint::invoke is async (dyn via async-trait) — the assembly + view endpoints read
@@ -182,4 +193,6 @@ tempfile = "3"
 # 0.5.1, not the 0.3.0 the brief named: `^0.2.0` and `^0.3.0` are each a CEILING under 0.x rules,
 # so either would hold the room to an old definition of "done". 0.5.1 is the current one; it
 # requires ikigai-core 0.1.85, so the lock now resolves core there.
-ikigai-conformance = "0.5.1"
+# 0.6.1, a CEILING crossing again (`^0.5.1` = `<0.6.0`, ledger #1039): 0.6.0 adds SPACE-NAME (a
+# module's space says who it is, ledger #987) and 0.6.1 reads an `Expiry::At` deadline as a bound.
+ikigai-conformance = "0.6.1"
