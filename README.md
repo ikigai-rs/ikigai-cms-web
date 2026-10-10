@@ -152,6 +152,32 @@ purge prompts refuse it, and every endpoint refuses a verb it does not declare. 
 `server_tests/privacy.rs` walk holds this: it lists the public set by name and fails on any
 other binding a signed-out visitor is not refused on.
 
+### The anonymous SPARQL budget
+
+Because SPARQL is on that public list, one signed-out request could otherwise pin a core for
+minutes: a three-way cross product of 100-row `VALUES` tables (no graph needed, about 1.3 KB of
+query) answered 272 MB after 11 s, and a long property path ran over 10 minutes.
+So every `urn:sparql:*` request from a caller **with no signed-in session** — over `/r/` and the
+wire alike, `dev_open`'s unauthenticated localhost included — leaves the door carrying
+`budget=` **1000 ms**, and a query that runs past it is refused with ikigai-sparql's typed
+timeout, never a partial answer. On the HTTP face that refusal renders like every other
+resolution error: `200 OK` with a `cms-error` fragment naming the budget (the wire returns it as
+the reply's error). A caller's own `budget=` is kept only when it is a smaller whole number of
+milliseconds; a larger one, `budget=600000` say, still stops at the door's.
+
+Change it in `cms.toml` (or for one run with `--anonymous-sparql-budget-ms <ms>`):
+
+```toml
+anonymous_sparql_budget_ms = 1000   # 1 to 5000; the server prints the value it applies
+```
+
+The budget is stamped at the door rather than set as the SPARQL space's ceiling because the
+room's own views, tag overlays and maintenance passes query through the same kernel. Those, and
+signed-in callers, run under the space's own 5 s ceiling (`ikigai_sparql::budget::DEFAULT_BUDGET`),
+which is also why a value above 5000 is refused: it would never apply. Measured on a copy of the
+live library (2.1 MB of bookmarks, the 4.4 MB Zotero export, release build), the room's heaviest
+read is a cold tag view at ~170 ms, the book CONSTRUCT ~100 ms.
+
 Needs a WebTransport browser: Chrome/Edge or Safari 26.4+ (any browser once WebTransport
 went Baseline in March 2026 — but the local page uses `serverCertificateHashes` to trust
 the self-signed cert, and Firefox's support for that self-signed path lags, so it may not
@@ -229,3 +255,13 @@ arithmetic rather than caution.
 
 Reinstall: `cargo install --path . --features server --locked --force` from this checkout,
 then re-register `dev.ikigai-rs.cms` (see "Install as a service").
+
+### 2026-10-09: a time budget on the anonymous door
+
+- **`ikigai-sparql` 0.1.12**: every evaluation runs under a time budget (5 s by default) and a
+  query's algebra is bounded before planning.
+- **Signed-out SPARQL gets 1 s** (`anonymous_sparql_budget_ms`, see "The anonymous SPARQL
+  budget"), on both faces, and a caller's `budget=` can only lower it.
+
+Reinstall the same way: `cargo install --path . --features server --locked --force`, then
+re-register `dev.ikigai-rs.cms`. No `cms.toml` change is needed for the 1 s default.

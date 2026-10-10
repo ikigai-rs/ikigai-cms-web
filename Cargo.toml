@@ -54,7 +54,13 @@ ikigai-cms = "0.1.4"
 oxttl = { version = "0.2.0", optional = true }
 oxrdf = { version = "0.3.0", optional = true }
 # SPARQL over graph=<uri> sources resolved through the kernel (Oxigraph in-memory).
-ikigai-sparql = "0.1.5"
+# 0.1.12 is a REAL floor (ledger #964): it is the first release with a TIME budget on every
+# evaluation — algebra bounds before planning, a watchdog deadline, a typed `Timeout` — and the
+# per-request `budget=` milliseconds argument (tighten-only) that the server stamps on every
+# anonymous `urn:sparql:*` request (`anonymous_sparql_budget_ms`, src/bin/server.rs). Below it
+# that argument does not exist and an anonymous query runs unbounded. The `0.1.5` this replaces
+# was stale, not a ceiling: the lock had already moved to 0.1.11 (ledger #962).
+ikigai-sparql = "0.1.12"
 # XSLT transform (urn:xslt:transform, xrust) — the view pipes its CONSTRUCT'd RDF/XML
 # through a `urn:cms:style:*` stylesheet to render cards. Native/server-side only.
 ikigai-xslt = "0.1.0"

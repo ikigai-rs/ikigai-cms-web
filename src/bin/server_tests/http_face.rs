@@ -11,12 +11,18 @@
 //!   `%` before a multi-byte character killed the connection's task before any check ran.
 //! - **The wire's verb.** A never-signed-in WebTransport session issued `Source` on a Sink and
 //!   the write ran (closed by `serves` in every endpoint; pinned here at the wire's door).
+//!
+//! And one that is not an audit's: **the anonymous door's time budget** (ledger #964). A
+//! signed-out `urn:sparql:*` request is stamped with `anonymous_sparql_budget_ms` on both faces;
+//! reproduced on 1cb5e7c, where a 1.3 KB cross product answered 272 MB after 11 s.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::{handle, percent_decode, resolve_http, serve_http, HttpAuth, PageOrigin, Session};
+use ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET;
 use ikigai_cms_web::session::{RecentLog, Rp};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
 use ikigai_wire::{encode, Call};
@@ -55,8 +61,14 @@ fn rp(dir: &Path) -> Rp {
     .expect("rp builds")
 }
 
-/// Start the page server on a free loopback port, answering for `origin`.
+/// Start the page server on a free loopback port, answering for `origin`, at the default
+/// anonymous SPARQL budget.
 async fn start(dir: &Path, origin: &str, dev_open: bool) -> u16 {
+    start_budgeted(dir, origin, dev_open, DEFAULT_ANONYMOUS_SPARQL_BUDGET).await
+}
+
+/// [`start`] with the anonymous SPARQL budget `budget` (`anonymous_sparql_budget_ms`).
+async fn start_budgeted(dir: &Path, origin: &str, dev_open: bool, budget: Duration) -> u16 {
     let (kernel, ent) = room(dir);
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
@@ -71,6 +83,7 @@ async fn start(dir: &Path, origin: &str, dev_open: bool) -> u16 {
         Arc::new(ent),
         Arc::new(PageOrigin::parse(origin).unwrap()),
         dev_open,
+        budget,
     ));
     port
 }
@@ -285,9 +298,223 @@ fn a_public_wire_session_cannot_dismiss_a_tag() {
             &RecentLog::default(),
             &mut session,
             &encode(&Call::Issue(req)).unwrap(),
+            DEFAULT_ANONYMOUS_SPARQL_BUDGET,
         );
     }
     let dismissed =
         std::fs::read_to_string(dir.path().join("cms-tag-dismissed.ttl")).unwrap_or_default();
     assert!(!dismissed.contains("planted"), "{dismissed}");
+}
+
+// ---- The anonymous door's SPARQL time budget (ledger #964) ----
+//
+// A signed-out caller reaches `urn:sparql:*` with no graph it may read (every room graph is
+// behind the fs grant, and `urn:kernel:actions` is not RDF), so the slow query carries its own
+// data: three `VALUES` tables of 100 rows, cross-joined — a million solutions. `VALUES` rows
+// cost nothing under ikigai-sparql's algebra bounds, so this passes them and has to be stopped by
+// the clock. Measured on 1cb5e7c (sparql 0.1.11, no budget), it answered `200` with every row
+// after ~11 s (debug); on 0.1.12 without the door's stamp it stopped at the space's 5 s ceiling.
+
+/// `SELECT *` over three `VALUES` tables of `n` integers each: `n³` solutions, no dataset.
+fn cross_product(n: usize) -> String {
+    let vals = (0..n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join("%20");
+    format!(
+        "SELECT%20*%20WHERE%20%7B%20VALUES%20%3Fa%20%7B{vals}%7D%20\
+         VALUES%20%3Fb%20%7B{vals}%7D%20VALUES%20%3Fc%20%7B{vals}%7D%20%7D"
+    )
+}
+
+/// Comfortably under the space's 5 s ceiling and over the door's 1 s, so passing means the door
+/// stopped it, not the space.
+const WELL_UNDER_THE_CEILING: Duration = Duration::from_millis(3000);
+
+/// GET `/r/{target}` signed out, returning the response and how long it took.
+async fn timed_get(port: u16, target: &str) -> (String, Duration) {
+    let start = Instant::now();
+    let resp = send(
+        port,
+        &format!("GET /r/{target} HTTP/1.1\r\nHost: localhost:8080"),
+    )
+    .await;
+    (resp, start.elapsed())
+}
+
+/// The reproduction: an anonymous cross product is refused at the door's 1 s budget, as a typed
+/// timeout rendered the way this face renders every resolution error — `200 OK` and a `cms-error`
+/// fragment (htmx swaps a 200; that mapping is the face's, not this budget's).
+#[tokio::test]
+async fn an_anonymous_cross_product_is_stopped_at_the_door_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = start(dir.path(), "http://localhost:8080", false).await;
+    let (resp, took) = timed_get(
+        port,
+        &format!("urn:sparql:select?query={}", cross_product(100)),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains("cms-error"), "{resp}");
+    assert!(
+        resp.contains("time budget of 1000 ms"),
+        "refused at the door's budget, not the space's: {resp}"
+    );
+    assert!(
+        !resp.contains("\"bindings\""),
+        "never a partial answer: {resp}"
+    );
+    assert!(took < WELL_UNDER_THE_CEILING, "took {took:?}");
+}
+
+/// `budget=` from an anonymous caller can only tighten the door: 600,000 ms still stops at the
+/// door's budget, and a smaller one is honored.
+#[tokio::test]
+async fn an_anonymous_budget_cannot_loosen_the_door() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = start(dir.path(), "http://localhost:8080", false).await;
+    let query = cross_product(100);
+    let (resp, took) = timed_get(
+        port,
+        &format!("urn:sparql:select?budget=600000&query={query}"),
+    )
+    .await;
+    assert!(resp.contains("time budget of 1000 ms"), "{resp}");
+    assert!(took < WELL_UNDER_THE_CEILING, "took {took:?}");
+
+    let (resp, took) =
+        timed_get(port, &format!("urn:sparql:select?budget=200&query={query}")).await;
+    assert!(
+        resp.contains("time budget of 200 ms"),
+        "a tighter budget is kept: {resp}"
+    );
+    assert!(took < Duration::from_millis(1000), "took {took:?}");
+}
+
+/// The budget is `anonymous_sparql_budget_ms`, not a constant: the server applies what it is
+/// configured with.
+#[tokio::test]
+async fn the_door_applies_the_configured_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = start_budgeted(
+        dir.path(),
+        "http://localhost:8080",
+        false,
+        Duration::from_millis(300),
+    )
+    .await;
+    let (resp, took) = timed_get(
+        port,
+        &format!("urn:sparql:select?query={}", cross_product(100)),
+    )
+    .await;
+    assert!(resp.contains("time budget of 300 ms"), "{resp}");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    // An ordinary anonymous query still answers.
+    let (ok, _) = timed_get(
+        port,
+        &format!("urn:sparql:select?query={}", cross_product(2)),
+    )
+    .await;
+    assert!(ok.contains("\"bindings\""), "{ok}");
+}
+
+/// The wire's anonymous door is the same door: a never-signed-in WebTransport session is
+/// stamped too, including when it sends `budget=` by reference (which ikigai-sparql would read as
+/// no budget, i.e. its 5 s ceiling).
+#[test]
+fn an_anonymous_wire_session_is_budgeted_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, ent) = room(dir.path());
+    let mut session = Session {
+        ceiling: Capability::scoped(Vec::<String>::new()),
+        auth_state: None,
+        reg_state: None,
+        principal: None,
+    };
+    let query = super::percent_decode(&cross_product(100));
+    for budget in [
+        None,
+        Some(ArgRef::Inline(b"600000".to_vec())),
+        Some(ArgRef::Reference(
+            Iri::parse("urn:cms:style:catalog").unwrap(),
+        )),
+    ] {
+        let mut req = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
+            .with_arg("query", ArgRef::Inline(query.clone().into_bytes()));
+        if let Some(b) = budget.clone() {
+            req = req.with_arg("budget", b);
+        }
+        let start = Instant::now();
+        let reply = handle(
+            &kernel,
+            &rp(dir.path()),
+            &HttpAuth::default(),
+            &ent,
+            &RecentLog::default(),
+            &mut session,
+            &encode(&Call::Issue(req)).unwrap(),
+            Duration::from_millis(400),
+        );
+        let took = start.elapsed();
+        match ikigai_wire::decode::<ikigai_wire::Reply>(&reply).unwrap() {
+            ikigai_wire::Reply::Error(e) => {
+                assert!(e.contains("time budget of 400 ms"), "{budget:?}: {e}")
+            }
+            other => panic!("{budget:?}: expected the timeout, got {other:?}"),
+        }
+        assert!(took < WELL_UNDER_THE_CEILING, "{budget:?} took {took:?}");
+    }
+}
+
+/// What the stamp does to a request, case by case.
+#[test]
+fn the_stamp_narrows_only_sparql_and_keeps_only_a_tighter_budget() {
+    let door = Duration::from_millis(1000);
+    let budget_of = |req: &Request| match req.args.get("budget") {
+        Some(ArgRef::Inline(b)) => Some(String::from_utf8(b.clone()).unwrap()),
+        Some(other) => Some(format!("{other:?}")),
+        None => None,
+    };
+    let sparql = |iri: &str| Request::new(Verb::Source, Iri::parse(iri).unwrap());
+    let with = |iri: &str, arg: ArgRef| sparql(iri).with_arg("budget", arg);
+    let stamp = |r| super::stamp_anonymous_budget(r, door);
+
+    assert_eq!(
+        budget_of(&stamp(sparql("urn:sparql:select"))).as_deref(),
+        Some("1000")
+    );
+    assert_eq!(
+        budget_of(&stamp(sparql("urn:sparql:construct"))).as_deref(),
+        Some("1000")
+    );
+    assert_eq!(
+        budget_of(&stamp(sparql("URN:SPARQL:ask"))).as_deref(),
+        Some("1000")
+    );
+    for (sent, kept) in [
+        ("250", "250"),
+        (" 1000 ", " 1000 "),
+        ("1001", "1000"),
+        ("600000", "1000"),
+        ("0", "1000"),
+        ("1s", "1000"),
+        ("-5", "1000"),
+    ] {
+        let out = stamp(with(
+            "urn:sparql:select",
+            ArgRef::Inline(sent.as_bytes().to_vec()),
+        ));
+        assert_eq!(budget_of(&out).as_deref(), Some(kept), "sent {sent:?}");
+    }
+    let by_ref = stamp(with(
+        "urn:sparql:select",
+        ArgRef::Reference(Iri::parse("urn:x").unwrap()),
+    ));
+    assert_eq!(budget_of(&by_ref).as_deref(), Some("1000"));
+    // Anything that is not SPARQL passes through untouched.
+    let view = stamp(sparql("urn:cms:view:science"));
+    assert!(view.args.is_empty(), "{:?}", view.args);
+    let other = stamp(with("urn:xslt:transform", ArgRef::Inline(b"9".to_vec())));
+    assert_eq!(budget_of(&other).as_deref(), Some("9"));
 }
