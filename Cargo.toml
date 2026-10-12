@@ -146,6 +146,15 @@ toml = { version = "0.8", optional = true }
 
 # The browser wire codec (encodeIssue / decodeReply) — wasm only.
 [target.'cfg(target_family = "wasm")'.dependencies]
+# EXACT on purpose (ledger #1342), unlike every other pin here. `build-wasm.sh` builds this
+# crate's cdylib and post-processes it with a `wasm-bindgen` CLI that must match the library
+# version exactly: the script names `wasm-bindgen-cli --version 0.2.108`, and a CLI at any
+# other version refuses the wasm (schema version mismatch). The committed lock holds 0.2.108
+# today, but under a caret an ordinary `cargo update` moves it: measured 2026-10-12, a caret
+# `"0.2.108"` takes wasm-bindgen to 0.2.129 (and js-sys 0.3.85 -> 0.3.106), while this exact
+# pin leaves both where they are. So this pin is what ties the crate to that CLI; bump it in
+# step with the version in `build-wasm.sh` (and the other `=0.2.108` crates in the
+# ecosystem's lockstep), never alone.
 wasm-bindgen = "=0.2.108"
 
 [features]
