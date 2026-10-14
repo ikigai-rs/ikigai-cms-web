@@ -14,14 +14,15 @@
 //! ## What the walk sees, and what this file waives
 //!
 //! The kernel composes four other crates' endpoints (`file` from ikigai-fs, `bookmarks`
-//! from ikigai-cms, `sparql-*` from ikigai-sparql, `xslt-transform` from ikigai-xslt), and
-//! the suite walks everything bound (PENDING #17). [`assert_findings`] holds this module's
-//! own ids AND the dependencies' ids in [`INHERITED`] to zero findings other than NAMES — a
-//! finding against an id neither list knows is red. The composed endpoints the suite cannot
-//! call with its minimal inputs (the four SPARQL forms, the XSLT transform, ikigai-http's six
-//! verbs, `llm-select`) carry fixtures, so the walk probes them rather than recording a
-//! failed call: under ikigai-conformance 0.2 those failed calls were the "inherited"
-//! findings, and they certified nothing.
+//! from ikigai-cms, `sparql-*` from ikigai-sparql, `xslt-transform` from ikigai-xslt; the
+//! pass kernel adds ikigai-http, ikigai-llm and ikigai-secret). The walk is scoped to this
+//! module with `Suite::own` (ikigai-conformance 0.8): `urn:cms:*` and `cms-style` are walked,
+//! every other id is INHERITED, listed in the report and NOT walked, so no check reads it and
+//! no probe fires it. [`assert_findings`] pins the inherited ids exactly ([`INHERITED`]), so a
+//! dependency that gains an endpoint turns this red rather than joining the pile unseen. The
+//! dependencies certify themselves in their own repos' walks; before 0.8 this file walked
+//! them too, with a fixture for each composed endpoint the suite could not call unaided and
+//! two opt-outs for ikigai-secret's biometric operations, and `own` replaces all of that.
 //!
 //! NAMES: every id here is a full IRI (`urn:cms:graph`), which is not kebab-case. Not
 //! renamed — the ids are live MCP tool names, renamed in one coordinated pass (wave two,
@@ -44,9 +45,14 @@
 //!   its blank nodes and `bib:`/`z:` terms are the export's — skolemized onto `cms:Book`
 //!   by `urn:cms:graph:books`. The opt-out also drops ENFORCED and CACHEABLE for it
 //!   (PENDING #21), so [`the_zotero_source_is_cached_under_its_own_thread`] pins both.
-//! - Two namespaces: `cms:` (`https://ikigai-rs.dev/ns/cms#`), the vocabulary this crate
-//!   coins for the room (named in the README), and Dublin Core Elements 1.1, which the
-//!   suite does not list as well-known (PENDING #102).
+//! - One namespace: `cms:` (`https://ikigai-rs.dev/ns/cms#`), the vocabulary this crate
+//!   coins for the room (named in the README). Dublin Core Elements 1.1 is well known to
+//!   the suite since 0.8.0 (PENDING #102), and a registration of it is an inert-namespace
+//!   DECLARATIONS finding, so it is not registered.
+//! - `required_on_mutating`: REQUIRED drops each required by-value input of the Sinks too
+//!   (`book` on the two tag Sinks), not only the Sources (`q` on `urn:cms:search`). Every
+//!   kernel here is a scratch fixture over a tempdir (the pass kernel's network and keystore
+//!   are canned), so a drop the room wrongly accepted would write only there.
 //!
 //! ## What the suite cannot hold and this file pins by hand
 //!
@@ -66,9 +72,14 @@
 //! - **The union's Turtle face, in full** ([`the_union_is_skolemized_on_the_cms_vocabulary`]):
 //!   VOCABULARY sees predicates and `rdf:type` objects only (PENDING #96); subjects and the
 //!   exact `cms:` terms the room emits are checked here.
-//! - **Required is required** ([`required_is_required`]): PENDING #49/#99.
-//! - **The fixture id is the description id** ([`the_fixture_id_is_the_description_id`]):
-//!   a `Fixture` matching no description is silently inert (PENDING #57).
+//! - **Required is required** ([`required_is_required`]): PENDING #49/#99. REQUIRED covers
+//!   `q` and `book` since 0.8; the hand test also pins the input each refusal NAMES, and
+//!   the `link-*` Sinks' "one of `url` or `content`" intake, which declares both optional
+//!   and so is outside REQUIRED's reach.
+//! - **The description id is what the suite keys on** ([`the_fixture_id_is_the_description_id`]):
+//!   a `Fixture` matching no description is silently inert (PENDING #57), and `own` matches
+//!   description ids, so the jails the room binds at `urn:cms:src:*` and `urn:cms:deck:*`
+//!   are ikigai-fs's `file`, inherited, and not `urn:cms:*`.
 //!
 //! Under `--features maintenance` the serving kernel also binds the review, the purges and
 //! the per-link actions, and [`the_maintenance_kernel_conforms`] walks the pass kernel
@@ -79,7 +90,7 @@ use std::path::{Path, PathBuf};
 
 use ikigai_cms_web::tagstore::TagPaths;
 use ikigai_cms_web::{build_cms_kernel_with, Presentations};
-use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
+use ikigai_conformance::{rdf, Check, Report, Suite};
 use ikigai_core::{
     ArgRef, Capability, Error, Expiry, Iri, Kernel, Representation, Request, Result, Verb,
 };
@@ -96,28 +107,9 @@ const FS_WRITE: &str = "urn:cap:fs:write:*";
 /// The bookmarks file, as a sub-path of the scratch jail (overriding the crate's default).
 const BOOKMARKS: &str = "bookmarks.org";
 const ZOTERO_IRI: &str = "urn:cms:src:zotero";
-/// A file present in BOTH jails (`urn:cms:src:*` and `urn:cms:deck:*`), because the suite
-/// applies a `file` fixture's binding to every entry that shares the id (PENDING #2).
+/// A path under either jail (`urn:cms:src:*` and `urn:cms:deck:*`), named only to reach the
+/// two `file` bindings' descriptions.
 const SCRATCH_FILE: &str = "conformance.txt";
-
-/// The SPARQL fixtures: one per form, over the empty default graph (no `graph=`). The
-/// CONSTRUCT's template uses a defined term, so VOCABULARY has something real to read.
-const SPARQL_SELECT: &str = "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1";
-const SPARQL_ASK: &str = "ASK { ?s ?p ?o }";
-const SPARQL_DESCRIBE: &str = "DESCRIBE <urn:example:conformance>";
-const SPARQL_CONSTRUCT: &str =
-    "CONSTRUCT { <urn:example:conformance> <http://purl.org/dc/elements/1.1/title> \"x\" } WHERE {}";
-
-/// The XSLT fixture, both inputs inline: a one-bookmark RDF/XML document and a card stylesheet
-/// with no `xsl:output` (XSLT's default method, html).
-const XSLT_DOC: &str = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-  xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <rdf:Description rdf:about="urn:example:conformance"><dc:title>x</dc:title></rdf:Description>
-</rdf:RDF>"#;
-const XSLT_STYLE: &str = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-  xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <xsl:template match="/"><h1><xsl:value-of select="//dc:title"/></h1></xsl:template>
-</xsl:stylesheet>"#;
 
 /// The bookmarks: two entries, two tags each, so the tag axis has something to join.
 const ORG: &str = "\
@@ -201,8 +193,8 @@ const OURS_MAINTENANCE: &[&str] = &[
     "urn:cms:link-keep",
 ];
 
-/// The dependencies' ids the walk also sees, at the versions the lock pins. Held to NAMES
-/// only, like this module's own: their ids are theirs to rename.
+/// The dependencies' ids the serving kernel binds beside the room, at the versions the lock
+/// pins: inherited under `Suite::own`, not walked, and pinned exactly.
 const INHERITED: &[&str] = &[
     "file",
     "bookmarks",
@@ -226,7 +218,6 @@ fn scratch(dir: &Path) -> (PathBuf, PathBuf, Presentations, TagPaths, PathBuf) {
     let src = dir.join("src");
     std::fs::create_dir_all(&src).expect("src jail");
     std::fs::write(src.join(BOOKMARKS), ORG).expect("bookmarks");
-    std::fs::write(src.join(SCRATCH_FILE), "scratch").expect("scratch file");
 
     let zotero = dir.join("zotero.rdf");
     std::fs::write(&zotero, ZOTERO).expect("zotero export");
@@ -236,7 +227,6 @@ fn scratch(dir: &Path) -> (PathBuf, PathBuf, Presentations, TagPaths, PathBuf) {
     std::fs::create_dir_all(deck.join("dist")).expect("deck");
     std::fs::write(deck.join("deck.toml"), "title = \"x\"\n").expect("deck.toml");
     std::fs::write(deck.join("dist/index.html"), DECK_HTML).expect("deck html");
-    std::fs::write(decks.join(SCRATCH_FILE), "scratch").expect("scratch file");
     let presentations = Presentations {
         root: decks,
         base_url: Some("https://decks.example".to_string()),
@@ -285,28 +275,11 @@ fn room() -> Room {
 /// The suite, configured for this module (the declarations the module docs state).
 fn suite() -> Suite {
     Suite::new()
+        // This module's endpoints; everything else the kernel binds is inherited, not walked.
+        .own("urn:cms:*")
+        .own("cms-style")
+        .required_on_mutating()
         .namespace(CMS)
-        .namespace(DC)
-        .fixture(Fixture::new("file", Verb::Source).binding("path", SCRATCH_FILE))
-        // The composed endpoints need a valid call the suite cannot guess; without one their
-        // probes fail and the walk certifies nothing about them. Each declares what its own
-        // repo's walk declares: a function of the query (no `graph=`) or of two inline
-        // documents, so pure.
-        .fixture(Fixture::new("sparql-select", Verb::Source).arg("query", SPARQL_SELECT))
-        .fixture(Fixture::new("sparql-ask", Verb::Source).arg("query", SPARQL_ASK))
-        .fixture(Fixture::new("sparql-describe", Verb::Source).arg("query", SPARQL_DESCRIBE))
-        .fixture(Fixture::new("sparql-construct", Verb::Source).arg("query", SPARQL_CONSTRUCT))
-        .fixture(
-            Fixture::new("xslt-transform", Verb::Source)
-                .arg("src", XSLT_DOC)
-                .arg("stylesheet", XSLT_STYLE),
-        )
-        .pure("sparql-select")
-        .pure("sparql-ask")
-        .pure("sparql-describe")
-        .pure("sparql-construct")
-        .pure("xslt-transform")
-        .pure("bookmarks")
         .pure("cms-style")
         .cacheable("cms-style")
         .cacheable("urn:cms:graph:books")
@@ -387,39 +360,25 @@ fn walked_ids(kernel: &Kernel) -> BTreeSet<String> {
         .collect()
 }
 
-/// The walk's verdict on THIS module: no finding against one of `ours` except NAMES,
-/// exactly the full-IRI ids under NAMES, every other finding against a pinned dependency
-/// id, the endpoint count equal to both lists together, and nothing skipped.
+/// The walk's verdict on THIS module: every finding is NAMES against one of `ours`, exactly
+/// the full-IRI ids; the walk reached exactly `ours`; `Suite::own` left out exactly
+/// `inherited`; the catalog is the two lists together; and nothing was skipped.
 fn assert_findings(report: &Report, kernel: &Kernel, ours: &[&str], inherited: &[&str]) {
     let ours: BTreeSet<&str> = ours.iter().copied().collect();
     let inherited: BTreeSet<&str> = inherited.iter().copied().collect();
     let mut names = BTreeSet::new();
-    let mut theirs = 0;
     for finding in &report.findings {
         let id = finding.endpoint.as_str();
-        if ours.contains(id) {
-            assert_eq!(
-                finding.check,
-                Check::Names,
-                "a finding against this module: {finding}"
-            );
-            names.insert(id);
-        } else {
-            assert!(
-                inherited.contains(id),
-                "a finding against an endpoint this file does not list: {finding}"
-            );
-            // With a fixture for every composed endpoint the suite cannot call unaided, the
-            // dependencies' only findings are their own ids' NAMES. Anything else is a probe
-            // that failed or a recipe a dependency broke: either way, not something to inherit
-            // silently.
-            assert_eq!(
-                finding.check,
-                Check::Names,
-                "a dependency's finding other than NAMES: {finding}"
-            );
-            theirs += 1;
-        }
+        assert!(
+            ours.contains(id),
+            "a finding against an endpoint this module does not own: {finding}"
+        );
+        assert_eq!(
+            finding.check,
+            Check::Names,
+            "a finding against this module: {finding}"
+        );
+        names.insert(id);
     }
     let full_iri: BTreeSet<&str> = ours.iter().copied().filter(|id| id.contains(':')).collect();
     assert_eq!(
@@ -427,20 +386,30 @@ fn assert_findings(report: &Report, kernel: &Kernel, ours: &[&str], inherited: &
         "NAMES is exactly the full-IRI ids, held for the wave-two rename"
     );
     eprintln!(
-        "{} inherited finding(s) against {} dependency endpoint(s); {} NAMES finding(s) held \
-         for the wave-two rename",
-        theirs,
-        inherited.len(),
-        names.len()
+        "{} NAMES finding(s) held for the wave-two rename; {} inherited endpoint(s) not walked",
+        names.len(),
+        inherited.len()
     );
 
+    let walked: BTreeSet<&str> = report.walked.iter().map(String::as_str).collect();
+    assert_eq!(walked, ours, "the walk reached exactly this module's ids");
+    let left_out: BTreeSet<&str> = report
+        .declared
+        .inherited
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        left_out, inherited,
+        "`own` left out exactly the pinned dependency ids"
+    );
     let expected: BTreeSet<String> = ours.union(&inherited).map(|s| s.to_string()).collect();
     assert_eq!(
         walked_ids(kernel),
         expected,
         "the catalog is exactly the two lists"
     );
-    assert_eq!(report.endpoints, expected.len(), "{report}");
+    assert_eq!(report.endpoints, ours.len(), "{report}");
     assert_eq!(
         report.checks.skipped().count(),
         0,
@@ -997,10 +966,11 @@ fn the_fixture_id_is_the_description_id() {
 /// The pass kernel (`maintenance_kernel`): the room's spaces plus ikigai-http, ikigai-llm
 /// and ikigai-secret over a canned transport and a scratch file keystore, and the three
 /// passes. Walked the same way: this module's ids clean but NAMES, the dependencies'
-/// findings pinned to their ids. The passes run under root here — link-check HEADs the two
-/// fixture bookmarks against the canned 200, tag-suggest asks the canned LLM, zotero-links
-/// sweeps the canned API with a key read as `urn:secret:zotero-api-key` — and every write
-/// lands in the scratch dir.
+/// ids inherited and pinned (not walked, so neither ikigai-secret's biometric operations
+/// nor ikigai-llm's model calls are fired on this module's behalf). The passes run under
+/// root here — link-check HEADs the two fixture bookmarks against the canned 200,
+/// tag-suggest asks the canned LLM, zotero-links sweeps the canned API with a key read as
+/// `urn:secret:zotero-api-key` — and every write lands in the scratch dir.
 #[cfg(feature = "maintenance")]
 #[test]
 fn the_maintenance_kernel_conforms() {
@@ -1034,18 +1004,12 @@ fn the_maintenance_kernel_conforms() {
         }
     }
 
-    /// Where the walk points ikigai-http's verbs: any URL with a host, answered by `Canned`.
-    const CANNED_URL: &str = "https://conformance.example/";
-
     let dir = tempfile::tempdir().expect("tempdir");
     let (src, zotero, _presentations, tags, status) = scratch(dir.path());
     let secrets = ikigai_secret::FileBackend::new(dir.path().join("secrets"));
     secrets
         .set("zotero-api-key", b"s3cret")
         .expect("seed the key");
-    secrets
-        .set("conformance", b"scratch")
-        .expect("seed the walk's secret");
     let registry = ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2"));
     let kernel = ikigai_cms_web::maintenance::maintenance_kernel(
         src,
@@ -1060,52 +1024,12 @@ fn the_maintenance_kernel_conforms() {
     );
 
     let report = suite()
-        .fixture(Fixture::new("urn:secret", Verb::Source).binding("name", "conformance"))
-        // HERMETIC (ledger #762): ikigai-secret's two reserved operations end in a REAL
-        // Touch ID prompt (`require_biometric`) once their cap check passes, and the walk
-        // invokes under root. `secret-unlock` prompts outright; `secret-generate` prompts
-        // too, because the walk fills its required `into` with a sample value and `type`
-        // defaults to `ed25519`. So walking them put biometric prompts on the developer's
-        // screen and hung `cargo test` until someone answered. Nothing here can make those
-        // calls non-biometric: the prompt is not injectable and takes no backend. Both are
-        // opted out of the INVOKING checks only; their descriptions are still walked, and
-        // their gates are pinned below under no grants, where the cap check refuses before
-        // any prompt. They are ikigai-secret's to certify, not this module's.
-        .opt_out(
-            "secret-unlock",
-            Some(Verb::Source),
-            "a real Touch ID prompt under root; its gate is pinned under no grants instead",
-        )
-        .opt_out(
-            "secret-generate",
-            Some(Verb::Source),
-            "a real Touch ID prompt under root (and a minted key); gate pinned under no grants",
-        )
         // The pass kernel never has a presentations root (`maintenance_kernel` passes
         // `None`), so its presentations graph is the constant empty document: a pure
         // function of nothing, cached forever correctly. Over the SERVING kernel the same
         // endpoint reads deck files and is threaded to them — a declaration certifies
         // behavior over the kernel passed (the suite's PENDING #18/#30).
         .pure("urn:cms:graph:presentations")
-        // ikigai-http's six verbs need a URL with a host (the suite's `x` has none); the
-        // canned transport answers it, so nothing leaves the process. GET and HEAD are live
-        // by ikigai-http's own declaration.
-        .fixture(Fixture::new("httpGet", Verb::Source).arg("url", CANNED_URL))
-        .fixture(Fixture::new("httpHead", Verb::Exists).arg("url", CANNED_URL))
-        .fixture(Fixture::new("httpPost", Verb::Sink).arg("url", CANNED_URL))
-        .fixture(Fixture::new("httpPut", Verb::Sink).arg("url", CANNED_URL))
-        .fixture(Fixture::new("httpPatch", Verb::Sink).arg("url", CANNED_URL))
-        .fixture(Fixture::new("httpDelete", Verb::Delete).arg("url", CANNED_URL))
-        .live("httpGet")
-        .live("httpHead")
-        // `needs=x` is a grammar error; ikigai-llm's own walk selects with `cost=local`.
-        .fixture(Fixture::new("llm-select", Verb::Source).arg("needs", "cost=local"))
-        // A function of the registry, which this kernel fixes at construction and never
-        // reloads: nothing here could cut `urn:llm:config`, and nothing needs to. So it is
-        // declared pure over THIS kernel (a host that reloads its registry cuts that thread
-        // and would declare otherwise), and held cacheable.
-        .pure("llm-config")
-        .cacheable("llm-config")
         .run_blocking(&kernel);
     eprintln!("{report}");
 
@@ -1147,8 +1071,9 @@ fn the_maintenance_kernel_conforms() {
     assert_findings(&report, &kernel, &ours, &inherited);
 
     // The passes declare their gates and are refused under no grants, before any read —
-    // and so are the two opted-out secret operations, whose cap checks run BEFORE their
-    // biometric prompts.
+    // and so are ikigai-secret's two biometric operations as this kernel composes them
+    // (inherited, so the walk never reaches them): their cap checks run BEFORE the prompt
+    // (ledger #762).
     for pass in [
         "urn:cms:linkcheck",
         "urn:cms:tag-suggest",

@@ -1538,9 +1538,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-conformance"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f3d0281cc6f087acc6561d1b3c6e3b9f45ff6d030b0ce6f94c25bcd1c6584b8"
+checksum = "ac980114264c162b0a4cb86c55e455d1221b848b46745786c1831c9f22c063bd"
 dependencies = [
  "futures",
  "ikigai-core",
