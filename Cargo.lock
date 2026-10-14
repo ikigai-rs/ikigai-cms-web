@@ -1520,6 +1520,7 @@ dependencies = [
  "ikigai-time",
  "ikigai-wire",
  "ikigai-xslt",
+ "libc",
  "oxrdf",
  "oxttl",
  "reqwest",
