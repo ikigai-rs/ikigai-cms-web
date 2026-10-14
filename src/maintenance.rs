@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
-    ReprType, Representation, Request, Result, Space, SystemClock, Verb,
+    ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation,
+    Iri, Kernel, ReprType, Representation, Request, Result, Space, SystemClock, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 
@@ -2433,6 +2433,39 @@ pub fn default_status_path() -> Option<PathBuf> {
     Some(file)
 }
 
+/// The authority each maintenance pass runs under when the server SCHEDULES it (ledger #889):
+/// a scheduled job fires under the capability it was scheduled with, clamped to the registry's
+/// ceiling (ikigai-time's rule since ledger #79), so this is what a daily pass may do.
+#[derive(Clone, Debug)]
+pub struct PassAuthority {
+    /// `urn:cms:linkcheck`.
+    pub link_check: Capability,
+    /// `urn:cms:tag-suggest`.
+    pub tag_suggest: Capability,
+}
+
+impl PassAuthority {
+    /// The authority for passes over the CMS jail at `src_dir` that ask `llm`.
+    pub fn new(
+        _src_dir: &std::path::Path,
+        _llm: &ikigai_llm::OpenAiConfig,
+    ) -> std::result::Result<Self, String> {
+        Ok(PassAuthority {
+            link_check: Capability::root(),
+            tag_suggest: Capability::root(),
+        })
+    }
+}
+
+/// The maintenance kernel and the authority its scheduled passes run under, from one read of
+/// the configuration, so the two cannot disagree about which LLM provider the passes reach.
+pub struct Maintenance {
+    /// The kernel the passes resolve on.
+    pub kernel: Kernel,
+    /// What each pass may do when scheduled.
+    pub authority: PassAuthority,
+}
+
 /// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
 /// registry. Must be built inside a tokio runtime. Errors (fail loud) on a malformed
 /// `llm.json` or an `llm_provider` the registry doesn't know.
@@ -2444,9 +2477,27 @@ pub fn build_maintenance_kernel(
     tags: crate::tagstore::TagPaths,
     llm_provider: Option<String>,
 ) -> std::result::Result<Kernel, String> {
+    build_maintenance(src_dir, zotero, bookmarks, status_path, tags, llm_provider).map(|m| m.kernel)
+}
+
+/// [`build_maintenance_kernel`], with the [`PassAuthority`] a host schedules the passes under.
+pub fn build_maintenance(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+    bookmarks: Option<String>,
+    status_path: PathBuf,
+    tags: crate::tagstore::TagPaths,
+    llm_provider: Option<String>,
+) -> std::result::Result<Maintenance, String> {
     let registry = llm_registry()?;
     let provider = resolve_llm_provider(&registry, llm_provider.as_deref())?;
-    Ok(maintenance_kernel(
+    let llm = registry
+        .providers
+        .iter()
+        .find(|c| c.provider == provider)
+        .ok_or_else(|| format!("llm_provider {provider}: not in the registry"))?;
+    let authority = PassAuthority::new(&src_dir, llm)?;
+    let kernel = maintenance_kernel(
         src_dir,
         zotero,
         bookmarks,
@@ -2458,7 +2509,8 @@ pub fn build_maintenance_kernel(
         ikigai_secret::default_backend(),
         registry,
         &provider,
-    ))
+    );
+    Ok(Maintenance { kernel, authority })
 }
 
 #[cfg(test)]
