@@ -1551,9 +1551,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-core"
-version = "0.1.93"
+version = "0.1.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3687ff94ace80d29d4d73b664fb7b69d5a70a4c5bd5d51e151be08690a45937"
+checksum = "fee0c2ba181f81b5783fab99a13a4b65863cdae9658e59607d4110a2cd019cb9"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1588,9 +1588,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-llm"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e45111c0b0492f8dc7c0880f8a0169e43f453747c032fec9e44d60f2e5b40c"
+checksum = "31ccac0030e1a9ac1a54aeb15f142feae88238a470edb0ebf7cfe621f6650bc1"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -1602,9 +1602,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-rdf"
-version = "0.2.1"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "691a2e7d51818c6f3807caf98251e796b91788d39aa6b0a4a65cae679536d6e9"
+checksum = "93f12156d83561df1889979ff8ba018cf5da0c7fe5b8d611084f1a48f478fd2b"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -1616,9 +1616,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-resolve"
-version = "0.1.44"
+version = "0.1.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e7b5c0ded3b3710f2d0b225c09b2f23705e34bdae69c562de86337550458efe"
+checksum = "7c9655d6c243c88dcb7594cf5b6562669018971fb6b732ea1947988a79ba9e56"
 dependencies = [
  "async-trait",
  "futures",
@@ -1645,9 +1645,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-sparql"
-version = "0.2.1"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4eb3758d30ce73eeddd0281d3ed0b0d3d7379c364ba514fd1aa62b04b61122a8"
+checksum = "5b5e51fb59aa11c87a9152d9fbb11cb4bc2c4f4717b697bc8222b90759d1a2ed"
 dependencies = [
  "async-trait",
  "ikigai-core",
@@ -1670,9 +1670,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-vocab"
-version = "0.1.93"
+version = "0.1.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e026bf10754d646becd25cf072e068930b9ae4ea55d4ebced3d97b62f996f96b"
+checksum = "79aa459049a5b94d2cc340b95aae42e0d721f2a1fd25781242ea7c4a4eed3a94"
 dependencies = [
  "ikigai-core",
  "serde_json",
@@ -1680,9 +1680,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-wire"
-version = "0.1.44"
+version = "0.1.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5bc3dadfb70804e54778e714fe7429c8d10231f956d2131092368c5325c51b2"
+checksum = "6536856e03bbd5889949db1718e39193c692d55262c547ccada2b5aa60c0e879"
 dependencies = [
  "ikigai-core",
  "ikigai-resolve",
@@ -2130,7 +2130,7 @@ dependencies = [
  "sparesults",
  "spareval",
  "spargebra",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2158,7 +2158,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "ryu-js",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2173,7 +2173,7 @@ dependencies = [
  "oxsdatatypes",
  "rand 0.9.5",
  "sha2 0.11.0",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2186,7 +2186,7 @@ dependencies = [
  "oxrdf",
  "oxrdfxml",
  "oxttl",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2199,7 +2199,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "quick-xml",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2209,7 +2209,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c17c2ae62ac34fda465f6331105906c0e17b4e088dac3249e1f229b962062503"
 dependencies = [
  "js-sys",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2222,7 +2222,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxrdf",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3289,7 +3289,7 @@ dependencies = [
  "memchr",
  "oxrdf",
  "quick-xml",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3312,7 +3312,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparopt",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3326,7 +3326,7 @@ dependencies = [
  "oxrdf",
  "peg",
  "rand 0.9.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
