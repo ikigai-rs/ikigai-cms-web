@@ -144,7 +144,12 @@ ikigai-time = { version = "0.4.1", optional = true }
 # credentials, stops caching answers built from a live probe, and REFUSES registries it used to
 # load silently (a `default` naming no provider, unknown cost values). The API this crate calls
 # (`OpenAiConfig::ollama`, `Registry::{single, from_json}`, `space`) is unchanged.
-ikigai-llm = { version = "0.13.0", optional = true }
+# 0.14.0, a ceiling crossing again (`^0.13.0` = `<0.14.0`): a transport failure is now typed
+# (`Unavailable` for a down model, `Timeout` for a slow one, where 0.13 said `Endpoint`), and an
+# undeclared `as=` is refused. Neither reaches the room's behavior: the tag-suggest pass reads ANY
+# error from `urn:llm:{provider}:up` as "down, skip the run" and ANY error from `…:ask` as "fall back
+# to the OpenLibrary filter" (maintenance.rs `llm_up`, `llm_tags`), and it never sends `as=`.
+ikigai-llm = { version = "0.14.0", optional = true }
 # Bin configuration lives in ~/.config/ikigai/cms.toml (+ CLI flags) — never env vars.
 toml = { version = "0.8", optional = true }
 
