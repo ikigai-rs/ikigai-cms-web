@@ -213,4 +213,7 @@ tempfile = "3"
 # requires ikigai-core 0.1.85, so the lock now resolves core there.
 # 0.6.1, a CEILING crossing again (`^0.5.1` = `<0.6.0`, ledger #1039): 0.6.0 adds SPACE-NAME (a
 # module's space says who it is, ledger #987) and 0.6.1 reads an `Expiry::At` deadline as a bound.
-ikigai-conformance = "0.6.1"
+# 0.8.0, a ceiling crossing again (`^0.6.1` = `<0.7.0`): VALIDATE (0.7), REQUIRED and
+# `Suite::own` (0.8). The walk is scoped to `urn:cms:*` + `cms-style`; the dependencies are
+# inherited, pinned exactly, and certified in their own repos.
+ikigai-conformance = "0.8.0"
