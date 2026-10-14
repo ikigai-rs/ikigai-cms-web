@@ -62,5 +62,11 @@ pub mod config;
 #[cfg(feature = "server")]
 pub mod session;
 
+// The page face's accept loop: what an accept error means (skip one connection, back off on
+// exhaustion, end on a dead listener). In the lib rather than the bin so a test can drive it in a
+// child process with its descriptor limit lowered (`tests/accept_exhaustion.rs`).
+#[cfg(feature = "server")]
+pub mod accept;
+
 #[cfg(target_family = "wasm")]
 mod wire_client;

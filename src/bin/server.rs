@@ -792,35 +792,36 @@ async fn serve_http(
             return;
         }
     };
-    loop {
-        match listener.accept().await {
-            Ok((sock, _)) => {
-                let dist = dist.clone();
-                let kernel = Arc::clone(&kernel);
-                let rp = Arc::clone(&rp);
-                let auth = Arc::clone(&auth);
-                let recent = Arc::clone(&recent);
-                let entitlement = Arc::clone(&entitlement);
-                let page_origin = Arc::clone(&page_origin);
-                tokio::spawn(async move {
-                    let _ = handle_http(
-                        sock,
-                        &dist,
-                        &kernel,
-                        &rp,
-                        &auth,
-                        &recent,
-                        &entitlement,
-                        &page_origin,
-                        dev_open,
-                        anonymous_budget,
-                    )
-                    .await;
-                });
-            }
-            Err(e) => eprintln!("http accept: {e}"),
-        }
-    }
+    let error = ikigai_cms_web::accept::serve_until_error(&listener, |sock| {
+        let dist = dist.clone();
+        let kernel = Arc::clone(&kernel);
+        let rp = Arc::clone(&rp);
+        let auth = Arc::clone(&auth);
+        let recent = Arc::clone(&recent);
+        let entitlement = Arc::clone(&entitlement);
+        let page_origin = Arc::clone(&page_origin);
+        tokio::spawn(async move {
+            let _ = handle_http(
+                sock,
+                &dist,
+                &kernel,
+                &rp,
+                &auth,
+                &recent,
+                &entitlement,
+                &page_origin,
+                dev_open,
+                anonymous_budget,
+            )
+            .await;
+        });
+    })
+    .await;
+    // The listener itself is gone (`accept::Fault::Fatal`): the page face cannot serve again, and
+    // a room whose page is dead while its wire stays up looks alive to every check but the one
+    // that matters. End the process so the supervisor (launchd's KeepAlive) starts a fresh one.
+    eprintln!("reading-room server: the page listener on {addr} failed ({error}); exiting");
+    std::process::exit(1);
 }
 
 /// Answer one HTTP request. `/r/{iri}?args` → a fragment resolved under the caller's session

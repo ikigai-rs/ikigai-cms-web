@@ -85,7 +85,11 @@ ikigai-resolve = "0.1.9"
 # The WebTransport server (rung 2). Behind the `server` feature so the default build
 # and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
 wtransport = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"], optional = true }
+# The page face's accept classifier (src/accept.rs) reads the errno an accept failed with: the
+# exhaustion family (EMFILE, ENFILE, ENOBUFS, ENOMEM) backs off, a dead listener (EBADF, ENOTSOCK,
+# EINVAL, EFAULT) ends the loop. Every constant it names is in every 0.2 release.
+libc = { version = "0.2", optional = true }
 # Rung 3b: the server-side WebAuthn relying party. Verifies a passkey assertion and maps
 # the credential to its granted capability scopes (the connection's ceiling).
 webauthn-rs = { version = "0.5.5", optional = true }
@@ -162,7 +166,7 @@ wasm-bindgen = "=0.2.108"
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 # The server includes the maintenance stack + the time transport so it can schedule the
 # link-check pass (urn:time) alongside serving the room.
-server = ["dep:wtransport", "dep:tokio", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time"]
+server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.
