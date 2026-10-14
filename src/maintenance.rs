@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation, Iri, Kernel,
-    ReprType, Representation, Request, Result, Space, SystemClock, Verb,
+    ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation,
+    Iri, Kernel, ReprType, Representation, Request, Result, Space, SystemClock, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 
@@ -2154,7 +2154,7 @@ async fn openlibrary_subjects(inv: &Invocation<'_>, isbn: &str, title: &str) -> 
     }
     if !title.is_empty() {
         let url = format!(
-            "https://openlibrary.org/search.json?title={}&fields=subject&limit=1",
+            "https://{OPENLIBRARY_HOST}/search.json?title={}&fields=subject&limit=1",
             url_encode(title)
         );
         return ol_fetch(inv, &url, OlShape::Search).await;
@@ -2179,7 +2179,7 @@ fn ol_bibkeys_url(isbn: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(",");
     Some(format!(
-        "https://openlibrary.org/api/books?bibkeys={bibkeys}&format=json&jscmd=data"
+        "https://{OPENLIBRARY_HOST}/api/books?bibkeys={bibkeys}&format=json&jscmd=data"
     ))
 }
 
@@ -2433,6 +2433,69 @@ pub fn default_status_path() -> Option<PathBuf> {
     Some(file)
 }
 
+/// The authority each maintenance pass runs under when the server SCHEDULES it (ledger #889):
+/// a scheduled job fires under the capability it was scheduled with, clamped to the registry's
+/// ceiling (ikigai-time's rule since ledger #79), so this is what a daily pass may do, every day,
+/// for the life of the process. Both used to be root.
+#[derive(Clone, Debug)]
+pub struct PassAuthority {
+    /// `urn:cms:linkcheck`: **root**, and on purpose. The pass HEAD-checks every bookmark, so the
+    /// hosts it must reach are whatever the bookmarks name, today and after the next edit, and the
+    /// net ACL has no grant for "any host" short of root: ikigai-http's `urn:cap:net:<host>` rules
+    /// are granted host by host and "there is no wildcard-allow rule". A narrowed link-check is
+    /// worse than a broad one, not merely weaker: a host its grants miss is refused with a
+    /// non-transient `Denied`, which the pass reads as an answered request, so every dead link on
+    /// that host would be recorded `ok` (`a_link_check_without_its_hosts_reads_a_dead_link_as_alive`).
+    pub link_check: Capability,
+    /// `urn:cms:tag-suggest`: exactly what the pass reaches. A read of the CMS jail (the graph's
+    /// file reads bottom out there, and every overlay and the Zotero library sit behind the same
+    /// `urn:cap:fs:read:*` floor), OpenLibrary, and the configured LLM provider's host AND port.
+    /// Not the keystore, not a file write (the suggestions overlay is written by the pass itself,
+    /// not through the kernel), and no other host or port: a local LLM's host is usually
+    /// `localhost`, where every other service on the machine also lives.
+    pub tag_suggest: Capability,
+}
+
+impl PassAuthority {
+    /// The authority for passes over the CMS jail at `src_dir` that ask `llm`. Refused for a
+    /// provider whose `base_url` names no host or no port this crate can tell (a scheme without a
+    /// known default): the pass could not reach it under any grant, and saying so here beats a
+    /// pass that silently never runs.
+    pub fn new(
+        src_dir: &std::path::Path,
+        llm: &ikigai_llm::OpenAiConfig,
+    ) -> std::result::Result<Self, String> {
+        // The URL itself is never quoted back: a `base_url` may carry credentials in its userinfo.
+        let unusable = |why: &str| format!("llm provider {}: base_url {why}", llm.provider);
+        let base = url::Url::parse(&llm.base_url).map_err(|_| unusable("does not parse"))?;
+        let host = base.host_str().ok_or_else(|| unusable("names no host"))?;
+        let port = base
+            .port_or_known_default()
+            .ok_or_else(|| unusable("names no port and its scheme has no default"))?;
+        Ok(PassAuthority {
+            link_check: Capability::root(),
+            tag_suggest: Capability::scoped([
+                format!("urn:cap:fs:read:{}", src_dir.display()),
+                format!("urn:cap:net:{OPENLIBRARY_HOST}"),
+                format!("urn:cap:net:{host}:{port}"),
+            ]),
+        })
+    }
+}
+
+/// The one host the tag-suggest pass asks for subjects ([`openlibrary_subjects`]): every URL it
+/// builds names this, so the grant in [`PassAuthority::tag_suggest`] cannot drift from it.
+const OPENLIBRARY_HOST: &str = "openlibrary.org";
+
+/// The maintenance kernel and the authority its scheduled passes run under, from one read of
+/// the configuration, so the two cannot disagree about which LLM provider the passes reach.
+pub struct Maintenance {
+    /// The kernel the passes resolve on.
+    pub kernel: Kernel,
+    /// What each pass may do when scheduled.
+    pub authority: PassAuthority,
+}
+
 /// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
 /// registry. Must be built inside a tokio runtime. Errors (fail loud) on a malformed
 /// `llm.json` or an `llm_provider` the registry doesn't know.
@@ -2444,9 +2507,27 @@ pub fn build_maintenance_kernel(
     tags: crate::tagstore::TagPaths,
     llm_provider: Option<String>,
 ) -> std::result::Result<Kernel, String> {
+    build_maintenance(src_dir, zotero, bookmarks, status_path, tags, llm_provider).map(|m| m.kernel)
+}
+
+/// [`build_maintenance_kernel`], with the [`PassAuthority`] a host schedules the passes under.
+pub fn build_maintenance(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+    bookmarks: Option<String>,
+    status_path: PathBuf,
+    tags: crate::tagstore::TagPaths,
+    llm_provider: Option<String>,
+) -> std::result::Result<Maintenance, String> {
     let registry = llm_registry()?;
     let provider = resolve_llm_provider(&registry, llm_provider.as_deref())?;
-    Ok(maintenance_kernel(
+    let llm = registry
+        .providers
+        .iter()
+        .find(|c| c.provider == provider)
+        .ok_or_else(|| format!("llm_provider {provider}: not in the registry"))?;
+    let authority = PassAuthority::new(&src_dir, llm)?;
+    let kernel = maintenance_kernel(
         src_dir,
         zotero,
         bookmarks,
@@ -2458,7 +2539,8 @@ pub fn build_maintenance_kernel(
         ikigai_secret::default_backend(),
         registry,
         &provider,
-    ))
+    );
+    Ok(Maintenance { kernel, authority })
 }
 
 #[cfg(test)]
@@ -2814,6 +2896,126 @@ mod tests {
         assert!(
             sug.iter().all(|e| e.iri.starts_with("urn:cms:book:")),
             "{sug:?}"
+        );
+    }
+
+    /// The tag-suggest pass under the authority the server SCHEDULES it with (ledger #889): its
+    /// three grants are enough for the whole pass (the same two LLM tags land as under root), and
+    /// the kernel refuses the same capability everything else the room's maintenance kernel can do.
+    #[test]
+    fn tag_suggest_runs_under_its_scheduled_authority_and_is_refused_outside_it() {
+        let (dir, z) = untagged_book_fixture();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            dir.path().join("st.json"),
+            tags.clone(),
+            Arc::new(RoutedCanned),
+            test_secrets(),
+            default_llm_registry(),
+            "ollama",
+        );
+        let llm = &default_llm_registry().providers[0];
+        let cap = PassAuthority::new(dir.path(), llm)
+            .expect("an authority")
+            .tag_suggest;
+        let issue = |req: Request| futures::executor::block_on(kernel.issue(req, &cap));
+
+        let pass = Request::new(Verb::Source, Iri::parse("urn:cms:tag-suggest").unwrap());
+        let summary = String::from_utf8(issue(pass).expect("tag-suggest runs").bytes).unwrap();
+        assert!(summary.contains("2 suggestions"), "summary: {summary}");
+        assert!(
+            summary.contains("1 via LLM"),
+            "the LLM was reached: {summary}"
+        );
+        assert_eq!(crate::tagstore::entries(&tags.suggestions).len(), 2);
+
+        let refused = |req: Request, what: &str| match issue(req) {
+            Err(Error::Denied(_)) => {}
+            other => panic!("{what}: expected Denied, got {other:?}"),
+        };
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+                .with_arg("url", ArgRef::Inline(b"https://example.com/".to_vec())),
+            "a host that is not OpenLibrary or the LLM",
+        );
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+                .with_arg("url", ArgRef::Inline(b"http://localhost:1062/".to_vec())),
+            "another port on the LLM's host",
+        );
+        refused(
+            Request::new(
+                Verb::Source,
+                Iri::parse("urn:secret:zotero-api-key").unwrap(),
+            ),
+            "the keystore",
+        );
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:cms:zotero-links").unwrap()),
+            "the Zotero link pass, which reads a credential",
+        );
+        refused(
+            Request::new(Verb::Sink, Iri::parse("urn:cms:link-keep").unwrap())
+                .with_arg("url", ArgRef::Inline(b"https://x.example/".to_vec())),
+            "a file write",
+        );
+    }
+
+    /// Why the link-check pass keeps ROOT when it is scheduled (ledger #889): its hosts are
+    /// whatever the bookmarks name, the net ACL grants hosts one by one, and a host its grants miss
+    /// is refused with a non-transient `Denied` that the pass reads as an answered request. So a
+    /// narrowed link-check does not fail loudly: it records a DEAD link as `ok`. Under root the
+    /// same link is `gone`.
+    #[test]
+    fn a_link_check_without_its_hosts_reads_a_dead_link_as_alive() {
+        let run = |cap: &Capability| {
+            let dir = tempfile::tempdir().unwrap();
+            let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+            std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+            std::fs::write(&bm, "* Bookmarks\n** [[https://dead.example/page][Dead]]\n").unwrap();
+            let status_path = dir.path().join("st.json");
+            let kernel = maintenance_kernel(
+                dir.path().to_path_buf(),
+                None,
+                None,
+                status_path.clone(),
+                crate::tagstore::TagPaths::in_dir(dir.path()),
+                Arc::new(Canned {
+                    status: 404,
+                    sends: Arc::new(AtomicU32::new(0)),
+                }),
+                test_secrets(),
+                default_llm_registry(),
+                "ollama",
+            );
+            let cap = match cap.scopes() {
+                // The jail read this fixture needs, beside whatever net grant `cap` holds.
+                Some(scopes) => Capability::scoped(
+                    scopes
+                        .iter()
+                        .cloned()
+                        .chain([format!("urn:cap:fs:read:{}", dir.path().display())]),
+                ),
+                None => Capability::root(),
+            };
+            let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
+            futures::executor::block_on(kernel.issue(req, &cap)).expect("pass runs");
+            load_status(&status_path)
+                .into_values()
+                .next()
+                .expect("one entry")
+                .status
+        };
+        assert_eq!(run(&Capability::root()), "gone");
+        // Any net grant at all passes the pass's own `urn:cap:net:*` floor; just not this host's.
+        assert_eq!(
+            run(&Capability::scoped([format!(
+                "urn:cap:net:{OPENLIBRARY_HOST}"
+            )])),
+            "ok"
         );
     }
 

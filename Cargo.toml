@@ -93,7 +93,7 @@ libc = { version = "0.2", optional = true }
 # Rung 3b: the server-side WebAuthn relying party. Verifies a passkey assertion and maps
 # the credential to its granted capability scopes (the connection's ceiling).
 webauthn-rs = { version = "0.5.5", optional = true }
-url = { version = "2", optional = true }                                   # rp_origin
+url = { version = "2", optional = true }  # rp_origin; the LLM provider host + port a scheduled tag-suggest pass is granted
 uuid = { version = "1", features = ["v4"], optional = true }               # user handle
 serde = { version = "1", features = ["derive"], optional = true }          # the {Passkey → scopes} store
 # rung 3c: the passkey store lives in the OS keystore (macOS Keychain), not plaintext;
@@ -173,7 +173,7 @@ server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url
 # ikigai-secret: the Zotero link pass reads its API key as `urn:secret:zotero-api-key` through the
 # kernel, so the maintenance kernel mounts the secret space (the server feature already had the dep
 # for the passkey store; maintenance needs it in its own right).
-maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:oxttl", "dep:oxrdf", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml"]
+maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:oxttl", "dep:oxrdf", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml", "dep:url"]
 
 [[bin]]
 name = "cms-server"

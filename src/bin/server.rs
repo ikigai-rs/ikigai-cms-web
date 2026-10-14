@@ -58,6 +58,7 @@ use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
+use ikigai_cms_web::maintenance::PassAuthority;
 use ikigai_cms_web::session::{Recent, RecentLog, Rp};
 
 /// Largest `Call` we'll read off a stream — a guard against a runaway client.
@@ -287,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // Fail loud: a maintenance pass was asked for, so a bad llm.json or an unknown
         // llm_provider must stop the server, never silently run the wrong model.
-        let maint = match ikigai_cms_web::maintenance::build_maintenance_kernel(
+        let (maint, authority) = match ikigai_cms_web::maintenance::build_maintenance(
             src_dir_maint,
             zotero_maint,
             bookmarks_maint,
@@ -295,7 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.tags.clone(),
             cfg.llm_provider.clone(),
         ) {
-            Ok(k) => Arc::new(k),
+            Ok(m) => (Arc::new(m.kernel), m.authority),
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
@@ -310,36 +311,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_capability(Capability::root());
         registry.set_resolver(Arc::clone(&maint) as Arc<dyn Resolver>);
-        let schedule_pass = |iri: &'static str, label: &'static str| {
-            match ikigai_time::parse_schedule("24h").and_then(|s| {
-                // Root, deliberately: the same authority the startup resolve below runs at, so
-                // the scheduled pass and the immediate one cannot diverge. ikigai-time 0.4 makes
-                // the job's authority a required argument (ledger #79); narrowing a pass to
-                // the scopes it needs is a design question for its own arc, not this bump.
-                registry.schedule_persistent(iri.into(), Verb::Source, s, true, Capability::root())
-            }) {
+        if linkcheck_on {
+            println!("link-check: enabled (daily)");
+        }
+        if tagsuggest_on {
+            println!("tag-suggest: enabled (daily); runs only when the local LLM is up");
+        }
+        for pass in scheduled_passes(&authority, linkcheck_on, tagsuggest_on) {
+            let label = pass.label;
+            match schedule_pass(&registry, &pass) {
                 Ok(id) => println!("{label}: scheduled daily (job {id})"),
                 Err(e) => eprintln!("{label}: schedule failed: {e}"),
             }
-            // The async, under-capability startup resolve (no block_on) — so a pass's fan-out parks.
+            // The async startup resolve (no block_on), so a pass's fan-out parks. Under the SAME
+            // capability the job fires under, so the scheduled pass and the immediate one cannot
+            // diverge.
             let maint = Arc::clone(&maint);
             tokio::spawn(async move {
-                let req = Request::new(Verb::Source, Iri::parse(iri).expect("valid IRI"));
-                match maint.issue_as_async(req, &Capability::root()).await {
+                let req = Request::new(Verb::Source, Iri::parse(pass.iri).expect("valid IRI"));
+                match maint.issue_as_async(req, &pass.capability).await {
                     Ok((r, _)) => {
                         println!("{label} (startup): {}", String::from_utf8_lossy(&r.bytes))
                     }
                     Err(e) => eprintln!("{label} (startup): {e}"),
                 }
             });
-        };
-        if linkcheck_on {
-            println!("link-check: enabled (daily)");
-            schedule_pass("urn:cms:linkcheck", "link-check");
-        }
-        if tagsuggest_on {
-            println!("tag-suggest: enabled (daily); runs only when the local LLM is up");
-            schedule_pass("urn:cms:tag-suggest", "tag-suggest");
         }
         Some(registry)
     } else {
@@ -757,6 +753,53 @@ fn ensure_session(auth: &HttpAuth, sid: Option<&str>) -> (String, Option<String>
     sessions.insert(id.clone(), HttpSession::default());
     let cookie = session_cookie(&id);
     (id, Some(cookie))
+}
+
+/// One maintenance pass the server runs on a daily `urn:time` job.
+struct ScheduledPass {
+    /// The pass resource (`urn:cms:linkcheck`, `urn:cms:tag-suggest`).
+    iri: &'static str,
+    /// What the log calls it.
+    label: &'static str,
+    /// The authority the job fires under, and the startup run with it ([`PassAuthority`]).
+    capability: Capability,
+}
+
+/// The passes `cms.toml` turned on, each with the authority it runs under.
+fn scheduled_passes(
+    authority: &PassAuthority,
+    linkcheck_on: bool,
+    tagsuggest_on: bool,
+) -> Vec<ScheduledPass> {
+    let mut passes = Vec::new();
+    if linkcheck_on {
+        passes.push(ScheduledPass {
+            iri: "urn:cms:linkcheck",
+            label: "link-check",
+            capability: authority.link_check.clone(),
+        });
+    }
+    if tagsuggest_on {
+        passes.push(ScheduledPass {
+            iri: "urn:cms:tag-suggest",
+            label: "tag-suggest",
+            capability: authority.tag_suggest.clone(),
+        });
+    }
+    passes
+}
+
+/// Schedule `pass` daily and persistent (a blanket cancel-all leaves it), under its own
+/// capability: ikigai-time 0.4 makes a job's authority a required argument (ledger #79).
+fn schedule_pass(registry: &ikigai_time::JobRegistry, pass: &ScheduledPass) -> Result<u64, String> {
+    let daily = ikigai_time::parse_schedule("24h")?;
+    registry.schedule_persistent(
+        pass.iri.into(),
+        Verb::Source,
+        daily,
+        true,
+        pass.capability.clone(),
+    )
 }
 
 /// Serve the reading room over plain HTTP on `addr` — replacing the separate
@@ -1844,6 +1887,11 @@ mod http_face;
 #[cfg(test)]
 #[path = "server_tests/chips.rs"]
 mod chips;
+
+/// Each scheduled maintenance pass fires under its own authority, never more (ledger #889).
+#[cfg(test)]
+#[path = "server_tests/jobs.rs"]
+mod jobs;
 
 #[cfg(test)]
 mod tests {
