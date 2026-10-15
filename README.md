@@ -193,6 +193,14 @@ view (SPARQL) → CONSTRUCT (align/shape meaning) → RDF/XML → XSLT (type→c
 CONSTRUCT shapes meaning; XSLT shapes pixels; htmx delivers hypermedia; web
 components are the interactive islands (the WebGPU graph).
 
+## Accessibility
+
+The room targets WCAG 2.2 AA and makes no conformance claim. [ACCESSIBILITY.md](ACCESSIBILITY.md)
+says what has been checked (one axe run in Chrome, signed in through a virtual authenticator, in
+both color schemes), what has not (no screen reader, no check in CI), and the barriers known
+today, among them that the tag chips cannot be reached by keyboard. Report a barrier with an issue
+labeled `accessibility`.
+
 ## Conformance
 
 The kernel passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)
