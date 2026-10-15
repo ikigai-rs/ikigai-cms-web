@@ -41,13 +41,8 @@ fn room(dir: &Path) -> Kernel {
 
 /// `GET /r/{target}` as a signed-in principal, sharing one recency trail across calls.
 fn get(kernel: &Kernel, recent: &RecentLog, target: &str) -> String {
-    let (status, _ct, body) = resolve_http(
-        kernel,
-        recent,
-        &Capability::root(),
-        Some("reader"),
-        target,
-    );
+    let (status, _ct, body) =
+        resolve_http(kernel, recent, &Capability::root(), Some("reader"), target);
     let body = String::from_utf8_lossy(&body).into_owned();
     assert_eq!(status, "200 OK", "{target}: {body}");
     body
