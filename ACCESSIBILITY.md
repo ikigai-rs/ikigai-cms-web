@@ -87,8 +87,9 @@ is not, so the server refuses to start in an arrangement where nobody could sign
 **Evaluation in progress** against WCAG 2.2 AA. No accessibility check runs in CI. One automated
 run in a real browser, a keyboard walk and a narrow-viewport check were made on 2026-10-15 and
 found contrast failures in both color schemes and a keyboard barrier in the room's main
-navigation, all listed below. **No screen reader has been used**, and no person has assessed the
-room by hand. Do not infer a conformance claim from a green build or from this file.
+navigation, listed below; the keyboard barrier was fixed the same day (see Change history).
+**No screen reader has been used**, and no person has assessed the room by hand. Do not infer
+a conformance claim from a green build or from this file.
 
 ## Evidence
 
@@ -97,10 +98,12 @@ The crate's tests run on every pull request (`.github/workflows/ci.yml`, with th
 
 | Check | Version | What it covers | What it does not cover |
 |---|---|---|---|
-| Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff` | Any accessibility property: names, roles, focus, contrast. No test asserts one |
+| Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff` | Any accessibility property: names, roles, focus, contrast |
+| `src/bin/server_tests/focus.rs`, same run | none | One accessibility property, as markup: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get` | Whether focus is visible, where it goes after a swap, and anything a browser decides |
 | axe-core in Google Chrome against a scratch `cms-server` (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | 14 states, each in light and dark: signed out (enroll offered, then sign-in offered), the tag index, the type index, the recent trail empty and after views, the dead-links review, the purge confirmation, a tag view in Catalog, Mosaic and Agenda, its second page, search with and without results. The passkey enrolled and signed in through Chrome's virtual authenticator. Rules tagged WCAG 2.0/2.1/2.2 A and AA, with best-practice rules reported | One viewport (1280×900). States not opened: a failed sign-in, the purge result, a promoted or dismissed suggestion, a link-check pass in progress, the error fragments, the WebTransport path's failures. Only invented data |
 | Tab walk, same run | as above | Which controls take focus, in order, on four states; where focus lands after a navigation-bar button and after the pager's "next" | Whether the order makes sense to a person; Shift+Tab; Enter and Space on each control |
 | Overflow at 320 px wide, same run | as above | Whether the page scrolls sideways at 320 CSS px (SC 1.4.10) on the sign-in panel, the tag index, and a tag view in Catalog and Agenda | Text resize and zoom to 400%; other views |
+| Keyboard re-check for the chips (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` built from the fix, signed in through Chrome's virtual authenticator, then again under `dev_open` for axe's detail: each chip focusable in the tag index, a Catalog, Mosaic and Agenda tag view, the type index and the recent trail; Tab reaches one and Enter opens its view in place with the address unchanged; axe on those views in light and dark (with `html{background:Canvas}` injected, so axe measures dark text against the dark page) | Shift+Tab; Space (a link does not take it); opening a chip in a new tab, which shows the bare fragment |
 
 On 2026-10-15, against `main` at `e86d873`: the only WCAG A/AA rule axe reported was
 `color-contrast`, in 23 of the 28 scans (every light scan, and 9 of the 14 dark ones); the
@@ -109,6 +112,13 @@ the tag views. The Tab walk found none of the tag,
 type or recent-trail chips in the tab order (0 of 4 in the tag index, 0 of 120 on a page of
 cards). At 320 px the Agenda style scrolled sideways (343 px of content); the other three did
 not.
+
+On 2026-10-15, after the chips gained an `href` (ledger #1640): every chip was focusable (4 of 4
+in the tag index, 120 of 120 and 71 of 71 on two pages of cards, 2 of 2 in the type index, 3 of
+3 in the recent trail), and Enter on one opened its view in place. axe reported `color-contrast`
+as before and, newly, `target-size` (SC 2.5.8) on the suggestion buttons: they were always 13 by
+12 px, and axe accepts a small target only with room around it, which the tag chips beside them
+now take, since a link with an `href` counts as a target and one without did not.
 
 Reading order, plain language, whether the views make sense without the visual layout, and the
 whole experience with assistive technology are for a person to judge, and none of that has been
@@ -121,6 +131,7 @@ Only what has actually been run. This is not a list of what is supported.
 | Platform | Browser | Assistive technology | What | When |
 |---|---|---|---|---|
 | macOS | Google Chrome 153.0.8010.54, headless | none | The axe run, the Tab walk and the 320 px check above, light and dark | 2026-10-15 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The keyboard re-check for the chips above, light and dark | 2026-10-15 |
 
 **No screen reader, screen magnifier, speech-input or switch-access software has been used to test
 this repository.** No other browser has been run. The README notes that Firefox may not connect
@@ -133,13 +144,13 @@ From the run above and from reading the source on 2026-10-15.
 
 | Barrier or gap | Where | Impact | Workaround |
 |---|---|---|---|
-| The tag chips, type chips and recent-trail items are `<a>` elements with `hx-get` and no `href`, so they are not in the tab order and do not respond to Enter (SC 2.1.1) | the tag index, the type index, the recent trail, every card's tags | Opening a tag or a type, the room's main navigation, cannot be done by keyboard | The search field finds cards by title |
 | Text in the muted color (`#8a857b`) is 3.46:1 on the page and 3.67:1 on a card in the light scheme (SC 1.4.3) | light: counts, tags on cards, authors, the unselected style buttons, "sign out", the link-check line, the review's labels and URLs, the sign-in panel's text | Hard to read with low vision or in bright light | The dark scheme, where the same text passes |
 | The passkey buttons are white on `#7fb2ee`, 2.21:1, in the dark scheme (SC 1.4.3) | dark: "Enroll a passkey", "Sign in" | The first control a person needs is hard to read | The light scheme (6.52:1) |
 | Red `#c0392b` text on the dark page is 3.23:1 (SC 1.4.3) | dark: the purge buttons in the review and the confirmation, the "gone" badge | Hard to read | The light scheme (5.12:1) |
 | Colors axe did not measure, computed from the stylesheets: the suggestion buttons' `+` (`#3a8a3a`, 4.31:1 on a light card, 3.77:1 on a dark one) and `x` (`#c0392b`, 2.99:1 on a dark card); the "nxdomain" badge (`#8e2f8e`, 2.47:1 on the dark page) | suggested tags; the dead-links review | Hard to read | none |
 | After the pager moves, focus falls to the page body, because the control that had it is swapped away, and nothing announces the new content (SC 2.4.3). Measured for the pager; the style and sort buttons, the purge buttons and every other control inside the room are swapped away the same way (from the source) | every view change made from inside the room | A keyboard or screen-reader user loses their place and must start again from the top | The navigation bar's buttons keep focus when used |
 | The suggestion buttons are named `+` and `x` and the clear button `×`; their purpose is only in a `title` (SC 2.4.6, 4.1.2) | suggested tags; the context header | A screen reader announces "plus" or "times" with no target | none |
+| The suggestion buttons are 13 by 12 px with the tag chips close beside them (SC 2.5.8, axe `target-size`) | suggested tags on cards | Hard to hit with a pointer, a finger or a tremor; a near miss opens the neighboring tag | Promote or dismiss from the keyboard |
 | The selected style and sort are a styled `<span>`, not a control with a state (SC 1.3.1) | the toolbar on every card view | The current choice is visible but not announced | none |
 | The search field's only label is its placeholder (SC 3.3.2) | the navigation bar | The hint disappears once typing starts; some assistive technology announces no name | none |
 | The sign-in failure line (`#auth-status`) and the room's error fragments are not live regions (SC 4.1.3) | the sign-in panel; any failed view | A failure is not announced | none |
@@ -226,7 +237,8 @@ before any conformance claim.
 
 | Date | Change | Evidence |
 |---|---|---|
-| 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | this pull request |
+| 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108) |
+| 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; this pull request |
 
 ## References
 
