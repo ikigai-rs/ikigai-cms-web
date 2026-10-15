@@ -34,6 +34,14 @@ use std::path::{Path, PathBuf};
 /// ACL like any other outbound request.
 const API: &str = "https://api.zotero.org";
 
+/// The one host the pass asks ([`API`]'s), so the grant in
+/// [`PassAuthority::zotero_links`](crate::maintenance::PassAuthority::zotero_links) cannot drift
+/// from it (`the_api_host_is_the_apis`).
+pub(crate) const API_HOST: &str = "api.zotero.org";
+
+/// The keystore name the API key is read under, as `urn:secret:{name}`.
+pub(crate) const API_KEY_SECRET: &str = "zotero-api-key";
+
 /// The API's hard ceiling on `limit`. Asking for more is silently clamped, so paging must assume
 /// it.
 const PAGE: usize = 100;
@@ -188,7 +196,7 @@ async fn api_key(inv: &Invocation<'_>) -> Result<String> {
     let repr = inv
         .issue(Request::new(
             Verb::Source,
-            Iri::parse("urn:secret:zotero-api-key").expect("valid IRI"),
+            Iri::parse(format!("urn:secret:{API_KEY_SECRET}")).expect("valid IRI"),
         ))
         .await
         .map_err(|e| {
@@ -617,6 +625,14 @@ fn escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_api_host_is_the_apis() {
+        assert_eq!(
+            url::Url::parse(super::API).unwrap().host_str(),
+            Some(super::API_HOST)
+        );
+    }
+
     use super::*;
 
     #[test]

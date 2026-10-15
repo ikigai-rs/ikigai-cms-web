@@ -31,7 +31,8 @@
 //!
 //! Declared to the suite, stated once:
 //!
-//! - `cacheable` on `urn:cms:graph:books`, `urn:cms:graph:presentations` and `cms-style`:
+//! - `cacheable` on `urn:cms:graph:books`, `urn:cms:graph:presentations`, `urn:cms:decks`
+//!   (the deck listing, cut by the serving host's `DeckWatch`) and `cms-style`:
 //!   each marks `.cacheable()`, and the declaration turns a sub-resolution that silently
 //!   downgraded the effective expiry into a red test. `urn:cms:graph:bookmarks` is NOT
 //!   declared: its org file is written outside the kernel and unwatched, so its jail is
@@ -167,6 +168,7 @@ const OURS: &[&str] = &[
     "urn:cms:graph:books",
     "urn:cms:graph:zotero-links",
     "urn:cms:graph:presentations",
+    "urn:cms:decks",
     "urn:cms:graph:tags-approved",
     "urn:cms:graph:suggestions",
     "urn:cms:graph:dismissed",
@@ -429,7 +431,11 @@ fn ours() -> Vec<&'static str> {
 #[test]
 fn conforms() {
     let room = room();
-    let report = suite().run_blocking(&room.kernel);
+    // The deck listing is bound only where decks are configured, so it is declared here, over
+    // the serving kernel, and not in `suite()`, which the pass kernel shares.
+    let report = suite()
+        .cacheable("urn:cms:decks")
+        .run_blocking(&room.kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert_findings(&report, &room.kernel, &ours(), INHERITED);
@@ -728,6 +734,7 @@ fn declared_outputs_are_the_media_types_served() {
         ("urn:cms:graph:books", Verb::Source, vec![]),
         ("urn:cms:graph:zotero-links", Verb::Source, vec![]),
         ("urn:cms:graph:presentations", Verb::Source, vec![]),
+        ("urn:cms:decks", Verb::Source, vec![]),
         ("urn:cms:graph:tags-approved", Verb::Source, vec![]),
         ("urn:cms:graph:suggestions", Verb::Source, vec![]),
         ("urn:cms:graph:dismissed", Verb::Source, vec![]),
@@ -1034,6 +1041,9 @@ fn the_maintenance_kernel_conforms() {
     eprintln!("{report}");
 
     let mut ours = OURS.to_vec();
+    // No presentations root, so no deck listing is bound: the deck tree is only walked where
+    // decks are configured.
+    ours.retain(|id| *id != "urn:cms:decks");
     ours.extend_from_slice(OURS_MAINTENANCE);
     ours.extend([
         "urn:cms:linkcheck",

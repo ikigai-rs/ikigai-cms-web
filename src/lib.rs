@@ -24,6 +24,10 @@ pub use native::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use presentations::Presentations;
+// The watch a serving host runs over the decks root, so a new or edited deck reaches the room
+// without a restart (ledger #286).
+#[cfg(feature = "server")]
+pub use presentations::DeckWatch;
 
 // The tag overlays (approved + suggested tags) merged into urn:cms:graph — provisional LLM/OL
 // tag suggestions with a human-authorized promote/dismiss, kept off the regenerated sources.
