@@ -6,7 +6,7 @@
 
   <!-- The type index over SPARQL-results XML: one chip per kind (?label / ?n), each
        opening its type view. Same chip look as the tag index; authored to xrust's
-       subset (xsl:attribute for hx-get, no quotes in the CSS). -->
+       subset (xsl:attribute for href and hx-get, no quotes in the CSS). -->
   <xsl:template match="/sr:sparql">
     <style>
       .cms-tags{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0}
@@ -21,6 +21,12 @@
 
   <xsl:template match="sr:result">
     <a class="cms-tag" hx-target="#room" hx-swap="innerHTML">
+      <!-- The href is the hx-get: htmx swaps in place on click and Enter, and the href puts the
+           chip in the tab order (an <a> with no href takes no focus; ledger #1640). -->
+      <xsl:attribute name="href">
+        <xsl:text>/r/urn:cms:type:</xsl:text>
+        <xsl:value-of select="sr:binding[@name='label']/sr:literal"/>
+      </xsl:attribute>
       <xsl:attribute name="hx-get">
         <xsl:text>/r/urn:cms:type:</xsl:text>
         <xsl:value-of select="sr:binding[@name='label']/sr:literal"/>

@@ -5,8 +5,8 @@
   <xsl:output method="html" omit-xml-declaration="yes"/>
 
   <!-- The tag index over SPARQL-results XML: one clickable chip per ?tag / ?n row. No
-       attribute value templates and no string functions (xrust lacks them); the hx-get
-       is built with xsl:attribute, and the CSS carries no quotes (xrust would escape
+       attribute value templates and no string functions (xrust lacks them); the href and hx-get
+       are built with xsl:attribute, and the CSS carries no quotes (xrust would escape
        them and corrupt the rule). -->
   <xsl:template match="/sr:sparql">
     <style>
@@ -22,6 +22,12 @@
 
   <xsl:template match="sr:result">
     <a class="cms-tag" hx-target="#room" hx-swap="innerHTML">
+      <!-- The href is the hx-get: htmx swaps in place on click and Enter, and the href puts the
+           chip in the tab order (an <a> with no href takes no focus; ledger #1640). -->
+      <xsl:attribute name="href">
+        <xsl:text>/r/urn:cms:view:</xsl:text>
+        <xsl:value-of select="sr:binding[@name='tag']/sr:literal"/>
+      </xsl:attribute>
       <xsl:attribute name="hx-get">
         <xsl:text>/r/urn:cms:view:</xsl:text>
         <xsl:value-of select="sr:binding[@name='tag']/sr:literal"/>

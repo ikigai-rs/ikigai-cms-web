@@ -35,6 +35,9 @@
       <div class="cms-tags">
         <xsl:for-each select="dc:subject">
           <a class="cms-tag" hx-target="#room">
+            <!-- The href is the hx-get: htmx swaps in place on click and Enter, and the href puts the
+                 chip in the tab order (an <a> with no href takes no focus; ledger #1640). -->
+            <xsl:attribute name="href">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
             <xsl:attribute name="hx-get">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
             <xsl:text>#</xsl:text><xsl:value-of select="."/>
           </a>

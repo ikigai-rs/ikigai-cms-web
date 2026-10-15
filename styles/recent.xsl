@@ -30,6 +30,14 @@
         <xsl:text>?type=</xsl:text>
         <xsl:value-of select="@scope"/>
       </xsl:attribute>
+      <!-- The same URL as the hx-get: the href puts the item in the tab order and makes Enter
+           open it (an <a> with no href takes no focus; ledger #1640). -->
+      <xsl:attribute name="href">
+        <xsl:text>/r/</xsl:text>
+        <xsl:value-of select="@iri"/>
+        <xsl:text>?type=</xsl:text>
+        <xsl:value-of select="@scope"/>
+      </xsl:attribute>
       <xsl:value-of select="."/>
     </a>
   </xsl:template>
