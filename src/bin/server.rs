@@ -1901,6 +1901,11 @@ mod http_face;
 #[path = "server_tests/chips.rs"]
 mod chips;
 
+/// Every chip is a link with an `href`, so a keyboard reaches it (ledger #1640, SC 2.1.1).
+#[cfg(test)]
+#[path = "server_tests/focus.rs"]
+mod focus;
+
 /// Each scheduled maintenance pass fires under its own authority, never more (ledger #889).
 #[cfg(test)]
 #[path = "server_tests/jobs.rs"]

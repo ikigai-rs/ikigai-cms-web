@@ -963,7 +963,8 @@ impl Endpoint for TagApprove {
         self.tags.approve(&book, &tag);
         let t = html_escape(&tag);
         let html = format!(
-            "<a class=\"cms-tag\" hx-target=\"#room\" hx-get=\"/r/urn:cms:view:{t}\">#{t}</a>"
+            "<a class=\"cms-tag\" hx-target=\"#room\" href=\"/r/urn:cms:view:{t}\" \
+             hx-get=\"/r/urn:cms:view:{t}\">#{t}</a>"
         );
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
