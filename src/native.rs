@@ -220,13 +220,23 @@ pub fn cms_spaces_with(
     }
     // Deck files, read THROUGH the kernel (`urn:cms:deck:{path}`, rooted at the presentations
     // dir) so the presentations graph is golden-threaded + capability-gated on them, not a raw
-    // std::fs read. Bound only when a presentations root is configured.
+    // std::fs read; and the deck listing (`urn:cms:decks`), the one walk of the deck tree, so
+    // which decks exist rides a thread too (ledger #286). Both cacheable: the threads are cut
+    // by the `DeckWatch` a serving host runs over the same root. Bound only when a
+    // presentations root is configured.
     let mut deck_space = EndpointSpace::new();
     if let Some(cfg) = &presentations {
-        deck_space = deck_space.bind(
-            UriTemplate::parse("urn:cms:deck:{path}").expect("valid template"),
-            DeckFiles(ikigai_fs::FileEndpoint::new(cfg.root.clone()).cacheable()),
-        );
+        deck_space = deck_space
+            .bind(
+                Exact::new(crate::presentations::DECKS_IRI),
+                crate::presentations::DeckListing {
+                    root: cfg.root.clone(),
+                },
+            )
+            .bind(
+                UriTemplate::parse("urn:cms:deck:{path}").expect("valid template"),
+                DeckFiles(ikigai_fs::FileEndpoint::new(cfg.root.clone()).cacheable()),
+            );
     }
     // The graph resources: bookmarks, books, and their union (what SPARQL points at).
     let bookmarks_src = format!(

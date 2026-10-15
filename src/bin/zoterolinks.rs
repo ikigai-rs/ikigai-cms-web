@@ -11,11 +11,14 @@
 //! access). Nothing is downloaded or proxied — the link points at Zotero and the browser's own
 //! session does the authenticating.
 //!
+//! It runs under `PassAuthority::zotero_links` (ledger #889), not root: a read of the CMS jail, the
+//! Zotero API host, and that one keystore entry.
+//!
 //! Run: `cargo run --features maintenance --bin cms-zotero-links` — configured by
 //! `cms.toml` in the ikigai config home + CLI flags; no env vars.
 
-use ikigai_cms_web::maintenance::{build_maintenance_kernel, default_status_path};
-use ikigai_core::{Capability, Iri, Request, Verb};
+use ikigai_cms_web::maintenance::{build_maintenance, default_status_path};
+use ikigai_core::{Iri, Request, Verb};
 
 #[tokio::main]
 async fn main() {
@@ -41,7 +44,7 @@ async fn main() {
     // Held past the kernel: a fresh sweep is exactly when a book gains a durable identity, so the
     // tag overlays are rekeyed onto it the moment the overlay it comes from is rewritten.
     let tags = cfg.tags.clone();
-    let kernel = match build_maintenance_kernel(
+    let (kernel, authority) = match build_maintenance(
         cfg.src_dir,
         cfg.zotero,
         cfg.bookmarks,
@@ -49,14 +52,14 @@ async fn main() {
         cfg.tags,
         cfg.llm_provider,
     ) {
-        Ok(k) => k,
+        Ok(m) => (m.kernel, m.authority),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
         }
     };
     let req = Request::new(Verb::Source, Iri::parse("urn:cms:zotero-links").unwrap());
-    match kernel.issue(req, &Capability::root()).await {
+    match kernel.issue(req, &authority.zotero_links).await {
         Ok(repr) => println!("\n{}", String::from_utf8_lossy(&repr.bytes)),
         Err(e) => {
             eprintln!("zotero-links failed: {e}");

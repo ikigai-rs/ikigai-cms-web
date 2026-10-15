@@ -2436,7 +2436,8 @@ pub fn default_status_path() -> Option<PathBuf> {
 /// The authority each maintenance pass runs under when the server SCHEDULES it (ledger #889):
 /// a scheduled job fires under the capability it was scheduled with, clamped to the registry's
 /// ceiling (ikigai-time's rule since ledger #79), so this is what a daily pass may do, every day,
-/// for the life of the process. Both used to be root.
+/// for the life of the process. Both used to be root. A one-shot bin runs its pass under the
+/// same authority, so the operator's run and the scheduled one cannot diverge.
 #[derive(Clone, Debug)]
 pub struct PassAuthority {
     /// `urn:cms:linkcheck`: **root**, and on purpose. The pass HEAD-checks every bookmark, so the
@@ -2454,6 +2455,11 @@ pub struct PassAuthority {
     /// not through the kernel), and no other host or port: a local LLM's host is usually
     /// `localhost`, where every other service on the machine also lives.
     pub tag_suggest: Capability,
+    /// `urn:cms:zotero-links`: a read of the CMS jail (the graph's books), the Zotero API host,
+    /// and the one keystore entry the pass reads, its API key. Not any other secret, not
+    /// OpenLibrary or the LLM, and no file write (the overlay is written by the pass itself). Not
+    /// scheduled by the server today; `cms-zotero-links` runs under it.
+    pub zotero_links: Capability,
 }
 
 impl PassAuthority {
@@ -2478,6 +2484,11 @@ impl PassAuthority {
                 format!("urn:cap:fs:read:{}", src_dir.display()),
                 format!("urn:cap:net:{OPENLIBRARY_HOST}"),
                 format!("urn:cap:net:{host}:{port}"),
+            ]),
+            zotero_links: Capability::scoped([
+                format!("urn:cap:fs:read:{}", src_dir.display()),
+                format!("urn:cap:net:{}", crate::zotero::API_HOST),
+                format!("urn:cap:secret:read:{}", crate::zotero::API_KEY_SECRET),
             ]),
         })
     }
@@ -2751,6 +2762,66 @@ mod tests {
         assert!(
             !html.contains("openlibrary.org/search"),
             "a linked book no longer falls back: {html}"
+        );
+    }
+
+    /// The Zotero link pass under the authority `cms-zotero-links` runs it with (ledger #889): its
+    /// three grants carry the whole pass (the same link lands as under root), and the same
+    /// capability is refused the keystore's other entries, other hosts (OpenLibrary included) and a
+    /// file write. Fails with root in its place: every refusal below would be granted.
+    #[test]
+    fn zotero_links_runs_under_its_authority_and_is_refused_outside_it() {
+        let (dir, z) = untagged_book_fixture();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
+        let secrets: Arc<dyn ikigai_secret::Backend> =
+            Arc::new(ikigai_secret::FileBackend::new(dir.path()));
+        secrets.set("zotero-api-key", b"s3cret").unwrap();
+        secrets.set("another-key", b"not yours").unwrap();
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            Some(z),
+            None,
+            dir.path().join("st.json"),
+            tags.clone(),
+            Arc::new(CannedZotero),
+            Arc::clone(&secrets),
+            default_llm_registry(),
+            "ollama",
+        );
+        let llm = &default_llm_registry().providers[0];
+        let cap = PassAuthority::new(dir.path(), llm)
+            .expect("an authority")
+            .zotero_links;
+        let issue = |req: Request| futures::executor::block_on(kernel.issue(req, &cap));
+
+        let pass = Request::new(Verb::Source, Iri::parse("urn:cms:zotero-links").unwrap());
+        let summary = String::from_utf8(issue(pass).expect("zotero-links runs").bytes).unwrap();
+        assert!(summary.contains("1 by ISBN"), "summary: {summary}");
+        let overlay = std::fs::read_to_string(&tags.zotero_links).unwrap();
+        assert!(overlay.contains("REALEPUB"), "the link landed: {overlay}");
+
+        let refused = |req: Request, what: &str| match issue(req) {
+            Err(Error::Denied(_)) => {}
+            other => panic!("{what}: expected Denied, got {other:?}"),
+        };
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:secret:another-key").unwrap()),
+            "another keystore entry",
+        );
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+                .with_arg("url", ArgRef::Inline(b"https://example.com/".to_vec())),
+            "a host that is not the Zotero API",
+        );
+        refused(
+            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+                .with_arg("url", ArgRef::Inline(b"https://openlibrary.org/".to_vec())),
+            "OpenLibrary, which only tag-suggest asks",
+        );
+        refused(
+            Request::new(Verb::Sink, Iri::parse("urn:cms:link-keep").unwrap())
+                .with_arg("url", ArgRef::Inline(b"https://x.example/".to_vec())),
+            "a file write",
         );
     }
 

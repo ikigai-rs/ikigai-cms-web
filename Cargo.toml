@@ -77,6 +77,10 @@ ikigai-sparql = "0.2.1"
 ikigai-xslt = "0.2.1"
 # Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
 ikigai-fs = "0.1.8" # security floor (audit round 3, ledger #856): the jail authorizes the file it opens
+# The platform watcher (FSEvents / inotify) behind `DeckWatch`: the serving host cuts the deck
+# listing's and the deck files' threads when the decks tree changes (ledger #286). The same major
+# ikigai-browse and ikigai-embedded watch with. Only the server runs a watch.
+notify = { version = "6.1", optional = true }
 # Endpoint::invoke is async (dyn via async-trait) — the assembly + view endpoints read
 # through the kernel.
 async-trait = "0.1"
@@ -171,7 +175,7 @@ wasm-bindgen = "=0.2.108"
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 # The server includes the maintenance stack + the time transport so it can schedule the
 # link-check pass (urn:time) alongside serving the room.
-server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time"]
+server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time", "dep:notify"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.

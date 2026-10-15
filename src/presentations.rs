@@ -12,16 +12,27 @@
 //! with no hand-tagging, and an un-migrated deck carries just its title and venue tag. The
 //! link is the built `dist/index.html`, served under the configured base.
 //!
-//! Native-only. Deck **contents** are read through the kernel (`urn:cms:deck:*`), so the
-//! graph is **golden-threaded** to them — a `lectern build` that rewrites a deck cuts the
-//! thread and the reading room refreshes. The directory **walk** (which decks exist) is still
-//! `std::fs`, so a brand-new deck *directory* appears on the next restart. The durable end
-//! state is the graph as source of truth with lectern rendering *from* it.
+//! Native-only. The graph reads nothing from disk itself (ledger #286). Which decks exist is
+//! the resource `urn:cms:decks` (the listing: the one place the deck tree is walked), and each
+//! deck's **contents** are read through the deck jail (`urn:cms:deck:*`). Both are cacheable,
+//! each under its own golden thread, so the graph hangs from all of them. What cuts those
+//! threads is the [`DeckWatch`] a serving host runs over the decks root: a new deck directory
+//! cuts the listing and a `lectern build` that rewrites a deck cuts its files, and the reading
+//! room recomputes on its next read without a restart. A kernel with no watch serves what it
+//! read first until something cuts. The durable end state is the graph as source of truth with
+//! lectern rendering *from* it.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use ikigai_core::{Description, Endpoint, Invocation, Iri, ReprType, Representation, Result, Verb};
+use ikigai_core::{
+    Description, Endpoint, Invocation, Iri, ReprType, Representation, Request, Result, Verb,
+};
+
+/// The deck listing, and the golden thread it hangs from: a [`DeckWatch`] cuts this name
+/// whenever anything under the decks root changes, so a deck that appears, moves or goes away
+/// reaches the graph on its next read.
+pub(crate) const DECKS_IRI: &str = "urn:cms:decks";
 
 /// Configuration for the presentations source: the decks root, and the base URL a static
 /// server exposes that tree at — so a card link opens the built deck (`{base}/{deck}/dist/
@@ -71,48 +82,149 @@ impl Endpoint for PresentationsGraph {
     }
 }
 
-/// The whole presentations graph: a `cms:Presentation` block per deck under `root`, each
-/// linked at `base_url` (or `file://` when none is configured). Deck *files* are read
-/// through the kernel (`urn:cms:deck:*`, see [`deck_source`]) so the graph is golden-threaded
-/// to them — a `lectern build` that rewrites a deck cuts the thread and this recomputes.
+/// The whole presentations graph: a `cms:Presentation` block per deck the listing names, each
+/// linked at `base_url` (or `file://` when none is configured). Nothing here touches the disk:
+/// which decks exist comes from `urn:cms:decks` ([`DeckListing`]) and every deck file is read
+/// through the deck jail ([`deck_source`]), so the graph hangs from their threads and
+/// recomputes when a [`DeckWatch`] cuts one.
 async fn presentations_turtle(inv: &Invocation<'_>, root: &Path, base_url: Option<&str>) -> String {
     let mut out = String::from(
         "@prefix dc: <http://purl.org/dc/elements/1.1/> .\n\
          @prefix cms: <https://ikigai-rs.dev/ns/cms#> .\n",
     );
-    // The directory *walk* (which decks exist) stays on std::fs — a brand-new deck dir still
-    // needs a restart — but each deck's contents ride a golden thread.
-    for deck in decks(root) {
-        if let Some(block) = deck_turtle(inv, &deck, root, base_url).await {
+    let listing = match inv.source(&Iri::parse(DECKS_IRI).expect("valid IRI")).await {
+        Ok(repr) => String::from_utf8_lossy(&repr.bytes).into_owned(),
+        // A refused listing (no read of the decks root) is no decks, as a refused deck read
+        // always was. An error is never cached, so the graph is not cached either.
+        Err(_) => return out,
+    };
+    for (deck, title_slide) in parse_listing(&listing, root) {
+        if let Some(block) = deck_turtle(inv, &deck, title_slide.as_deref(), root, base_url).await {
             out.push_str(&block);
         }
     }
     out
 }
 
+/// The `urn:cms:deck:{rel}` name of a file at `abs` under `root`, each path segment
+/// percent-encoded where an IRI cannot carry it raw. `None` outside `root`, or for a name the
+/// IRI grammar still refuses (said once, on stderr).
+fn deck_file_iri(root: &Path, abs: &Path) -> Option<Iri> {
+    let rel = abs.strip_prefix(root).ok()?;
+    // A deck under `talks/my talk` made an IRI with a space, `Iri::parse` refused it, and the
+    // deck vanished from the room with nothing said. The deck jail decodes the binding back.
+    match Iri::parse(format!("urn:cms:deck:{}", rel_iri(rel))) {
+        Ok(iri) => Some(iri),
+        Err(e) => {
+            eprintln!("presentations: skipping {}: {e}", abs.display());
+            None
+        }
+    }
+}
+
+/// A relative path as IRI text: its segments, each through [`iri_segment`], joined by `/`.
+fn rel_iri(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .map(iri_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Read a deck file (given its absolute path under `root`) THROUGH the kernel as
 /// `urn:cms:deck:{rel}`, so the read is golden-threaded (and capability-gated) rather than a
 /// raw `std::fs` read. `None` if the file is absent/unreadable or outside `root`.
 async fn deck_source(inv: &Invocation<'_>, root: &Path, abs: &Path) -> Option<String> {
-    let rel = abs.strip_prefix(root).ok()?;
-    // Each segment percent-encoded where an IRI cannot carry it raw: a deck under `talks/my talk`
-    // made an IRI with a space, `Iri::parse` refused it, the `?` turned that into `None`, and the
-    // deck vanished from the room with nothing said. The deck jail decodes the binding back.
-    let rel_url = rel
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .map(iri_segment)
-        .collect::<Vec<_>>()
-        .join("/");
-    let iri = match Iri::parse(format!("urn:cms:deck:{rel_url}")) {
-        Ok(iri) => iri,
-        Err(e) => {
-            eprintln!("presentations: skipping {}: {e}", abs.display());
-            return None;
-        }
-    };
+    let iri = deck_file_iri(root, abs)?;
     let repr = inv.source(&iri).await.ok()?;
     String::from_utf8(repr.bytes).ok()
+}
+
+/// Whether the deck jail answers that the file at `abs` exists, under the caller's capability:
+/// `false` for a file that is absent, outside `root`, or one the caller may not read.
+async fn deck_exists(inv: &Invocation<'_>, root: &Path, abs: &Path) -> bool {
+    let Some(iri) = deck_file_iri(root, abs) else {
+        return false;
+    };
+    matches!(inv.issue(Request::new(Verb::Exists, iri)).await, Ok(r) if r.bytes == b"true")
+}
+
+/// `urn:cms:decks` — which decks exist under the presentations root, and each one's title
+/// slide. The only place the deck tree is walked: the directory tree is this resource's state,
+/// and the graph composes it rather than reading the disk.
+///
+/// `text/plain`, one deck per line, as paths relative to the root in IRI text (each segment
+/// through [`iri_segment`], so a raw space never appears): `{deck}` alone, or `{deck} {slide}`
+/// when the deck has a title slide, the slide relative to the deck. A deck is listed only when
+/// the caller may read its `deck.toml` through the deck jail, and a slide only when the caller
+/// may read it, so the listing names nothing the caller's grants do not reach. Cacheable under
+/// its own name, which a [`DeckWatch`] cuts.
+pub(crate) struct DeckListing {
+    pub root: PathBuf,
+}
+
+#[async_trait]
+impl Endpoint for DeckListing {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        crate::native::serves(inv, &self.describe())?;
+        let mut out = String::new();
+        for deck in decks(&self.root) {
+            if !deck_exists(inv, &self.root, &deck.join("deck.toml")).await {
+                continue;
+            }
+            let Ok(rel) = deck.strip_prefix(&self.root) else {
+                continue;
+            };
+            out.push_str(&rel_iri(rel));
+            if let Some(slide) = title_slide(inv, &self.root, &deck).await {
+                if let Ok(slide) = slide.strip_prefix(&deck) {
+                    out.push(' ');
+                    out.push_str(&rel_iri(slide));
+                }
+            }
+            out.push('\n');
+        }
+        Ok(Representation::new(
+            ReprType::new("text/plain").with_param("charset", "utf-8"),
+            out.into_bytes(),
+        )
+        .cacheable()
+        .depends_on(DECKS_IRI))
+    }
+
+    fn name(&self) -> &str {
+        "cms-decks"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(DECKS_IRI)
+            .summary(
+                "The lectern decks under the presentations root, one per line as root-relative \
+                 IRI path text, each followed by its title slide when it has one. Lists only \
+                 what the caller may read through the deck jail.",
+            )
+            .verb(Verb::Source)
+            .output("text/plain")
+            .requires(crate::native::FS_READ)
+    }
+}
+
+/// The listing's lines as `(deck dir, title slide)` absolute paths under `root`. A line that
+/// is empty is skipped; anything else is taken as the listing wrote it.
+fn parse_listing(listing: &str, root: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    listing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let (deck, slide) = match line.split_once(' ') {
+                Some((deck, slide)) => (deck, Some(slide)),
+                None => (line, None),
+            };
+            let deck = root.join(crate::native::pct_decode(deck));
+            let slide = slide.map(|s| deck.join(crate::native::pct_decode(s)));
+            (deck, slide)
+        })
+        .collect()
 }
 
 /// One path segment as IRI text: every byte an IRI path segment cannot carry raw — whitespace,
@@ -180,10 +292,11 @@ fn collect_decks(dir: &Path, out: &mut Vec<PathBuf>) {
 async fn deck_turtle(
     inv: &Invocation<'_>,
     deck: &Path,
+    title_slide: Option<&Path>,
     root: &Path,
     base_url: Option<&str>,
 ) -> Option<String> {
-    let (title, mut tags) = deck_metadata(inv, deck, root).await?;
+    let (title, mut tags) = deck_metadata(inv, deck, title_slide, root).await?;
     // The venue tags come from the path, not the deck — always added, whatever the source.
     tags.extend(venue_tags(deck, root));
     tags.sort();
@@ -191,10 +304,13 @@ async fn deck_turtle(
     let title = title.unwrap_or_else(|| pretty_slug(deck));
 
     let iri = deck_iri(deck, root);
+    // Only a `file://` link asks whether the deck is built; a served link names the built deck
+    // either way.
+    let built = base_url.is_none() && deck_exists(inv, root, &deck.join("dist/index.html")).await;
     let mut ttl = format!(
         "<{iri}> a cms:Presentation ; dc:title {} ; dc:identifier {}",
         ttl_str(&title),
-        ttl_str(&deck_link(deck, root, base_url)),
+        ttl_str(&deck_link(deck, root, base_url, built)),
     );
     for tag in &tags {
         ttl.push_str(&format!(" ; dc:subject {}", ttl_str(tag)));
@@ -209,11 +325,12 @@ async fn deck_turtle(
 async fn deck_metadata(
     inv: &Invocation<'_>,
     deck: &Path,
+    title_slide: Option<&Path>,
     root: &Path,
 ) -> Option<(Option<String>, Vec<String>)> {
     match jsonld_metadata(inv, deck, root).await {
         Some(m) => Some(m),
-        None => scraped_metadata(inv, deck, root).await,
+        None => scraped_metadata(inv, title_slide?, root).await,
     }
 }
 
@@ -261,19 +378,20 @@ fn extract_ld_json(html: &str) -> Option<String> {
 /// `[metadata]` is authored and built. `None` when the deck has no readable title slide.
 async fn scraped_metadata(
     inv: &Invocation<'_>,
-    deck: &Path,
+    slide: &Path,
     root: &Path,
 ) -> Option<(Option<String>, Vec<String>)> {
-    let slide = title_slide(deck)?;
-    let text = deck_source(inv, root, &slide).await?;
+    let text = deck_source(inv, root, slide).await?;
     Some((first_h1(title_region(&text)), Vec::new()))
 }
 
 /// The card link for a deck: its built `dist/index.html` served under `base_url` (so a
 /// click opens the deck to present), or a `file://` path when no server base is configured
 /// (locatable but not clickable from an https page). The served URL is emitted whether or
-/// not the deck is built yet — it resolves once `lectern build` has run.
-fn deck_link(deck: &Path, root: &Path, base_url: Option<&str>) -> String {
+/// not the deck is built yet — it resolves once `lectern build` has run. `built` says whether
+/// the deck's `dist/index.html` exists, which only the `file://` form uses: the caller asks
+/// the deck jail, so this reads nothing from disk.
+fn deck_link(deck: &Path, root: &Path, base_url: Option<&str>, built: bool) -> String {
     match base_url {
         Some(base) => {
             let rel = deck.strip_prefix(root).unwrap_or(deck);
@@ -285,9 +403,8 @@ fn deck_link(deck: &Path, root: &Path, base_url: Option<&str>) -> String {
             format!("{}/{}/dist/index.html", base.trim_end_matches('/'), rel_url)
         }
         None => {
-            let built = deck.join("dist/index.html");
-            let target = if built.is_file() {
-                built
+            let target = if built {
+                deck.join("dist/index.html")
             } else {
                 deck.to_path_buf()
             };
@@ -297,13 +414,12 @@ fn deck_link(deck: &Path, root: &Path, base_url: Option<&str>) -> String {
 }
 
 /// A deck's title slide: `slides/00-title.md` if present, else the lexically-first
-/// `slides/*.md` (single-file decks carry the title slide at the top of that file).
-fn title_slide(deck: &Path) -> Option<PathBuf> {
+/// `slides/*.md` (single-file decks carry the title slide at the top of that file). Part of the
+/// listing's walk ([`DeckListing`]); each candidate must also exist through the deck jail under
+/// the caller's capability, so a slide the caller may not read is never named.
+async fn title_slide(inv: &Invocation<'_>, root: &Path, deck: &Path) -> Option<PathBuf> {
     let slides = deck.join("slides");
-    let explicit = slides.join("00-title.md");
-    if explicit.is_file() {
-        return Some(explicit);
-    }
+    let mut candidates = vec![slides.join("00-title.md")];
     let mut mds: Vec<PathBuf> = std::fs::read_dir(&slides)
         .ok()?
         .flatten()
@@ -311,7 +427,13 @@ fn title_slide(deck: &Path) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
         .collect();
     mds.sort();
-    mds.into_iter().next()
+    candidates.extend(mds);
+    for candidate in candidates {
+        if deck_exists(inv, root, &candidate).await {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The leading title-slide region of a slide file: everything before the first `---` slide
@@ -399,6 +521,143 @@ fn ttl_str(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r");
     format!("\"{esc}\"")
+}
+
+/// The threads a set of changed paths names, for a decks root spelled any of `roots` ways:
+/// every path under the root names its own deck-jail thread (`urn:cms:deck:{rel}`, spelled
+/// exactly as [`deck_file_iri`] spells it), and any path under the root at all names the
+/// listing's thread ([`DECKS_IRI`]), first. A path outside every spelling names nothing.
+///
+/// Every change cuts the listing, not only a create or a remove: the platforms disagree about
+/// which kind they report for an editor's atomic save or a rename, and a re-walk is cheap
+/// beside a deck that never appears. Pure: the decision, separated from the platform feeding it.
+#[cfg(feature = "server")]
+fn deck_threads_for<'a>(
+    roots: &[PathBuf],
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Vec<String> {
+    let mut cut: Vec<String> = Vec::new();
+    for path in paths {
+        let Some(rel) = roots.iter().find_map(|root| path.strip_prefix(root).ok()) else {
+            continue;
+        };
+        if cut.is_empty() {
+            cut.push(DECKS_IRI.to_string());
+        }
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let thread = format!("urn:cms:deck:{}", rel_iri(rel));
+        if !cut.contains(&thread) {
+            cut.push(thread);
+        }
+    }
+    cut
+}
+
+/// The watch that keeps `urn:cms:graph:presentations` fresh in a serving process (ledger
+/// #286): the platform watcher (FSEvents / inotify) over the decks root, recursively, cutting
+/// the listing's thread and each changed file's deck-jail thread **by name**. The kernel is
+/// neither restarted nor rebuilt; the graph recomputes on its next read.
+///
+/// Declaring a thread is a promise that something cuts it, and before this nothing did: the
+/// deck files were cached under their names in a process that ran no watcher, so an edited
+/// deck was served stale until a restart, and a new deck (found by a walk outside the kernel)
+/// was invisible until one. Same shape as ikigai-browse's `ConfigWatch`: the watch is split
+/// from the thread that drives it, so a test drives the notification path
+/// ([`apply_next`](Self::apply_next)) rather than sleeping.
+///
+/// The platform reports canonical paths (macOS maps `/var` to `/private/var`) while the
+/// threads are named after the root the kernel was GIVEN, so a changed path is placed against
+/// both spellings.
+#[cfg(feature = "server")]
+pub struct DeckWatch {
+    kernel: std::sync::Arc<ikigai_core::Kernel>,
+    /// The decks root as given and, when it differs, as the platform will report it.
+    roots: Vec<PathBuf>,
+    events: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    /// Held for the watch's lifetime: dropping it ends the platform watch and closes
+    /// `events`, which ends [`run`](Self::run).
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[cfg(feature = "server")]
+impl DeckWatch {
+    /// Start watching `root` on `kernel`'s behalf, and hand the watch back to be driven.
+    /// Fails, rather than silently watching nothing, when the platform watcher cannot be
+    /// created or pointed at the root (a root that does not exist is the usual cause).
+    pub fn start(
+        kernel: std::sync::Arc<ikigai_core::Kernel>,
+        root: &Path,
+    ) -> std::result::Result<Self, String> {
+        use notify::Watcher;
+        let mut roots = vec![root.to_path_buf()];
+        if let Ok(canonical) = root.canonicalize() {
+            if canonical != root {
+                roots.push(canonical);
+            }
+        }
+        let (tx, events) = std::sync::mpsc::channel();
+        let platform = |e: notify::Error| format!("cannot watch {}: {e}", root.display());
+        let mut watcher = notify::recommended_watcher(move |res| {
+            // A closed receiver means the watch was dropped; nothing to report to.
+            let _ = tx.send(res);
+        })
+        .map_err(platform)?;
+        watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .map_err(platform)?;
+        Ok(DeckWatch {
+            kernel,
+            roots,
+            events,
+            _watcher: watcher,
+        })
+    }
+
+    /// [`start`](Self::start), then drive the watch on a detached thread for the process's
+    /// lifetime: the serving host's one line.
+    pub fn spawn(
+        kernel: std::sync::Arc<ikigai_core::Kernel>,
+        root: &Path,
+    ) -> std::result::Result<(), String> {
+        let watch = Self::start(kernel, root)?;
+        std::thread::spawn(move || watch.run());
+        Ok(())
+    }
+
+    /// Cut every thread a change names. Returns the threads cut: empty for an access (a read
+    /// changes no content), a path outside the root, or a watcher error (which names no path).
+    fn apply(&self, event: notify::Result<notify::Event>) -> Vec<String> {
+        let Ok(event) = event else {
+            return Vec::new();
+        };
+        if event.kind.is_access() {
+            return Vec::new();
+        }
+        let cut = deck_threads_for(&self.roots, event.paths.iter().map(PathBuf::as_path));
+        for thread in &cut {
+            self.kernel.cut(thread.as_str());
+        }
+        cut
+    }
+
+    /// Wait up to `timeout` for the watcher's next notification and apply it: `None` when
+    /// nothing arrived in time or the watch has ended, else the threads it cut. The deadline
+    /// is an upper bound on platform latency, not a guess at it.
+    pub fn apply_next(&self, timeout: std::time::Duration) -> Option<Vec<String>> {
+        self.events
+            .recv_timeout(timeout)
+            .ok()
+            .map(|event| self.apply(event))
+    }
+
+    /// Drive the watch until its channel closes: in practice, for the process's lifetime.
+    pub fn run(self) {
+        for event in self.events.iter() {
+            self.apply(event);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,10 +787,17 @@ mod tests {
         let root = Path::new("/decks");
         let deck = root.join("conferences/nfjs/fs-crypto");
         assert_eq!(
-            deck_link(&deck, root, Some("http://localhost:8000/")),
+            deck_link(&deck, root, Some("http://localhost:8000/"), false),
             "http://localhost:8000/conferences/nfjs/fs-crypto/dist/index.html"
         );
-        assert!(deck_link(&deck, root, None).starts_with("file://"));
+        assert_eq!(
+            deck_link(&deck, root, None, false),
+            "file:///decks/conferences/nfjs/fs-crypto"
+        );
+        assert_eq!(
+            deck_link(&deck, root, None, true),
+            "file:///decks/conferences/nfjs/fs-crypto/dist/index.html"
+        );
     }
 
     #[test]

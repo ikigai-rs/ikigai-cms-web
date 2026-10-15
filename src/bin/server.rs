@@ -219,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src_dir_maint = src_dir.clone();
     let bookmarks_maint = bookmarks.clone();
     let zotero_maint = zotero.clone();
+    let decks_root = presentations.as_ref().map(|p| p.root.clone());
     let kernel = Arc::new(ikigai_cms_web::build_cms_kernel_with(
         src_dir,
         zotero,
@@ -227,6 +228,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.tags.clone(),
         cfg.linkstatus.clone(),
     ));
+    // The watch over the decks root: the deck listing and the deck files are cached under
+    // threads, and this is what cuts them, so a new deck or a `lectern build` reaches the room
+    // without a restart (ledger #286). A watch that cannot start is said, not fatal: the room
+    // serves correctly, only stale.
+    if let Some(root) = &decks_root {
+        match ikigai_cms_web::DeckWatch::spawn(Arc::clone(&kernel), root) {
+            Ok(()) => println!("presentations watch: {}", root.display()),
+            Err(e) => eprintln!(
+                "presentations watch: OFF ({e}); a new or rebuilt deck needs a restart to appear"
+            ),
+        }
+    }
     // The recency trail, shared across connections and keyed per passkey identity.
     let recent = Arc::new(RecentLog::default());
 

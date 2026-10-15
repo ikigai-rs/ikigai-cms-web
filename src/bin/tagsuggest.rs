@@ -3,11 +3,14 @@
 //! `urn:time` schedule, S3, sources the very same resource behind the LLM gate). Writes the
 //! suggestions overlay for `+`/`x` review — never a proper tag until you promote it.
 //!
+//! It runs under `PassAuthority::tag_suggest`, the authority the server schedules the pass with
+//! (ledger #889), not root: a read of the CMS jail, OpenLibrary, and the LLM's host and port.
+//!
 //! Run: `cargo run --features maintenance --bin cms-tag-suggest` — configured by
 //! `cms.toml` in the ikigai config home + CLI flags (`--limit <n>`, default 5); no env vars.
 
-use ikigai_cms_web::maintenance::{build_maintenance_kernel, default_status_path};
-use ikigai_core::{ArgRef, Capability, Iri, Request, Verb};
+use ikigai_cms_web::maintenance::{build_maintenance, default_status_path};
+use ikigai_core::{ArgRef, Iri, Request, Verb};
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +36,7 @@ async fn main() {
         eprintln!("HOME is not set");
         std::process::exit(2);
     };
-    let kernel = match build_maintenance_kernel(
+    let (kernel, authority) = match build_maintenance(
         cfg.src_dir,
         cfg.zotero,
         cfg.bookmarks,
@@ -41,7 +44,7 @@ async fn main() {
         cfg.tags,
         cfg.llm_provider,
     ) {
-        Ok(k) => k,
+        Ok(m) => (m.kernel, m.authority),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
@@ -51,7 +54,7 @@ async fn main() {
     if let Some(limit) = cfg.limit {
         req = req.with_arg("limit", ArgRef::Inline(limit.into_bytes()));
     }
-    match kernel.issue(req, &Capability::root()).await {
+    match kernel.issue(req, &authority.tag_suggest).await {
         Ok(repr) => println!("\n{}", String::from_utf8_lossy(&repr.bytes)),
         Err(e) => {
             eprintln!("tag-suggest failed: {e}");
