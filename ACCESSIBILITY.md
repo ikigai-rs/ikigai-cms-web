@@ -19,7 +19,7 @@ Adapted from the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSI
 | Private channel | [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cms-web/security/advisories/new), for anything security-sensitive |
 | Target | WCAG 2.2 Level AA |
 | Status | Evaluation in progress. No conformance claim. |
-| Last reviewed | 2026-10-15 |
+| Last reviewed | 2026-10-16 |
 | Next review | when `dist/index.html`, `dist/auth.js`, a stylesheet in `styles/`, the server-rendered chrome or the vendored htmx changes, or when an accessibility check is added |
 
 ## Commitment
@@ -78,9 +78,19 @@ is not, so the server refuses to start in an arrangement where nobody could sign
 - **`dev_open`** ungates the HTTP face on loopback only, which lets a check reach the signed-in
   views without any authenticator. It skips the sign-in panel, so a run that uses it says nothing
   about sign-in.
-- **The passkey store** is the Keychain on macOS (a file store elsewhere). A test server should not
-  read the store of a room someone uses; the run below used a build of `main` whose store was a
-  scratch directory, with scratch data and a scratch configuration (`--config`).
+- **The passkey store** is the Keychain on macOS (a file store elsewhere). A test server must not
+  read the store of a room someone uses, so it is started with `--keystore-dir <dir>` (or
+  `keystore_dir` in its scratch `cms.toml`), an existing empty directory that holds the passkey
+  store instead; the Keychain is then never opened, and the startup banner names the directory
+  (`passkey store: the directory …`). Add scratch data and a scratch configuration (`--config`),
+  and `--dev-open` when the check needs no sign-in:
+
+  ```sh
+  cms-server --config <scratch>/cms.toml --keystore-dir <scratch>/keys --dev-open
+  ```
+
+  The runs below, before this setting existed (ledger #1684), used a build of `main` patched to
+  keep its store in a scratch directory. No source patch is needed now.
 
 ## Conformance status
 
@@ -98,7 +108,7 @@ The crate's tests run on every pull request (`.github/workflows/ci.yml`, with th
 
 | Check | Version | What it covers | What it does not cover |
 |---|---|---|---|
-| Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff` | Any accessibility property: names, roles, focus, contrast |
+| Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff`; no stylesheet relies on a space the XSLT engine drops, and the count line's and the review's spaces render | Any accessibility property: names, roles, focus, contrast |
 | `src/bin/server_tests/focus.rs`, same run | none | Two accessibility properties, as markup. Keyboard: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get`. Target size: in a tag view with a suggested tag, in each style, every button the view's own stylesheet styles (the suggestion's `+` and `x`) is given a `min-width` and `min-height` (or `width` and `height`) of at least 24 px | Whether focus is visible, where it goes after a swap, and anything a browser decides, including the size a button is actually drawn at; buttons styled only by the page shell (toolbar, pager, the clear button) |
 | axe-core in Google Chrome against a scratch `cms-server` (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | 14 states, each in light and dark: signed out (enroll offered, then sign-in offered), the tag index, the type index, the recent trail empty and after views, the dead-links review, the purge confirmation, a tag view in Catalog, Mosaic and Agenda, its second page, search with and without results. The passkey enrolled and signed in through Chrome's virtual authenticator. Rules tagged WCAG 2.0/2.1/2.2 A and AA, with best-practice rules reported | One viewport (1280×900). States not opened: a failed sign-in, the purge result, a promoted or dismissed suggestion, a link-check pass in progress, the error fragments, the WebTransport path's failures. Only invented data |
 | Tab walk, same run | as above | Which controls take focus, in order, on four states; where focus lands after a navigation-bar button and after the pager's "next" | Whether the order makes sense to a person; Shift+Tab; Enter and Space on each control |
@@ -246,8 +256,9 @@ before any conformance claim.
 | Date | Change | Evidence |
 |---|---|---|
 | 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108) |
-| 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; this pull request |
+| 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; [PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109) |
 | 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8, ledger #1672); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111) |
+| 2026-10-16 | A test server keeps its passkey store in a scratch directory with `--keystore-dir` (ledger #1684), so a browser check needs no source patch; the testing notes say so. The rendering tests now refuse a stylesheet that relies on a space the XSLT engine drops (a whitespace-only `<xsl:text>` or a no-break space, ledger #1693); none of the room's stylesheets does, so no view changed | `config.rs` keystore tests; `native.rs` whitespace tests; this pull request |
 
 ## References
 

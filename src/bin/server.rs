@@ -87,16 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut entitlement = vec![format!("urn:cap:fs:read:{}", src_dir.display())];
 
     // The relying party. rp_id + page origin default to local dev; the passkey store
-    // persists through the OS keystore (macOS Keychain), not a plaintext file. The origin
-    // defaults to the page we serve — same host+port — so it cannot drift from the URL you
-    // actually open (the #1 sign-in failure). Override only for a non-localhost deployment.
+    // persists through the OS keystore (macOS Keychain), not a plaintext file, unless
+    // `keystore_dir` names a scratch directory (ledger #1684): then the Keychain is never
+    // constructed, by this or the maintenance kernel. The origin defaults to the page we
+    // serve — same host+port — so it cannot drift from the URL you actually open (the #1
+    // sign-in failure). Override only for a non-localhost deployment.
     let rp_id = cfg.rp_id.clone();
     let rp_origin = cfg.rp_origin.clone();
-    let rp = Arc::new(Rp::new(
-        &rp_id,
-        &rp_origin,
-        ikigai_secret::default_backend(),
-    )?);
+    let keystore = cfg.keystore();
+    let rp = Arc::new(Rp::new(&rp_id, &rp_origin, Arc::clone(&keystore))?);
 
     // The WebTransport certificate's SANs FOLLOW THE BIND. The browser dials the wire by the
     // host the page came from; a cert that doesn't name it is rejected, and that failure shows
@@ -132,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  — no passkey enrolled yet; register one from the page"
         }
     );
+    println!("passkey store: {}", cfg.keystore_label());
     println!("cert sha-256: {hash_hex}  (SANs: {})", cert_sans.join(", "));
     // Write the cert hash where the page can fetch it, so no one pastes `#cert=` by hand.
     // The static server serving `dist/` serves this too; the page reads `cert.json` on
@@ -308,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             status_path,
             cfg.tags.clone(),
             cfg.llm_provider.clone(),
+            Arc::clone(&keystore),
         ) {
             Ok(m) => (Arc::new(m.kernel), m.authority),
             Err(e) => {

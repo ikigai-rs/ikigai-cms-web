@@ -10,7 +10,8 @@ WebTransport by `cms-server`. These rules are for every agent and every person w
   server renders into the room. It lists what has been tested, what has not, and the known
   barriers.
 - Never run a test server against the configuration, data or passkey store of a room someone
-  uses: give it a scratch `--config` and scratch paths.
+  uses: give it a scratch `--config`, scratch paths and a scratch `--keystore-dir` (an existing
+  empty directory), so the passkey store is not the Keychain.
 - Security reports go through the organization's security policy (GitHub private vulnerability
   reporting), never a public issue.
 - Every change lands through a pull request with green CI (`.github/workflows/ci.yml`: fmt,

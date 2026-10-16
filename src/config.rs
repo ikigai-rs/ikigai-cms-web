@@ -93,6 +93,9 @@ struct Raw {
     /// The Zotero link overlay path (default `~/.ikigai/cms-zotero-links.ttl`) — written by the
     /// `cms-zotero-links` pass, read by the books graph.
     zotero_links: Option<String>,
+    /// A directory to keep secrets in (the passkey store, the Zotero API key) instead of the
+    /// machine's keystore. For a scratch room under test; see [`CmsConfig::keystore`].
+    keystore_dir: Option<String>,
 }
 
 /// The resolved configuration the bins consume.
@@ -132,9 +135,47 @@ pub struct CmsConfig {
     pub extra_cert_sans: Vec<String>,
     /// Flag-only (`--limit N`): cap a maintenance pass's fan-out. Never in the file.
     pub limit: Option<String>,
+    /// `keystore_dir` / `--keystore-dir`: the directory every secret this process reads or writes
+    /// lives in, instead of the machine's keystore. `None` = the machine's keystore. An explicit
+    /// directory must exist (fail loud), and is used for every secret, never alongside the
+    /// default. See [`CmsConfig::keystore`].
+    pub keystore_dir: Option<PathBuf>,
 }
 
 impl CmsConfig {
+    /// The secret store this process reads and writes: the passkey store `cms-server` keeps, and
+    /// the API key the Zotero pass reads.
+    ///
+    /// With `keystore_dir` set it is an [`ikigai_secret::FileBackend`] in that directory, and the
+    /// machine's keystore ([`ikigai_secret::default_backend`], the macOS Keychain) is never
+    /// constructed (ledger #1684). That is how a test room runs on scratch data without reading or
+    /// writing the passkeys of a room someone uses, and without patching the source to do it.
+    /// Without it, the machine's keystore, as before.
+    pub fn keystore(&self) -> std::sync::Arc<dyn ikigai_secret::Backend> {
+        self.keystore_with(ikigai_secret::default_backend)
+    }
+
+    /// [`CmsConfig::keystore`] with the machine's keystore passed in, so a test can prove the
+    /// scratch directory never reaches it without touching the real one.
+    fn keystore_with(
+        &self,
+        machine: impl FnOnce() -> std::sync::Arc<dyn ikigai_secret::Backend>,
+    ) -> std::sync::Arc<dyn ikigai_secret::Backend> {
+        match &self.keystore_dir {
+            Some(dir) => std::sync::Arc::new(ikigai_secret::FileBackend::new(dir)),
+            None => machine(),
+        }
+    }
+
+    /// Where [`CmsConfig::keystore`] keeps secrets, for the startup banner: a stated directory is
+    /// said out loud, so a scratch room cannot be mistaken for the real one.
+    pub fn keystore_label(&self) -> String {
+        match &self.keystore_dir {
+            Some(dir) => format!("the directory {} (keystore_dir)", dir.display()),
+            None => "the OS keystore".to_string(),
+        }
+    }
+
     /// The subject-alternative names the WebTransport certificate must carry.
     ///
     /// **The SANs follow the bind.** The browser dials the wire by whatever host the page came
@@ -329,6 +370,7 @@ fn apply_flags(raw: &mut Raw, args: &[String]) -> Result<(), String> {
             "--tags-suggestions" => raw.tags_suggestions = Some(value),
             "--tags-dismissed" => raw.tags_dismissed = Some(value),
             "--zotero-links" => raw.zotero_links = Some(value),
+            "--keystore-dir" => raw.keystore_dir = Some(value),
             "--anonymous-sparql-budget-ms" => {
                 raw.anonymous_sparql_budget_ms =
                     Some(value.parse().map_err(|_| {
@@ -586,6 +628,19 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         tags.zotero_links = expand(home, &s);
     }
 
+    // Explicitly configured ⇒ must be a directory. A FileBackend would create a missing one on
+    // its first write, and a typo would then become a second, empty store that nobody meant.
+    let keystore_dir = match raw.keystore_dir {
+        Some(s) => {
+            let p = expand(home, &s);
+            if !p.is_dir() {
+                return Err(format!("keystore_dir {}: no such directory", p.display()));
+            }
+            Some(p)
+        }
+        None => None,
+    };
+
     let page_port = raw.page_port.unwrap_or(8080);
     let bind = match &raw.bind {
         Some(s) => parse_bind(s)?,
@@ -639,6 +694,7 @@ fn resolve(home: &Path, raw: Raw) -> Result<CmsConfig, String> {
         tags,
         extra_cert_sans: raw.cert_sans.unwrap_or_default(),
         limit: None,
+        keystore_dir,
     })
 }
 
@@ -719,6 +775,8 @@ config: cms.toml in the ikigai config home ($XDG_CONFIG_HOME/ikigai, else
   --tags-suggestions <file> tag-suggestions overlay (default ~/.ikigai/cms-tag-suggestions.ttl)
   --tags-dismissed <file>  dismissed-tag overlay (default ~/.ikigai/cms-tag-dismissed.ttl)
   --zotero-links <file>    Zotero link overlay (default ~/.ikigai/cms-zotero-links.ttl)
+  --keystore-dir <dir>     keep secrets (passkeys, the Zotero API key) in this existing
+                           directory instead of the OS keystore: for a scratch room
   --limit <n>              cap a maintenance pass (cms-linkcheck / cms-tag-suggest)";
 
 #[cfg(test)]
@@ -1180,5 +1238,134 @@ mod tests {
         std::fs::write(dir.join("cms.toml"), "anonymous_sparql_budget_ms = 0\n").unwrap();
         let err = load_args(home.path(), &[]).expect_err("zero in the file");
         assert!(err.contains("from 1 to 5000"), "{err}");
+    }
+
+    /// A machine keystore that a test may never reach: constructing it fails the test.
+    fn no_machine_keystore() -> std::sync::Arc<dyn ikigai_secret::Backend> {
+        panic!("the machine's keystore was constructed although keystore_dir is set")
+    }
+
+    /// Ledger #1684: `keystore_dir` (the file key, or `--keystore-dir`) is the ONLY keystore the
+    /// process builds. The machine's keystore is never constructed, and secrets land in the
+    /// directory: what `cms-server` needs to run on scratch data with no source patch.
+    #[test]
+    fn a_keystore_dir_replaces_the_machine_keystore_entirely() {
+        let home = fake_home();
+        let scratch = home.path().join("scratch-keys");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let conf = home.path().join(".config/ikigai");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(conf.join("cms.toml"), "keystore_dir = \"~/scratch-keys\"\n").unwrap();
+
+        let from_file = load_args(home.path(), &[]).expect("keystore_dir in the file");
+        let flag_dir = scratch.display().to_string();
+        let from_flag = load_args(home.path(), &["--keystore-dir", &flag_dir]).expect("the flag");
+        for cfg in [from_file, from_flag] {
+            assert_eq!(cfg.keystore_dir.as_deref(), Some(scratch.as_path()));
+            assert!(
+                cfg.keystore_label().contains("scratch-keys"),
+                "the banner names it"
+            );
+            let keystore = cfg.keystore_with(no_machine_keystore);
+            keystore
+                .set("cms-probe", b"scratch")
+                .expect("a scratch write");
+            assert!(
+                std::fs::read_dir(&scratch).unwrap().next().is_some(),
+                "the secret lands in the stated directory"
+            );
+            assert_eq!(
+                keystore
+                    .get("cms-probe")
+                    .expect("a scratch read")
+                    .as_deref(),
+                Some(&b"scratch"[..])
+            );
+            keystore.delete("cms-probe").expect("a scratch delete");
+        }
+
+        // The passkey store cms-server builds at startup loads from it, with nothing enrolled.
+        #[cfg(feature = "server")]
+        {
+            let cfg = load_args(home.path(), &[]).expect("keystore_dir in the file");
+            let rp = crate::session::Rp::new(
+                "localhost",
+                "http://localhost:8080",
+                cfg.keystore_with(no_machine_keystore),
+            )
+            .expect("the relying party builds over the scratch keystore");
+            assert!(!rp.is_enrolled());
+        }
+    }
+
+    /// Without `keystore_dir`, the machine's keystore, exactly once, as before.
+    #[test]
+    fn without_a_keystore_dir_the_machine_keystore_is_used() {
+        let home = fake_home();
+        let cfg = load_args(home.path(), &[]).expect("defaults load");
+        assert_eq!(cfg.keystore_dir, None);
+        assert_eq!(cfg.keystore_label(), "the OS keystore");
+        // A stand-in for the machine's keystore, so the real one is never touched.
+        let stand_in = tempfile::tempdir().unwrap();
+        let built = std::cell::Cell::new(0);
+        let keystore = cfg.keystore_with(|| {
+            built.set(built.get() + 1);
+            std::sync::Arc::new(ikigai_secret::FileBackend::new(stand_in.path()))
+        });
+        assert_eq!(built.get(), 1);
+        keystore
+            .set("cms-probe", b"x")
+            .expect("the stand-in takes a write");
+    }
+
+    /// An explicit `keystore_dir` that is not a directory fails loud: a file backend would create
+    /// it on the first write, so a typo would quietly become a second, empty store.
+    #[test]
+    fn a_missing_keystore_dir_fails_loud() {
+        let home = fake_home();
+        let err = load_args(home.path(), &["--keystore-dir", "~/no-such-keys"]).unwrap_err();
+        assert!(
+            err.contains("keystore_dir") && err.contains("no-such-keys"),
+            "{err}"
+        );
+    }
+
+    /// Every keystore the bins build comes through [`CmsConfig::keystore`], so `keystore_dir`
+    /// cannot be honored by one constructor and skipped by another. A direct call to the machine
+    /// keystore anywhere else in the crate is refused.
+    #[test]
+    fn only_the_config_constructs_the_machine_keystore() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 10, "found {} sources", files.len());
+        // Spelled in two halves so this line does not match itself.
+        let needle = concat!("default", "_backend(");
+        let mut calls = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if !code.starts_with("//") && code.contains(needle) {
+                    calls.push(format!("{}:{}: {code}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            calls.is_empty(),
+            "build the keystore with CmsConfig::keystore: {calls:#?}"
+        );
     }
 }

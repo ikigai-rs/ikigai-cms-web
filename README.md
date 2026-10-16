@@ -144,6 +144,13 @@ store persists through the OS keystore — the **macOS Keychain** (via `ikigai-s
 dev file store elsewhere — not a plaintext file. The RP origin defaults to
 `http://localhost:{page_port}` (override with `rp_origin`/`rp_id`).
 
+A test room keeps its secrets somewhere else: `keystore_dir = "<dir>"` in its `cms.toml`, or
+`--keystore-dir <dir>` for one run, names an existing directory that holds the passkey store
+(and the Zotero pass's API key) instead of the OS keystore; `ikigai-secret` tightens it to mode
+0700. The Keychain is then never opened, and the startup banner says which store the room uses
+(`passkey store: …`). It is how a browser check runs a scratch `cms-server` without reading or
+writing the passkeys of a room someone uses; see [ACCESSIBILITY.md](ACCESSIBILITY.md).
+
 What the public ceiling reaches, over either face, is a closed list: the embedded
 stylesheets, the pure compute endpoints (SPARQL, XSLT, the org transreptor) and the kernel's
 own manifold and validator, all of which read only what the caller hands them or could read

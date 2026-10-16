@@ -18,6 +18,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // The keystore before any field moves out of `cfg`: the machine's, or `keystore_dir`.
+    let secrets = cfg.keystore();
     // A pass has to know where to reconcile; with no configured path and no data home there
     // is nowhere, so stop rather than write the cache to wherever we were started from.
     let Some(status_path) = cfg
@@ -41,6 +43,7 @@ async fn main() {
         status_path,
         cfg.tags,
         cfg.llm_provider,
+        secrets,
     ) {
         Ok(k) => k,
         Err(e) => {

@@ -21,6 +21,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // The keystore before any field moves out of `cfg`: the machine's, or `keystore_dir`.
+    let secrets = cfg.keystore();
 
     eprintln!(
         "source: {}  zotero: {}",
@@ -43,6 +45,7 @@ async fn main() {
         status_path,
         cfg.tags,
         cfg.llm_provider,
+        secrets,
     ) {
         Ok(m) => (m.kernel, m.authority),
         Err(e) => {
