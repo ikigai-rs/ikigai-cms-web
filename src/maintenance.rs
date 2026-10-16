@@ -2509,7 +2509,8 @@ pub struct Maintenance {
 
 /// [`maintenance_kernel`] over the real reqwest transport and the config-home LLM
 /// registry. Must be built inside a tokio runtime. Errors (fail loud) on a malformed
-/// `llm.json` or an `llm_provider` the registry doesn't know.
+/// `llm.json` or an `llm_provider` the registry doesn't know. `secrets` is the keystore the
+/// `urn:secret:*` space reads: a host passes [`crate::config::CmsConfig::keystore`].
 pub fn build_maintenance_kernel(
     src_dir: PathBuf,
     zotero: Option<PathBuf>,
@@ -2517,8 +2518,18 @@ pub fn build_maintenance_kernel(
     status_path: PathBuf,
     tags: crate::tagstore::TagPaths,
     llm_provider: Option<String>,
+    secrets: std::sync::Arc<dyn ikigai_secret::Backend>,
 ) -> std::result::Result<Kernel, String> {
-    build_maintenance(src_dir, zotero, bookmarks, status_path, tags, llm_provider).map(|m| m.kernel)
+    build_maintenance(
+        src_dir,
+        zotero,
+        bookmarks,
+        status_path,
+        tags,
+        llm_provider,
+        secrets,
+    )
+    .map(|m| m.kernel)
 }
 
 /// [`build_maintenance_kernel`], with the [`PassAuthority`] a host schedules the passes under.
@@ -2529,6 +2540,7 @@ pub fn build_maintenance(
     status_path: PathBuf,
     tags: crate::tagstore::TagPaths,
     llm_provider: Option<String>,
+    secrets: std::sync::Arc<dyn ikigai_secret::Backend>,
 ) -> std::result::Result<Maintenance, String> {
     let registry = llm_registry()?;
     let provider = resolve_llm_provider(&registry, llm_provider.as_deref())?;
@@ -2545,9 +2557,10 @@ pub fn build_maintenance(
         status_path,
         tags,
         std::sync::Arc::new(ReqwestTransport::new()),
-        // The machine's real keystore (macOS Keychain). Constructing it touches nothing — only a
+        // The configured keystore: the machine's (macOS Keychain) unless `keystore_dir` names a
+        // directory (ledger #1684). Constructing the Keychain one touches nothing — only a
         // `urn:secret:*` read does, so the passes that never read one never prompt.
-        ikigai_secret::default_backend(),
+        secrets,
         registry,
         &provider,
     );

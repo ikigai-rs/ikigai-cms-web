@@ -29,6 +29,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // The keystore before any field moves out of `cfg`: the machine's, or `keystore_dir`.
+    let secrets = cfg.keystore();
     if cfg.zotero.is_none() {
         eprintln!("no Zotero library configured — nothing to link (see --zotero)");
         std::process::exit(2);
@@ -51,6 +53,7 @@ async fn main() {
         status_path,
         cfg.tags,
         cfg.llm_provider,
+        secrets,
     ) {
         Ok(m) => (m.kernel, m.authority),
         Err(e) => {
