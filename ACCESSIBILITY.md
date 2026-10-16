@@ -247,7 +247,7 @@ before any conformance claim.
 |---|---|---|
 | 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108) |
 | 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; this pull request |
-| 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8, ledger #1672); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; this pull request |
+| 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8, ledger #1672); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111) |
 
 ## References
 
