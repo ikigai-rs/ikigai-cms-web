@@ -13,6 +13,9 @@
 //! The class test below renders every fragment that carries a chip and checks each start tag that
 //! asks htmx to GET something: it must be a `<button>`, a `<form>`, or an `<a>` whose `href`
 //! equals its `hx-get`. And no `<a>` may lack an `href`. A new chip added without one fails here.
+//!
+//! The same views also hold this file's pointer check, the target size of the suggestion buttons
+//! (ledger #1672, SC 2.5.8), at the end.
 
 use std::path::Path;
 
@@ -149,4 +152,152 @@ fn the_reachability_check_sees_a_link_with_no_href() {
     );
     assert_eq!(links, 4);
     assert_eq!(bad.len(), 4, "{bad:#?}");
+}
+
+// ---- Target size (ledger #1672, SC 2.5.8) ----
+//
+// The suggestion chip's promote (`+`) and dismiss (`x`) buttons were 13 by 12 px, beside tag
+// chips that are links and so targets of their own: axe's `target-size` flagged them in Chrome.
+// A target passes SC 2.5.8 at 24 by 24 CSS px whatever is around it, so the stylesheets now give
+// each one a `min-width` and `min-height` of 24px. The check below reads that from the markup a
+// card view renders: for every `<button>` the fragment's own `<style>` styles, the size its rules
+// guarantee. A button styled only by the page shell (`dist/index.html`: the toolbar, the pager,
+// the context header's clear button) takes its size from padding and font and is not read here;
+// those measured 24 px or more in the browser runs ACCESSIBILITY.md records.
+
+/// The px value of the last `prop:` declaration in a declaration block, if it is in px.
+fn px(decls: &str, prop: &str) -> Option<f32> {
+    decls
+        .split(';')
+        .filter_map(|d| d.split_once(':'))
+        .filter(|(p, _)| p.trim() == prop)
+        .filter_map(|(_, v)| v.trim().strip_suffix("px")?.trim().parse().ok())
+        .next_back()
+}
+
+/// The `(selectors, declarations)` of every rule in `html`'s `<style>` elements, in source order.
+fn style_rules(html: &str) -> Vec<(String, String)> {
+    let mut rules = Vec::new();
+    let mut rest = html;
+    while let Some(open) = rest.find("<style>") {
+        rest = &rest[open + "<style>".len()..];
+        let Some(close) = rest.find("</style>") else {
+            break;
+        };
+        for rule in rest[..close].split('}') {
+            if let Some((sel, decls)) = rule.split_once('{') {
+                rules.push((sel.trim().to_string(), decls.to_string()));
+            }
+        }
+        rest = &rest[close..];
+    }
+    rules
+}
+
+/// Every `<button>` in `html` whose own fragment styles it and does not guarantee it 24 by 24 CSS
+/// px, with the size it does guarantee; also the number of buttons checked. A rule applies when
+/// its selector list names one of the button's classes as a plain class selector (`.cms-sug-no`,
+/// not `.cms-sug-no:hover`); the last declaration wins, and the guaranteed size is the larger of
+/// `width` and `min-width` (and of `height` and `min-height`), 0 when neither is in px.
+fn undersized_buttons(html: &str) -> (Vec<String>, usize) {
+    let rules = style_rules(html);
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    let mut rest = html;
+    while let Some(open) = rest.find("<button") {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('>') else { break };
+        let tag = &rest[..close];
+        let classes: Vec<&str> = attr(tag, "class")
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        let mut styled = false;
+        const PROPS: [&str; 4] = ["width", "min-width", "height", "min-height"];
+        let mut dims: [Option<f32>; 4] = [None; 4];
+        for (sel, decls) in &rules {
+            let names_it = sel.split(',').any(|s| {
+                s.trim()
+                    .strip_prefix('.')
+                    .is_some_and(|c| classes.contains(&c))
+            });
+            if !names_it {
+                continue;
+            }
+            styled = true;
+            for (slot, prop) in dims.iter_mut().zip(PROPS) {
+                if let Some(v) = px(decls, prop) {
+                    *slot = Some(v);
+                }
+            }
+        }
+        if !styled {
+            continue;
+        }
+        checked += 1;
+        let size = |a: Option<f32>, b: Option<f32>| a.unwrap_or(0.0).max(b.unwrap_or(0.0));
+        let (w, h) = (size(dims[0], dims[1]), size(dims[2], dims[3]));
+        if w < 24.0 || h < 24.0 {
+            bad.push(format!("<{tag}> guarantees {w} by {h} px"));
+        }
+    }
+    (bad, checked)
+}
+
+#[test]
+fn every_suggestion_button_is_at_least_24_px_square() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room(dir.path());
+    let recent = RecentLog::default();
+
+    // Seed a suggestion on the quic bookmark (its skolemized subject is what an overlay targets).
+    let select = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
+        .with_arg(
+            "query",
+            ArgRef::Inline(
+                b"SELECT ?s WHERE { ?s <http://purl.org/dc/elements/1.1/subject> \"quic\" } LIMIT 1"
+                    .to_vec(),
+            ),
+        )
+        .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+    let (rows, _) = Resolver::issue_as(&k, select, &Capability::root()).expect("select");
+    let rows: serde_json::Value = serde_json::from_slice(&rows.bytes).unwrap();
+    let book = rows["results"]["bindings"][0]["s"]["value"]
+        .as_str()
+        .expect("the quic bookmark")
+        .to_string();
+    ikigai_cms_web::tagstore::TagPaths::in_dir(dir.path()).add_suggestion(&book, "suggested");
+
+    for style in ["catalog", "mosaic", "agenda"] {
+        let html = get(&k, &recent, &format!("urn:cms:view:quic?style={style}"));
+        assert!(
+            html.contains("cms-sug-yes"),
+            "{style}: no suggestion: {html}"
+        );
+        let (bad, checked) = undersized_buttons(&html);
+        assert!(
+            checked >= 2,
+            "{style}: the + and x buttons were not checked: {html}"
+        );
+        assert!(
+            bad.is_empty(),
+            "{style}: a target under 24 by 24 CSS px (SC 2.5.8): {bad:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_size_check_sees_a_small_button() {
+    // The rules as they were before ledger #1672, and one button no rule of the fragment names.
+    let (bad, checked) = undersized_buttons(
+        "<style>.cms-sug-yes,.cms-sug-no{font:12px ui-monospace,monospace;padding:0 3px;line-height:1}\n\
+         .cms-sug-yes:hover,.cms-sug-no:hover{min-width:40px;min-height:40px}\n\
+         .big{width:30px;min-height:24px}</style>\
+         <button class=\"cms-sug-yes\" hx-post=\"/tag/approve\">+</button>\
+         <button class='cms-sug-no'>x</button>\
+         <button class=\"big\">b</button>\
+         <button class=\"cms-seg-btn\">shell</button>",
+    );
+    assert_eq!(checked, 3);
+    assert_eq!(bad.len(), 2, "{bad:#?}");
 }

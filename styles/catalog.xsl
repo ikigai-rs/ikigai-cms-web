@@ -15,8 +15,8 @@
 .cms-author{display:inline-block;color:var(--mut);font-size:13px;font-style:italic;margin:2px 8px 0 0}
 .cms-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .cms-tag{font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);text-decoration:none;cursor:pointer}
-.cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);border:1px dashed var(--line);border-radius:10px;padding:1px 4px 1px 7px}
-.cms-sug-yes,.cms-sug-no{font:12px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0 3px;line-height:1}
+.cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-family:ui-monospace,monospace;color:var(--mut);border:1px dashed var(--line);border-radius:10px;padding:0 2px 0 7px}
+.cms-sug-yes,.cms-sug-no{font:12px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0;line-height:1;min-width:24px;min-height:24px;display:inline-flex;align-items:center;justify-content:center}
 .cms-sug-yes{color:#3a8a3a}.cms-sug-no{color:#c0392b}
 .cms-sug-yes:hover,.cms-sug-no:hover{font-weight:700}</style>
     <section class="cms-room">
