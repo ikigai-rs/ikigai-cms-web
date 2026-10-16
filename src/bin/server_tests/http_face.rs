@@ -314,8 +314,20 @@ fn a_public_wire_session_cannot_dismiss_a_tag() {
 // cost nothing under ikigai-sparql's algebra bounds, so this passes them and has to be stopped by
 // the clock. Measured on 1cb5e7c (sparql 0.1.11, no budget), it answered `200` with every row
 // after ~11 s (debug); on 0.1.12 without the door's stamp it stopped at the space's 5 s ceiling.
+//
+// That query cannot test the budget any longer, because it is now stopped by whichever bound
+// fires FIRST (ledger #1673): ikigai-sparql 0.2 also bounds an answer's size (16 MiB, 100,000
+// rows; ledger #970), and a machine fast enough to serialize 16 MiB inside the door's second is
+// refused for size. On plasma the two budget tests failed that way under a debug `cargo test`
+// while CI's slower runners passed. So the queries that must meet the clock are built so that
+// no other bound CAN fire: [`slow_cross_product`] has at most `SLOW_ROWS` small rows, far under
+// both size bounds by construction, and makes each row expensive instead, so only time stops
+// it. A machine fast enough to finish all of it inside the budget would answer `200` with
+// `"bindings"`, which every test below refuses: it fails as "not slow enough", never as a
+// different bound standing in for the door's.
 
 /// `SELECT *` over three `VALUES` tables of `n` integers each: `n³` solutions, no dataset.
+/// Used here only small, as the ordinary query a door must still answer.
 fn cross_product(n: usize) -> String {
     let vals = (0..n)
         .map(|i| i.to_string())
@@ -325,6 +337,74 @@ fn cross_product(n: usize) -> String {
         "SELECT%20*%20WHERE%20%7B%20VALUES%20%3Fa%20%7B{vals}%7D%20\
          VALUES%20%3Fb%20%7B{vals}%7D%20VALUES%20%3Fc%20%7B{vals}%7D%20%7D"
     )
+}
+
+/// How many integers each of [`slow_cross_product`]'s two `VALUES` tables holds.
+const SLOW_SIDE: usize = 300;
+/// The most rows [`slow_cross_product`] can answer: `SLOW_SIDE²`.
+const SLOW_ROWS: u64 = (SLOW_SIDE * SLOW_SIDE) as u64;
+/// An upper bound on one of its rows as SPARQL JSON: one integer binding
+/// (`{"n":{"type":"literal","value":"1000006","datatype":"…XMLSchema#integer"}},` is 97 bytes).
+const SLOW_ROW_BYTES: u64 = 128;
+
+/// A cross product whose answer can never reach the space's size bounds, and whose every row
+/// is slow: two `VALUES` tables of `SLOW_SIDE` integers, and for each pair a `BIND` that grows
+/// ten `x`s and the two numbers ten-fold five times over with `REPLACE` (to a million `x`s)
+/// and keeps only its `STRLEN`. The string depends on `?a` and `?b`, so the planner cannot fold
+/// it into one constant. Measured on plasma (2026-10-15): about 20 ms a row in a debug build and
+/// 1.2 ms in release, so all 90,000 rows would take about half an hour in debug and two minutes
+/// in release; finishing inside the door's second would take a machine about a hundred times
+/// faster than plasma's release build. Plain text; the HTTP tests percent-encode it.
+fn slow_cross_product() -> String {
+    let vals = (0..SLOW_SIDE)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut grown = r#"CONCAT(STR(?a), STR(?b), "xxxxxxxxxx")"#.to_string();
+    for _ in 0..5 {
+        grown = format!(r#"REPLACE({grown}, "x", "xxxxxxxxxx")"#);
+    }
+    format!(
+        "SELECT ?n WHERE {{ VALUES ?a {{ {vals} }} VALUES ?b {{ {vals} }} \
+         BIND(STRLEN({grown}) AS ?n) }}"
+    )
+}
+
+/// `s` with every byte outside RFC 3986's unreserved set percent-encoded, for a request line.
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+// The slow query cannot be stopped by the size bounds, so a refusal of it is the clock's. Checked
+// at compile time against the bounds the space applies; the JSON head and tail are a few dozen
+// bytes, and one row's worth is ample room for them.
+const _: () = {
+    use ikigai_sparql::budget::{DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS};
+    assert!(SLOW_ROWS < DEFAULT_MAX_ROWS);
+    assert!((SLOW_ROWS + 1) * SLOW_ROW_BYTES < DEFAULT_MAX_BYTES);
+};
+
+/// And `SLOW_ROWS` is what the query builds: two tables of `SLOW_SIDE` members.
+#[test]
+fn the_slow_query_is_as_small_as_its_size_bound_says() {
+    let q = slow_cross_product();
+    let members = q
+        .split("VALUES")
+        .skip(1)
+        .map(|t| {
+            t[t.find('{').unwrap() + 1..t.find('}').unwrap()]
+                .split_whitespace()
+                .count()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(members, vec![SLOW_SIDE, SLOW_SIDE]);
 }
 
 /// Comfortably under the space's 5 s ceiling and over the door's 1 s, so passing means the door
@@ -351,7 +431,7 @@ async fn an_anonymous_cross_product_is_stopped_at_the_door_budget() {
     let port = start(dir.path(), "http://localhost:8080", false).await;
     let (resp, took) = timed_get(
         port,
-        &format!("urn:sparql:select?query={}", cross_product(100)),
+        &format!("urn:sparql:select?query={}", pct(&slow_cross_product())),
     )
     .await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
@@ -373,7 +453,7 @@ async fn an_anonymous_cross_product_is_stopped_at_the_door_budget() {
 async fn an_anonymous_budget_cannot_loosen_the_door() {
     let dir = tempfile::tempdir().unwrap();
     let port = start(dir.path(), "http://localhost:8080", false).await;
-    let query = cross_product(100);
+    let query = pct(&slow_cross_product());
     let (resp, took) = timed_get(
         port,
         &format!("urn:sparql:select?budget=600000&query={query}"),
@@ -405,7 +485,7 @@ async fn the_door_applies_the_configured_budget() {
     .await;
     let (resp, took) = timed_get(
         port,
-        &format!("urn:sparql:select?query={}", cross_product(100)),
+        &format!("urn:sparql:select?query={}", pct(&slow_cross_product())),
     )
     .await;
     assert!(resp.contains("time budget of 300 ms"), "{resp}");
@@ -432,7 +512,7 @@ fn an_anonymous_wire_session_is_budgeted_too() {
         reg_state: None,
         principal: None,
     };
-    let query = super::percent_decode(&cross_product(100));
+    let query = slow_cross_product();
     for budget in [
         None,
         Some(ArgRef::Inline(b"600000".to_vec())),
