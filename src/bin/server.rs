@@ -1901,7 +1901,8 @@ mod http_face;
 #[path = "server_tests/chips.rs"]
 mod chips;
 
-/// Every chip is a link with an `href`, so a keyboard reaches it (ledger #1640, SC 2.1.1).
+/// Every chip is a link with an `href`, so a keyboard reaches it (ledger #1640, SC 2.1.1), and
+/// every suggestion button is at least 24 by 24 CSS px (ledger #1672, SC 2.5.8).
 #[cfg(test)]
 #[path = "server_tests/focus.rs"]
 mod focus;

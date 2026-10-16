@@ -14,8 +14,8 @@
 .cms-author{display:inline-block;color:var(--mut);font-size:12px;font-style:italic;margin:0 6px 6px 0}
 .cms-tags{display:flex;flex-wrap:wrap;gap:5px}
 .cms-tag{font-size:11px;padding:2px 9px;border-radius:20px;background:var(--accent-bg);color:var(--accent);text-decoration:none;cursor:pointer}
-.cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--mut);border:1px dashed var(--line);border-radius:20px;padding:1px 4px 1px 8px}
-.cms-sug-yes,.cms-sug-no{font:11px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0 3px;line-height:1}
+.cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--mut);border:1px dashed var(--line);border-radius:20px;padding:0 2px 0 8px}
+.cms-sug-yes,.cms-sug-no{font:11px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0;line-height:1;min-width:24px;min-height:24px;display:inline-flex;align-items:center;justify-content:center}
 .cms-sug-yes{color:#3a8a3a}.cms-sug-no{color:#c0392b}</style>
     <section class="cms-room">
       <div class="cms-count"><xsl:value-of select="count(rdf:Description)"/> resources</div>

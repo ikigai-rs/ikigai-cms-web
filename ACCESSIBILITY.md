@@ -99,11 +99,12 @@ The crate's tests run on every pull request (`.github/workflows/ci.yml`, with th
 | Check | Version | What it covers | What it does not cover |
 |---|---|---|---|
 | Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff` | Any accessibility property: names, roles, focus, contrast |
-| `src/bin/server_tests/focus.rs`, same run | none | One accessibility property, as markup: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get` | Whether focus is visible, where it goes after a swap, and anything a browser decides |
+| `src/bin/server_tests/focus.rs`, same run | none | Two accessibility properties, as markup. Keyboard: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get`. Target size: in a tag view with a suggested tag, in each style, every button the view's own stylesheet styles (the suggestion's `+` and `x`) is given a `min-width` and `min-height` (or `width` and `height`) of at least 24 px | Whether focus is visible, where it goes after a swap, and anything a browser decides, including the size a button is actually drawn at; buttons styled only by the page shell (toolbar, pager, the clear button) |
 | axe-core in Google Chrome against a scratch `cms-server` (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | 14 states, each in light and dark: signed out (enroll offered, then sign-in offered), the tag index, the type index, the recent trail empty and after views, the dead-links review, the purge confirmation, a tag view in Catalog, Mosaic and Agenda, its second page, search with and without results. The passkey enrolled and signed in through Chrome's virtual authenticator. Rules tagged WCAG 2.0/2.1/2.2 A and AA, with best-practice rules reported | One viewport (1280×900). States not opened: a failed sign-in, the purge result, a promoted or dismissed suggestion, a link-check pass in progress, the error fragments, the WebTransport path's failures. Only invented data |
 | Tab walk, same run | as above | Which controls take focus, in order, on four states; where focus lands after a navigation-bar button and after the pager's "next" | Whether the order makes sense to a person; Shift+Tab; Enter and Space on each control |
 | Overflow at 320 px wide, same run | as above | Whether the page scrolls sideways at 320 CSS px (SC 1.4.10) on the sign-in panel, the tag index, and a tag view in Catalog and Agenda | Text resize and zoom to 400%; other views |
 | Keyboard re-check for the chips (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` built from the fix, signed in through Chrome's virtual authenticator, then again under `dev_open` for axe's detail: each chip focusable in the tag index, a Catalog, Mosaic and Agenda tag view, the type index and the recent trail; Tab reaches one and Enter opens its view in place with the address unchanged; axe on those views in light and dark (with `html{background:Canvas}` injected, so axe measures dark text against the dark page) | Shift+Tab; Space (a link does not take it); opening a chip in a new tab, which shows the bare fragment |
+| Target-size re-check for the suggestion buttons (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` under `dev_open` (no authenticator), built once from `main` and once from the fix, with the same scratch data: axe's `target-size` rule, each suggestion button's drawn size, and the page's scroll width, on three tag views with suggested tags in Catalog, Mosaic and Agenda, light and dark, at 1280 and 320 px wide | Other rules; touch input; zoom; any view without a suggested tag |
 
 On 2026-10-15, against `main` at `e86d873`: the only WCAG A/AA rule axe reported was
 `color-contrast`, in 23 of the 28 scans (every light scan, and 9 of the 14 dark ones); the
@@ -120,6 +121,13 @@ as before and, newly, `target-size` (SC 2.5.8) on the suggestion buttons: they w
 12 px, and axe accepts a small target only with room around it, which the tag chips beside them
 now take, since a link with an `href` counts as a target and one without did not.
 
+On 2026-10-15, after the suggestion buttons were given a 24 px minimum (ledger #1672): `main`
+drew them at 13.2 by 12 px (12.6 by 11 in Mosaic) and axe's `target-size` flagged every one, 6, 4
+and 2 nodes on the three views in each style, scheme and width; the fix draws each at 24 by 24 px
+and axe flagged none. The larger buttons widen the suggestion chip by about 20 px, so at 320 px
+the Agenda style, which already scrolled sideways, now does by 20 px more on a row with a
+suggestion (343 to 363 px of content); Catalog and Mosaic still fit (320 px).
+
 Reading order, plain language, whether the views make sense without the visual layout, and the
 whole experience with assistive technology are for a person to judge, and none of that has been
 done.
@@ -132,6 +140,7 @@ Only what has actually been run. This is not a list of what is supported.
 |---|---|---|---|---|
 | macOS | Google Chrome 153.0.8010.54, headless | none | The axe run, the Tab walk and the 320 px check above, light and dark | 2026-10-15 |
 | macOS | Google Chrome 153.0.8010.54, headless | none | The keyboard re-check for the chips above, light and dark | 2026-10-15 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The target-size re-check for the suggestion buttons above, light and dark, 1280 and 320 px | 2026-10-15 |
 
 **No screen reader, screen magnifier, speech-input or switch-access software has been used to test
 this repository.** No other browser has been run. The README notes that Firefox may not connect
@@ -150,12 +159,11 @@ From the run above and from reading the source on 2026-10-15.
 | Colors axe did not measure, computed from the stylesheets: the suggestion buttons' `+` (`#3a8a3a`, 4.31:1 on a light card, 3.77:1 on a dark one) and `x` (`#c0392b`, 2.99:1 on a dark card); the "nxdomain" badge (`#8e2f8e`, 2.47:1 on the dark page) | suggested tags; the dead-links review | Hard to read | none |
 | After the pager moves, focus falls to the page body, because the control that had it is swapped away, and nothing announces the new content (SC 2.4.3). Measured for the pager; the style and sort buttons, the purge buttons and every other control inside the room are swapped away the same way (from the source) | every view change made from inside the room | A keyboard or screen-reader user loses their place and must start again from the top | The navigation bar's buttons keep focus when used |
 | The suggestion buttons are named `+` and `x` and the clear button `×`; their purpose is only in a `title` (SC 2.4.6, 4.1.2) | suggested tags; the context header | A screen reader announces "plus" or "times" with no target | none |
-| The suggestion buttons are 13 by 12 px with the tag chips close beside them (SC 2.5.8, axe `target-size`) | suggested tags on cards | Hard to hit with a pointer, a finger or a tremor; a near miss opens the neighboring tag | Promote or dismiss from the keyboard |
 | The selected style and sort are a styled `<span>`, not a control with a state (SC 1.3.1) | the toolbar on every card view | The current choice is visible but not announced | none |
 | The search field's only label is its placeholder (SC 3.3.2) | the navigation bar | The hint disappears once typing starts; some assistive technology announces no name | none |
 | The sign-in failure line (`#auth-status`) and the room's error fragments are not live regions (SC 4.1.3) | the sign-in panel; any failed view | A failure is not announced | none |
 | No `<main>` landmark, content outside any landmark, and two unnamed `<nav>` landmarks (axe `landmark-one-main`, `region`, `landmark-unique`, best practice) | every page | Landmark navigation does not reach the room | Tab order |
-| The Agenda style scrolls sideways at 320 px (SC 1.4.10) | Agenda views | Reading on a narrow screen or at high zoom needs horizontal scrolling | Catalog or Mosaic |
+| The Agenda style scrolls sideways at 320 px (SC 1.4.10): 343 px of content, 363 px on a row with a suggested tag since its buttons grew to 24 px | Agenda views | Reading on a narrow screen or at high zoom needs horizontal scrolling | Catalog or Mosaic |
 | Card titles open in a new tab with no warning (`target="_blank"`, advisory) | every card | A person who does not notice the new tab finds the back button does nothing | Close the tab to return to the room |
 | The page `<title>` is the same for every view, and views have no heading of their own (advisory) | every view | A screen reader user does not hear which view they are in | The context header's text |
 
@@ -239,6 +247,7 @@ before any conformance claim.
 |---|---|---|
 | 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108) |
 | 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; this pull request |
+| 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8, ledger #1672); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; this pull request |
 
 ## References
 
