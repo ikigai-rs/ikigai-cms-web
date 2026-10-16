@@ -15,7 +15,8 @@
 //! equals its `hx-get`. And no `<a>` may lack an `href`. A new chip added without one fails here.
 //!
 //! The same views also hold this file's pointer check, the target size of the suggestion buttons
-//! (ledger #1672, SC 2.5.8), at the end.
+//! (ledger #1672, SC 2.5.8), and the separation of a chip's words in its name from content
+//! (ledger #1716), at the end.
 
 use std::path::Path;
 
@@ -300,4 +301,123 @@ fn the_size_check_sees_a_small_button() {
     );
     assert_eq!(checked, 3);
     assert_eq!(bad.len(), 2, "{bad:#?}");
+}
+
+// ---- Names from content (ledger #1716) ----
+//
+// A tag or type chip in the indexes is a label and a count in two `<span>`s, and the markup put
+// nothing between them: `<span>#quic</span><span>3</span>`. The space a person sees is the flex
+// `gap`. A link's accessible name comes from its content, and whether an engine joins two child
+// elements with a space is left to the engine (the name computation does not specify it,
+// w3c/accname#225). Chrome 153 inserts one, because flex items are block-level, and names the chip
+// "#quic 3"; the text itself (`textContent`, the page without its CSS) reads "#quic3". So each
+// link's text now separates its parts in the markup, where no engine can lose the space: a text
+// space between the spans, which a flex container does not draw, so nothing moves on screen.
+
+/// Each `<a>` in `html`: its text with every tag removed, and its text with every tag read as a
+/// space, both with whitespace collapsed. The two differ exactly when two words are separated
+/// only by an element boundary, which is where an engine may or may not put a space.
+fn link_texts(html: &str) -> Vec<(String, String)> {
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut texts = Vec::new();
+    let mut rest = html;
+    while let Some(open) = rest.find("<a") {
+        rest = &rest[open + 2..];
+        if !rest.starts_with([' ', '>']) {
+            continue; // `<abbr`, `<article`
+        }
+        let Some(start) = rest.find('>') else { break };
+        let Some(end) = rest.find("</a>") else { break };
+        let inner = &rest[start + 1..end];
+        rest = &rest[end..];
+        let (mut joined, mut spaced, mut in_tag) = (String::new(), String::new(), false);
+        for c in inner.chars() {
+            match c {
+                '<' => {
+                    in_tag = true;
+                    spaced.push(' ');
+                }
+                '>' => in_tag = false,
+                _ if in_tag => {}
+                _ => {
+                    joined.push(c);
+                    spaced.push(c);
+                }
+            }
+        }
+        texts.push((collapse(&joined), collapse(&spaced)));
+    }
+    texts
+}
+
+#[test]
+fn every_chip_names_its_parts_with_a_space_in_the_markup() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room(dir.path());
+    let recent = RecentLog::default();
+
+    let tags = get(&k, &recent, "urn:cms:tags");
+    let types = get(&k, &recent, "urn:cms:types");
+    let mut fragments = vec![
+        ("the tag index", tags.clone()),
+        ("the type index", types.clone()),
+    ];
+    for style in ["catalog", "mosaic", "agenda"] {
+        fragments.push((
+            style,
+            get(&k, &recent, &format!("urn:cms:view:quic?style={style}")),
+        ));
+    }
+    fragments.push(("the recent trail", get(&k, &recent, "urn:cms:recent")));
+    let approve = Request::new(Verb::Sink, Iri::parse("urn:cms:tag-approve").unwrap())
+        .with_arg("book", ArgRef::Inline(b"urn:cms:bookmark:x".to_vec()))
+        .with_arg("tag", ArgRef::Inline(b"promoted".to_vec()));
+    let (chip, _) = Resolver::issue_as(&k, approve, &Capability::root()).expect("approve");
+    fragments.push((
+        "a promoted suggestion",
+        String::from_utf8(chip.bytes).unwrap(),
+    ));
+
+    for (what, html) in &fragments {
+        let texts = link_texts(html);
+        assert!(!texts.is_empty(), "{what} rendered no link: {html}");
+        for (joined, spaced) in &texts {
+            assert_eq!(
+                joined, spaced,
+                "{what}: a link's words are separated only by an element boundary, so its name \
+                 may run them together: {html}"
+            );
+        }
+    }
+
+    // The names themselves, as a reader hears them: the label, a space, the count.
+    let names = |html: &str| -> Vec<String> { link_texts(html).into_iter().map(|t| t.0).collect() };
+    let tag_names = names(&tags);
+    for name in ["#quic 1", "#networking 1", "#c++ 1"] {
+        assert!(
+            tag_names.iter().any(|n| n == name),
+            "no chip named {name:?}: {tag_names:?}"
+        );
+    }
+    let type_names = names(&types);
+    assert!(
+        type_names.iter().any(|n| n == "bookmark 2"),
+        "no chip named \"bookmark 2\": {type_names:?}"
+    );
+}
+
+#[test]
+fn the_name_check_sees_words_joined_by_an_element_boundary() {
+    let texts = link_texts(
+        "<abbr>x</abbr><a class='cms-tag' href='/r/x'><span>#quic</span><span>3</span></a>\
+         <a href='/r/y'><span>#wasm</span> <span>1</span></a><a href='/r/z'>#solo</a>",
+    );
+    assert_eq!(
+        texts,
+        vec![
+            ("#quic3".to_string(), "#quic 3".to_string()),
+            ("#wasm 1".to_string(), "#wasm 1".to_string()),
+            ("#solo".to_string(), "#solo".to_string()),
+        ]
+    );
 }

@@ -34,6 +34,12 @@
       <span class="cms-tag-label">
         <xsl:value-of select="sr:binding[@name='label']/sr:literal"/>
       </span>
+      <!-- A real space between the label and the count, so the chip's name is "bookmark 4" in
+           every engine and not "bookmark4" (ledger #1716): whether an engine spaces two child
+           elements is its own choice. A flex container draws no whitespace-only text, so
+           the gap above still sets what a person sees. xrust drops a whitespace-only
+           xsl:text (ledger #1693), so the space is an XPath string. -->
+      <xsl:value-of select="' '"/>
       <span class="cms-tag-n">
         <xsl:value-of select="sr:binding[@name='n']/sr:literal"/>
       </span>
