@@ -1,0 +1,11 @@
+/* The htmx probe page's styles, a file because the page face sends a Content-Security-Policy
+   that admits no inline style (src/csp.rs). */
+:root { --bg:#faf8f3; --fg:#26241f; --mut:#8a857b; --line:#e6e1d6; --card:#fff; --accent:#185fa5; --accent-bg:#e6f1fb; }
+@media (prefers-color-scheme: dark) { :root { --bg:#1a1917; --fg:#e9e5dc; --mut:#9a958a; --line:#2f2c27; --card:#232019; --accent:#7fb2ee; --accent-bg:#12314f; } }
+body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; max-width:860px; margin:2rem auto; padding:0 1rem; }
+h1 { font-size:20px; }
+.note { color:var(--mut); font-size:14px; }
+nav { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; }
+nav button { font:14px system-ui; padding:7px 14px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); cursor:pointer; }
+nav button:hover { border-color:var(--accent); color:var(--accent); }
+#out { margin-top:14px; --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }

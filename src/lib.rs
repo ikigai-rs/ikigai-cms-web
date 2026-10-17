@@ -20,7 +20,8 @@ mod native;
 mod presentations;
 #[cfg(not(target_family = "wasm"))]
 pub use native::{
-    build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with, pct_decode,
+    build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with, pct_decode, safe_href,
+    style_blocks, url_segment,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use presentations::Presentations;
@@ -65,6 +66,11 @@ pub mod config;
 // the rest of the native server stack.
 #[cfg(feature = "server")]
 pub mod session;
+
+// The Content-Security-Policy the page face sends on every response (ledger #1793): strict
+// script and style sources, the views' own `<style>` blocks admitted by hash.
+#[cfg(feature = "server")]
+pub mod csp;
 
 // The page face's accept loop: what an accept error means (skip one connection, back off on
 // exhaustion, end on a dead listener). In the lib rather than the bin so a test can drive it in a

@@ -154,6 +154,11 @@ ikigai-time = { version = "0.4.1", optional = true }
 # error from `urn:llm:{provider}:up` as "down, skip the run" and ANY error from `…:ask` as "fall back
 # to the OpenLibrary filter" (maintenance.rs `llm_up`, `llm_tags`), and it never sends `as=`.
 ikigai-llm = { version = "0.14.0", optional = true }
+# The page's Content-Security-Policy admits each view stylesheet's own `<style>` block by its
+# SHA-256 (src/csp.rs, ledger #1793). Both versions are the ones the lock already held through
+# other crates, so adding them added no package to the graph.
+sha2 = { version = "0.10.9", optional = true }
+base64 = { version = "0.22.1", optional = true }
 # Bin configuration lives in ~/.config/ikigai/cms.toml (+ CLI flags) — never env vars.
 toml = { version = "0.8", optional = true }
 
@@ -175,7 +180,7 @@ wasm-bindgen = "=0.2.108"
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 # The server includes the maintenance stack + the time transport so it can schedule the
 # link-check pass (urn:time) alongside serving the room.
-server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time", "dep:notify"]
+server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time", "dep:notify", "dep:sha2", "dep:base64"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.

@@ -50,12 +50,22 @@ fn a_tag_with_a_plus_opens_from_its_chip() {
         None,
     );
     let (_, index) = get(&k, "urn:cms:tags");
-    assert!(index.contains("/r/urn:cms:view:c++"), "the chip: {index}");
-    // What htmx sends for that href: `+` is legal in a path and goes out as is.
-    let (status, view) = get(&k, "urn:cms:view:c++?style=catalog");
+    // The chip's path segment is the tag percent-encoded (ledger #1794), `+` included.
+    assert!(
+        index.contains("/r/urn:cms:view:c%2B%2B"),
+        "the chip: {index}"
+    );
+    let (status, view) = get(&k, "urn:cms:view:c%2B%2B?style=catalog");
     assert!(
         status == "200 OK" && view.contains("Plus Plus Bookmark"),
         "the c++ chip opened {status}: {view}"
+    );
+    // And a path that spells the `+` raw, as the chips did before, still names the same tag:
+    // `+` is legal in a path and is not a space there.
+    let (status, view) = get(&k, "urn:cms:view:c++?style=catalog");
+    assert!(
+        status == "200 OK" && view.contains("Plus Plus Bookmark"),
+        "a raw c++ path opened {status}: {view}"
     );
 }
 

@@ -15,8 +15,9 @@
        percent-encoded server-side — xrust has no string functions, so it could not escape a URL
        into JSON for hx-vals). The card's duration comes pre-phrased in `@age`: whether "9d" means
        "dead" or "unverified" is an evidence question, and the stylesheet is not where it gets
-       decided. Authored to xrust's subset — xsl:attribute for the dynamic hx-post/href/class (no
-       AVT), class-selector CSS only (no attribute-selector quotes). -->
+       decided. Authored to xrust's subset — xsl:attribute for the dynamic hx-post/class (no AVT),
+       class-selector CSS only (no attribute-selector quotes). The title link is the shared
+       `safe-link` template's. -->
   <xsl:template match="/rev:review">
     <style>
       .cms-review-head{color:var(--mut,#888);font-size:13px;margin:14px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -76,10 +77,13 @@
         <xsl:attribute name="class">cms-dead-badge <xsl:value-of select="@status"/></xsl:attribute>
         <xsl:value-of select="@status"/>
       </span>
-      <a class="cms-dead-title" target="_blank" rel="noopener noreferrer">
-        <xsl:attribute name="href"><xsl:value-of select="@url"/></xsl:attribute>
-        <xsl:value-of select="@title"/>
-      </a>
+      <!-- The URL is library data: the shared rule decides whether it may be a link
+           (styles/links.xsl, ledger #1793). -->
+      <xsl:call-template name="safe-link">
+        <xsl:with-param name="href" select="string(@url)"/>
+        <xsl:with-param name="class" select="'cms-dead-title'"/>
+        <xsl:with-param name="label" select="string(@title)"/>
+      </xsl:call-template>
       <span class="cms-dead-url"><xsl:value-of select="@url"/></span>
       <div class="cms-dead-meta">
         <xsl:value-of select="@reason"/><xsl:text> · </xsl:text>

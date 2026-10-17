@@ -24,13 +24,15 @@
     <a class="cms-tag" hx-target="#room" hx-swap="innerHTML">
       <!-- The href is the hx-get: htmx swaps in place on click and Enter, and the href puts the
            chip in the tab order (an <a> with no href takes no focus; ledger #1640). -->
+      <!-- `?enc` is the tag percent-encoded by the query (ENCODE_FOR_URI), so a `?`, `#` or `/` in a
+           tag cannot end the path (ledger #1794); the label below is the tag itself. -->
       <xsl:attribute name="href">
         <xsl:text>/r/urn:cms:view:</xsl:text>
-        <xsl:value-of select="sr:binding[@name='tag']/sr:literal"/>
+        <xsl:value-of select="sr:binding[@name='enc']/sr:literal"/>
       </xsl:attribute>
       <xsl:attribute name="hx-get">
         <xsl:text>/r/urn:cms:view:</xsl:text>
-        <xsl:value-of select="sr:binding[@name='tag']/sr:literal"/>
+        <xsl:value-of select="sr:binding[@name='enc']/sr:literal"/>
       </xsl:attribute>
       <span class="cms-tag-label">
         <xsl:text>#</xsl:text>

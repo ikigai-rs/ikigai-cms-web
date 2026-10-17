@@ -63,7 +63,7 @@ fn rp(dir: &Path) -> Rp {
 
 /// Start the page server on a free loopback port, answering for `origin`, at the default
 /// anonymous SPARQL budget.
-async fn start(dir: &Path, origin: &str, dev_open: bool) -> u16 {
+pub(super) async fn start(dir: &Path, origin: &str, dev_open: bool) -> u16 {
     start_budgeted(dir, origin, dev_open, DEFAULT_ANONYMOUS_SPARQL_BUDGET).await
 }
 
@@ -82,6 +82,7 @@ async fn start_budgeted(dir: &Path, origin: &str, dev_open: bool, budget: Durati
         Arc::new(RecentLog::default()),
         Arc::new(ent),
         Arc::new(PageOrigin::parse(origin).unwrap()),
+        Arc::from(ikigai_cms_web::csp::policy(4433)),
         dev_open,
         budget,
     ));
@@ -89,7 +90,7 @@ async fn start_budgeted(dir: &Path, origin: &str, dev_open: bool, budget: Durati
 }
 
 /// Send `head` (request line + headers, no blank line) and read the whole response.
-async fn send(port: u16, head: &str) -> String {
+pub(super) async fn send(port: u16, head: &str) -> String {
     let mut conn = None;
     for _ in 0..50 {
         if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
