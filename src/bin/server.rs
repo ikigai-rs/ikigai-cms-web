@@ -275,6 +275,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&recent),
         Arc::clone(&entitlement),
         page_origin,
+        // One policy for the process: it names the wire's port and hashes the views' styles,
+        // neither of which changes while the server runs.
+        Arc::from(ikigai_cms_web::csp::policy(port)),
         dev_open,
         anonymous_budget,
     ));
@@ -835,6 +838,7 @@ async fn serve_http(
     recent: Arc<RecentLog>,
     entitlement: Arc<Vec<String>>,
     page_origin: Arc<PageOrigin>,
+    csp: Arc<str>,
     dev_open: bool,
     anonymous_budget: Duration,
 ) {
@@ -857,6 +861,7 @@ async fn serve_http(
         let recent = Arc::clone(&recent);
         let entitlement = Arc::clone(&entitlement);
         let page_origin = Arc::clone(&page_origin);
+        let csp = Arc::clone(&csp);
         tokio::spawn(async move {
             let _ = handle_http(
                 sock,
@@ -867,6 +872,7 @@ async fn serve_http(
                 &recent,
                 &entitlement,
                 &page_origin,
+                &csp,
                 dev_open,
                 anonymous_budget,
             )
@@ -894,6 +900,7 @@ async fn handle_http(
     recent: &RecentLog,
     entitlement: &[String],
     page_origin: &PageOrigin,
+    csp: &str,
     dev_open: bool,
     anonymous_budget: Duration,
 ) -> std::io::Result<()> {
@@ -1009,10 +1016,12 @@ async fn handle_http(
     let cookie_line = set_cookie
         .map(|c| format!("Set-Cookie: {c}\r\n"))
         .unwrap_or_default();
+    // The policy rides on every response, whatever its type: it governs only the documents and
+    // workers a browser builds from one, and a page that is not HTML is harmless under it.
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
          {cookie_line}Cache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n\
-         Connection: close\r\n\r\n",
+         Content-Security-Policy: {csp}\r\nConnection: close\r\n\r\n",
         out.len()
     );
     sock.write_all(header.as_bytes()).await?;
@@ -1408,6 +1417,9 @@ fn percent_decode(s: &str) -> String {
 ///   with a space reaches us as `%20` and decodes to a space. So it goes on as
 ///   `urn:cms:view:machine%20learning`, and the tag view decodes its binding back. A `%` that does
 ///   not begin an escape becomes `%25` for the same reason.
+/// - **A `?` or `#` stays escaped.** The query was split off before decoding and a browser never
+///   sends a fragment, so either one here was `%3F` or `%23` in a chip's path: part of the tag
+///   (ledger #1794). Decoded raw it would end the IRI's path, and the view would name another tag.
 ///
 /// `dist/wire.js` applies the same two steps to the same href before it sends an IRI over the
 /// wire, so a chip names one IRI whichever face carries it.
@@ -1437,7 +1449,10 @@ fn path_iri(path: &str) -> String {
         if (c == '%' && !begins_escape)
             || c.is_whitespace()
             || c.is_control()
-            || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+            || matches!(
+                c,
+                '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`' | '?' | '#'
+            )
         {
             let mut buf = [0u8; 4];
             for byte in c.encode_utf8(&mut buf).bytes() {
@@ -1913,6 +1928,13 @@ mod focus;
 #[path = "server_tests/jobs.rs"]
 mod jobs;
 
+/// A link from data renders only with a safe scheme, every HTML response carries the
+/// Content-Security-Policy, a suggestion posts its tag as one value, and a tag with URL syntax
+/// in it opens from its chip (ledger #1793, ledger #1794).
+#[cfg(test)]
+#[path = "server_tests/links.rs"]
+mod links;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2217,6 +2239,7 @@ mod tests {
             Arc::new(RecentLog::default()),
             Arc::new(ent),
             Arc::new(super::PageOrigin::parse("http://localhost:8080").unwrap()),
+            Arc::from(ikigai_cms_web::csp::policy(4433)),
             true, // dev-open, so /r/ resolves under the entitlement
             ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
         ));

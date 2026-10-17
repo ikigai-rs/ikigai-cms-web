@@ -151,6 +151,19 @@ same, `#quic 3` and `Bookmark 4`, the text reads `#quic 3`, and the inline layou
 `#quic 3`. Every chip's box and both index screenshots were identical before and after: a flex
 container draws no whitespace-only text, so nothing moved.
 
+On 2026-10-17, the link rule and the Content-Security-Policy (ledger #1793, ledger #1794). A card
+or review title whose target is not `http:`, `https:` or a path on the room's own origin now
+renders as text in a `<span>` with the same class, not as a link: it is no longer in the tab
+order, by design, since there is nothing safe to open. The page shell's CSS moved from an inline
+`<style>` to `dist/room.css`, loaded at the same place, and each view keeps its own `<style>`,
+admitted by hash. The suggestion chips gained two hidden inputs, which take no focus and have no
+name. Checked in the desktop app's browser pane (Chromium, version not recorded), dark scheme
+only, against a scratch `cms-server` under `dev_open` with planted data: no policy violation on
+load or across the tag index, a tag view in each style, a promoted suggestion and a reopened
+chip; each view's own rules applied (the chips' 999 px radius, the cards' 12 px, the suggestion
+buttons' 24 px minimum); a style block the policy does not list was refused. No before-and-after
+screenshot comparison was made, and no accessibility tool was run.
+
 Reading order, plain language, whether the views make sense without the visual layout, and the
 whole experience with assistive technology are for a person to judge, and none of that has been
 done.

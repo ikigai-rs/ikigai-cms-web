@@ -23,14 +23,23 @@
     $("auth-status").textContent = msg || "";
   }
 
+  // The link-check indicator's poll: `cms:poll` every five seconds while the room is open, and
+  // none while it is closed, so a signed-out page never polls a refusal into the header. The
+  // interval lives here rather than in an htmx trigger filter because a filter is evaluated
+  // JavaScript, which the page's Content-Security-Policy refuses.
+  let poll = null;
+
   // Reveal the room (and hand control to htmx to load it) or the login panel.
   function show(open, canSignOut) {
     $("auth").hidden = open;
     $("nav").hidden = !open;
     $("auth-logout").hidden = !canSignOut;
+    clearInterval(poll);
+    poll = null;
     if (open) {
       htmx.ajax("GET", "/r/urn:cms:tags", { target: "#room", swap: "innerHTML" });
       htmx.trigger("#linkcheck", "cms:open");
+      poll = setInterval(() => htmx.trigger("#linkcheck", "cms:poll"), 5000);
     } else {
       $("room").innerHTML = "";
       $("linkcheck").innerHTML = "";

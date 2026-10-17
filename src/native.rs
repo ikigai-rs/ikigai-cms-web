@@ -431,7 +431,18 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         .get("name")
         .map(|s| s.to_string())
         .unwrap_or_default();
-    let xsl = match name.as_str() {
+    let xsl =
+        style_source(&name).ok_or_else(|| Error::Endpoint(format!("no stylesheet `{name}`")))?;
+    Ok(Representation::new(
+        ReprType::new("application/xslt+xml").with_param("charset", "utf-8"),
+        xsl.into_bytes(),
+    )
+    .cacheable())
+}
+
+/// A view stylesheet as it is authored in `styles/`, before the shared templates are spliced in.
+fn authored_style(name: &str) -> Option<&'static str> {
+    Some(match name {
         "catalog" => include_str!("../styles/catalog.xsl"),
         "mosaic" => include_str!("../styles/mosaic.xsl"),
         "agenda" => include_str!("../styles/agenda.xsl"),
@@ -445,13 +456,48 @@ fn stylesheet(inv: &Invocation<'_>) -> Result<Representation> {
         "types" => include_str!("../styles/types.xsl"),
         // The suggested-deletes review renders a server-supplied doc (urn:cms:review#).
         "review" => include_str!("../styles/review.xsl"),
-        _ => return Err(Error::Endpoint(format!("no stylesheet `{name}`"))),
-    };
-    Ok(Representation::new(
-        ReprType::new("application/xslt+xml").with_param("charset", "utf-8"),
-        xsl.as_bytes().to_vec(),
-    )
-    .cacheable())
+        _ => return None,
+    })
+}
+
+/// The stylesheet `urn:cms:style:{name}` serves: the authored view with every template of
+/// `styles/links.xsl` (the room's shared rules, such as `safe-link`) spliced in before its
+/// closing tag. Spliced rather than `xsl:include`d because the XSLT engine resolves no include
+/// (ikigai-xslt hands xrust a resolver that answers nothing), and one copy of the rule is the
+/// point: a view calls it with `xsl:call-template`.
+fn style_source(name: &str) -> Option<String> {
+    const CLOSE: &str = "</xsl:stylesheet>";
+    let view = authored_style(name)?;
+    let shared = include_str!("../styles/links.xsl");
+    let templates = &shared[shared.find("<xsl:template")?..shared.rfind(CLOSE)?];
+    let at = view.rfind(CLOSE)?;
+    Some(format!("{}{templates}{}", &view[..at], &view[at..]))
+}
+
+/// The body of every `<style>` element the room's stylesheets emit, one per stylesheet
+/// `urn:cms:style:{name}` serves: what a browser hashes to decide whether a `style-src` hash
+/// admits it. Read from the authored text, which the XSLT engine copies through unchanged (a test
+/// renders each view and compares).
+///
+/// ```
+/// let blocks = ikigai_cms_web::style_blocks();
+/// assert_eq!(blocks.len(), 7);
+/// assert!(blocks.iter().all(|css| css.contains(".cms-") && !css.contains("<")));
+/// ```
+pub fn style_blocks() -> Vec<&'static str> {
+    let mut blocks = Vec::new();
+    for name in STYLE_NAMES {
+        let mut rest = authored_style(name).unwrap_or_default();
+        while let Some(open) = rest.find("<style>") {
+            rest = &rest[open + "<style>".len()..];
+            let Some(close) = rest.find("</style>") else {
+                break;
+            };
+            blocks.push(&rest[..close]);
+            rest = &rest[close..];
+        }
+    }
+    blocks
 }
 
 /// `urn:cms:graph:bookmarks` — assemble the bookmark graph. Reads the org bookmarks file
@@ -961,10 +1007,10 @@ impl Endpoint for TagApprove {
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
         self.tags.approve(&book, &tag);
-        let t = html_escape(&tag);
+        let (t, seg) = (html_escape(&tag), url_segment(&tag));
         let html = format!(
-            "<a class=\"cms-tag\" hx-target=\"#room\" href=\"/r/urn:cms:view:{t}\" \
-             hx-get=\"/r/urn:cms:view:{t}\">#{t}</a>"
+            "<a class=\"cms-tag\" hx-target=\"#room\" href=\"/r/urn:cms:view:{seg}\" \
+             hx-get=\"/r/urn:cms:view:{seg}\">#{t}</a>"
         );
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
@@ -1041,6 +1087,64 @@ impl Endpoint for DeckFiles {
     fn describe(&self) -> Description {
         self.0.describe()
     }
+}
+
+/// Percent-encode `s` for one segment of a `/r/` path: every byte but the RFC 3986 unreserved
+/// characters (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`, the same output as SPARQL's `ENCODE_FOR_URI`,
+/// which the stylesheets' chips are built from. The server's `/r/` route decodes it back.
+///
+/// ```
+/// use ikigai_cms_web::url_segment;
+/// assert_eq!(url_segment("quic"), "quic");
+/// assert_eq!(url_segment("c++"), "c%2B%2B");
+/// assert_eq!(url_segment("what? #1 / 100%"), "what%3F%20%231%20%2F%20100%25");
+/// assert_eq!(url_segment("café"), "caf%C3%A9");
+/// ```
+pub fn url_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Whether a link target that came from library data may be a link: past any leading whitespace,
+/// it starts with `http://` or `https://` (in any case), or with a single `/` (a path on the room's own origin; `//` and
+/// `/\` name another host). Anything else, `javascript:`, `data:`, `vbscript:`, `file:` or a
+/// target with no scheme, renders as text (ledger #1793).
+///
+/// The rule for markup built in Rust. Markup built by XSLT uses the `safe-link` template in
+/// `styles/links.xsl`, the same rule, and a test holds the two to the same answers.
+///
+/// ```
+/// use ikigai_cms_web::safe_href;
+/// assert!(safe_href("https://example.org/a?b=1"));
+/// assert!(safe_href("HTTP://EXAMPLE.ORG/"));
+/// assert!(safe_href("/r/urn:cms:tags"));
+/// assert!(!safe_href("javascript:alert(1)"));
+/// assert!(safe_href(" https://example.org/"));
+/// assert!(!safe_href(" javascript:alert(1)"));
+/// assert!(!safe_href("data:text/html,x"));
+/// assert!(!safe_href("//evil.example/"));
+/// assert!(!safe_href("file:///decks/talk"));
+/// ```
+pub fn safe_href(href: &str) -> bool {
+    // Past leading whitespace, as a browser reads a URL and as the stylesheet's
+    // `normalize-space` does. Only the XML whitespace: data that reached a view through XML can
+    // hold no other control character.
+    let href = href.trim_start_matches([' ', '\t', '\n', '\r']);
+    let starts = |p: &str| {
+        href.get(..p.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(p))
+    };
+    starts("https://")
+        || starts("http://")
+        || (href.starts_with('/') && !href.starts_with("//") && !href.starts_with("/\\"))
 }
 
 /// Percent-decode an IRI segment (`%XX` → the byte; a `%` not followed by two hex digits is kept
@@ -1124,6 +1228,16 @@ const KIND_WHERE: &str = " OPTIONAL { ?s a ?kt . \
 /// elements the stylesheet renders as pending chips with `+`/`x`.
 const SUGGEST_CONSTRUCT: &str = " ; cms:suggestedTag ?sg";
 const SUGGEST_WHERE: &str = " OPTIONAL { ?s cms:suggestedTag ?sg }";
+
+/// Each card's tags as `cms:tagChip` literals, `"{the tag, percent-encoded} {the tag}"`: the
+/// stylesheets build a chip's `/r/urn:cms:view:…` link from the part before the first space and its
+/// label from the rest. ENCODE_FOR_URI writes a space as `%20`, so the first space always splits
+/// them, and one literal keeps the encoded form paired with its own label (two multi-valued
+/// properties would not). Encoded by the query because the XSLT engine has no URI encoder; a `?`,
+/// `#` or `/` left raw in a chip's path ended it, and the chip opened another view (ledger #1794).
+/// Requires the WHERE to bind `?tag` (each view joins `dc:subject ?tag`).
+const TAG_CHIP_CONSTRUCT: &str = " ; cms:tagChip ?chip";
+const TAG_CHIP_BIND: &str = " BIND(CONCAT(ENCODE_FOR_URI(?tag), \" \", ?tag) AS ?chip)";
 
 /// Prefer the readable copy. A book's own `dc:identifier` is an Open Library search — all the
 /// Zotero export can offer — but the `urn:cms:graph:zotero-links` overlay knows the web-reader URL
@@ -1337,7 +1451,9 @@ fn view_hxvals(ctx: &ViewCtx<'_>) -> String {
 /// external template later.
 fn facet_html(ctx: &ViewCtx<'_>) -> String {
     let (label, clear_iri) = match ctx.facet {
-        Facet::Tag(t) => (format!("#{}", html_escape(t)), "urn:cms:tags"),
+        // A tag view's binding is the IRI's text, so a tag an IRI cannot carry raw is still
+        // percent-encoded here; the header names the tag itself.
+        Facet::Tag(t) => (format!("#{}", html_escape(&pct_decode(t))), "urn:cms:tags"),
         Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_escape(q)), "urn:cms:tags"),
         Facet::Type(t) => (type_label(t).to_string(), "urn:cms:types"),
     };
@@ -1442,9 +1558,8 @@ async fn render_page(
 }
 
 /// `urn:cms:view:{tag}` — the reading room for a tag: cards for every resource carrying
-/// `dc:subject "{tag}"`, rendered through the chosen card stylesheet. Multi-valued
-/// `dc:subject` stays as repeated RDF/XML elements so the stylesheet renders tag chips
-/// with no string ops (xrust lacks them).
+/// `dc:subject "{tag}"`, rendered through the chosen card stylesheet. Each card's tags ride as
+/// repeated `cms:tagChip` elements (see [`TAG_CHIP_CONSTRUCT`]).
 struct TagView;
 
 #[async_trait]
@@ -1482,11 +1597,13 @@ impl Endpoint for TagView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag . OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
+                      ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag .{TAG_CHIP_BIND} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
-        let view_iri = format!("urn:cms:view:{tag}");
+        // The view's own controls (pager, toolbar) link back to it, so its tag goes into their
+        // `/r/` paths encoded, as the chips' does.
+        let view_iri = format!("urn:cms:view:{}", url_segment(&pct_decode(tag)));
         let ctx = ViewCtx {
             iri: &view_iri,
             style: card_style(inv),
@@ -1561,9 +1678,9 @@ impl Endpoint for SearchView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag{TAG_CHIP_BIND} }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
         let ctx = ViewCtx {
             iri: "urn:cms:search",
@@ -1607,7 +1724,8 @@ impl Endpoint for TagsIndex {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         serves(inv, &self.describe())?;
         let query = "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
-             SELECT ?tag (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s dc:subject ?tag } \
+             SELECT ?tag (ENCODE_FOR_URI(?tag) AS ?enc) (COUNT(DISTINCT ?s) AS ?n) \
+             WHERE { ?s dc:subject ?tag } \
              GROUP BY ?tag ORDER BY DESC(?n) LIMIT 200"
             .to_string();
         render(inv, "urn:sparql:select", query, "xml", "tags").await
@@ -1659,9 +1777,9 @@ impl Endpoint for TypeView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT} ; dc:subject ?tag ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
              WHERE {{ {paged} \
-             OPTIONAL {{ ?s dc:subject ?tag }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
+             OPTIONAL {{ ?s dc:subject ?tag{TAG_CHIP_BIND} }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
         let view_iri = format!("urn:cms:type:{ty}");
         let ctx = ViewCtx {
@@ -2550,6 +2668,93 @@ mod tests {
     /// Ledger #1693: the spaces the room's views do emit survive xrust. Each lives inside
     /// non-whitespace text: the count line's ` resources` after a number, in each card style,
     /// and the ` · ` between a dead link's reason and its age in the review.
+    /// The two copies of the link rule (ledger #1793) give the same answer for every target:
+    /// `safe_href` in Rust, and the `safe-link` template the views call, here through the
+    /// dead-links review, whose title links to a bookmark's URL.
+    #[test]
+    fn the_rust_and_the_stylesheet_link_rules_agree() {
+        let (_dir, kernel) = kernel_over_fixture();
+        let targets = [
+            ("https://example.org/a?b=1&c=2", true),
+            ("http://example.org/", true),
+            ("HTTPS://EXAMPLE.ORG/", true),
+            ("HtTp://example.org/", true),
+            ("/r/urn:cms:tags", true),
+            ("/", true),
+            ("//evil.example/", false),
+            ("/\\evil.example/", false),
+            ("javascript:alert(1)", false),
+            ("JAVASCRIPT:alert(1)", false),
+            (" https://example.org/", true),
+            ("\t javascript:alert(1)", false),
+            ("data:text/html,<b>x</b>", false),
+            ("vbscript:msgbox(1)", false),
+            ("file:///decks/talk", false),
+            ("mailto:someone@example.org", false),
+            ("r/urn:cms:tags", false),
+            ("https:/example.org", false),
+            ("http:example.org", false),
+            ("", false),
+        ];
+        for (url, want) in targets {
+            assert_eq!(safe_href(url), want, "Rust rule on {url:?}");
+            let enc = url_segment(url);
+            let attr = url
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('"', "&quot;");
+            let review = format!(
+                "<review xmlns=\"urn:cms:review#\">\
+                 <section label=\"Gone\" action=\"urn:cms:purge:gone\" cta=\"Remove all\">\
+                 <item status=\"gone\" url=\"{attr}\" title=\"The Title\" reason=\"HTTP 404\" \
+                 age=\"9d\" enc=\"{enc}\"/></section></review>"
+            );
+            let html = render_via_xslt(&kernel, &review, "review");
+            let linked = html.contains("<a class='cms-dead-title'");
+            assert_eq!(linked, want, "stylesheet rule on {url:?}: {html}");
+            assert!(
+                html.contains(">The Title<"),
+                "{url:?}: the title shows either way: {html}"
+            );
+        }
+    }
+
+    /// The `<style>` bodies [`style_blocks`] reads from the authored stylesheets are exactly what
+    /// the views render, so the page's Content-Security-Policy, which hashes the former, admits
+    /// the latter. A rule with a character the serializer escapes (`>`, `&`) would break this.
+    #[test]
+    fn a_view_renders_its_style_block_as_authored() {
+        let (_dir, kernel) = kernel_over_fixture();
+        let blocks = style_blocks();
+        assert_eq!(blocks.len(), STYLE_NAMES.len(), "one block per stylesheet");
+        let rendered = [
+            resolve_html(&kernel, "urn:cms:tags", &[]),
+            resolve_html(&kernel, "urn:cms:types", &[]),
+            render_via_xslt(
+                &kernel,
+                "<recent xmlns=\"urn:cms:recent#\"><empty/></recent>",
+                "recent",
+            ),
+            render_via_xslt(
+                &kernel,
+                "<review xmlns=\"urn:cms:review#\"><empty/></review>",
+                "review",
+            ),
+            view(&kernel, "quic", "catalog"),
+            view(&kernel, "quic", "mosaic"),
+            view(&kernel, "quic", "agenda"),
+        ];
+        for html in &rendered {
+            let open = html.find("<style>").expect("a style block") + "<style>".len();
+            let close = open + html[open..].find("</style>").expect("closed");
+            let body = &html[open..close];
+            assert!(
+                blocks.contains(&body),
+                "rendered style is not an authored block: {body}"
+            );
+        }
+    }
+
     #[test]
     fn the_spaces_a_view_renders_survive_the_transform() {
         let (_dir, kernel) = kernel_over_fixture();

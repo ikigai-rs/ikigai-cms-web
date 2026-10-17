@@ -27,30 +27,39 @@
     <article class="cms-card">
       <xsl:attribute name="data-kind"><xsl:value-of select="cms:kind"/></xsl:attribute>
       <span class="cms-kind"><xsl:value-of select="cms:kind"/></span>
-      <a class="cms-title" target="_blank" rel="noopener noreferrer">
-        <xsl:attribute name="href"><xsl:value-of select="dc:identifier"/></xsl:attribute>
-        <xsl:value-of select="dc:title"/>
-      </a>
+      <!-- The link target is library data: the shared rule decides whether it may be a link
+           (styles/links.xsl, ledger #1793). -->
+      <xsl:call-template name="safe-link">
+        <xsl:with-param name="href" select="string(dc:identifier)"/>
+        <xsl:with-param name="class" select="'cms-title'"/>
+        <xsl:with-param name="label" select="string(dc:title)"/>
+      </xsl:call-template>
       <div class="cms-byline"><xsl:apply-templates select="dc:creator"/></div>
       <div class="cms-tags">
-        <xsl:for-each select="dc:subject">
+        <!-- Each `cms:tagChip` is "{the tag, percent-encoded} {the tag}" (native.rs TAG_CHIP_WHERE):
+             SPARQL's ENCODE_FOR_URI writes no space, so the first space splits the path segment
+             from the label, and a `?`, `#` or `/` in a tag cannot end the path (ledger #1794). -->
+        <xsl:for-each select="cms:tagChip">
           <a class="cms-tag" hx-target="#room">
             <!-- The href is the hx-get: htmx swaps in place on click and Enter, and the href puts the
                  chip in the tab order (an <a> with no href takes no focus; ledger #1640). -->
-            <xsl:attribute name="href">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
-            <xsl:attribute name="hx-get">/r/urn:cms:view:<xsl:value-of select="."/></xsl:attribute>
-            <xsl:value-of select="."/>
+            <xsl:attribute name="href">/r/urn:cms:view:<xsl:value-of select="substring-before(., ' ')"/></xsl:attribute>
+            <xsl:attribute name="hx-get">/r/urn:cms:view:<xsl:value-of select="substring-before(., ' ')"/></xsl:attribute>
+            <xsl:value-of select="substring-after(., ' ')"/>
           </a>
         </xsl:for-each>
         <xsl:for-each select="cms:suggestedTag">
           <span class="cms-sug">
             <xsl:text>#</xsl:text><xsl:value-of select="."/>
-            <button class="cms-sug-yes" hx-post="/tag/approve" hx-target="closest .cms-sug" hx-swap="outerHTML" title="promote to a tag">
-              <xsl:attribute name="hx-vals">{"book":"<xsl:value-of select="../@rdf:about"/>","tag":"<xsl:value-of select="."/>"}</xsl:attribute>
+            <!-- `book` and `tag` ride as hidden inputs the buttons hx-include, so htmx form-encodes
+                 each value itself. They were an hx-vals JSON object assembled here, and attribute
+                 escaping protects the HTML, not the JSON: a `"` in a tag added keys (ledger #1794). -->
+            <input type="hidden" name="book"><xsl:attribute name="value"><xsl:value-of select="../@rdf:about"/></xsl:attribute></input>
+            <input type="hidden" name="tag"><xsl:attribute name="value"><xsl:value-of select="."/></xsl:attribute></input>
+            <button class="cms-sug-yes" hx-post="/tag/approve" hx-include="closest .cms-sug" hx-target="closest .cms-sug" hx-swap="outerHTML" title="promote to a tag">
               <xsl:text>+</xsl:text>
             </button>
-            <button class="cms-sug-no" hx-post="/tag/reject" hx-target="closest .cms-sug" hx-swap="outerHTML" title="dismiss">
-              <xsl:attribute name="hx-vals">{"book":"<xsl:value-of select="../@rdf:about"/>","tag":"<xsl:value-of select="."/>"}</xsl:attribute>
+            <button class="cms-sug-no" hx-post="/tag/reject" hx-include="closest .cms-sug" hx-target="closest .cms-sug" hx-swap="outerHTML" title="dismiss">
               <xsl:text>x</xsl:text>
             </button>
           </span>

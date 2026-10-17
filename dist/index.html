@@ -4,79 +4,14 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ikigai — reading room</title>
-<style>
-  :root { --bg:#faf8f3; --fg:#26241f; --mut:#8a857b; --line:#e6e1d6; --card:#fff; --accent:#185fa5; --accent-bg:#e6f1fb; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#1a1917; --fg:#e9e5dc; --mut:#9a958a; --line:#2f2c27; --card:#232019; --accent:#7fb2ee; --accent-bg:#12314f; } }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui, sans-serif; }
-  .wrap { max-width:760px; margin:0 auto; padding:24px 20px 64px; }
-  header.top { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
-  header.top h1 { font-size:18px; font-weight:500; margin:0; }
-  .linkcheck { margin-left:auto; font:12px ui-monospace, monospace; color:var(--mut); }
-  .linkcheck .cms-linkcheck.running { color:var(--accent); }
-  .linkcheck:empty { display:none; }
-  nav.nav { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0 0; }
-  nav.nav[hidden] { display:none; }
-  nav.nav button { border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--fg); padding:5px 12px; font:13px system-ui; cursor:pointer; }
-  nav.nav button:hover { background:var(--card); }
-  nav.nav form { margin-left:auto; display:flex; }
-  nav.nav input { padding:6px 11px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:13px system-ui; width:190px; }
-  nav.nav .nav-signout { margin-left:8px; color:var(--mut); }
-  nav.nav .wire-status { margin-left:8px; font:11px ui-monospace, monospace; color:#2e7d32; letter-spacing:.03em; }
-  @media (prefers-color-scheme: dark) { nav.nav .wire-status { color:#6cc070; } }
-  /* Passkey login panel — shown until a session is established (auth.js toggles [hidden]). */
-  .auth { max-width:420px; margin:44px auto; border:1px solid var(--line); border-radius:14px; padding:26px 24px; background:var(--card); text-align:center; }
-  .auth[hidden] { display:none; }
-  .auth h2 { margin:0 0 6px; font-size:17px; font-weight:600; }
-  .auth p { margin:0 0 18px; color:var(--mut); font-size:14px; line-height:1.5; }
-  .auth button { border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:9px; padding:9px 22px; font:14px system-ui; cursor:pointer; }
-  .auth button[hidden] { display:none; }
-  .auth button:hover { opacity:.92; }
-  .auth-status { margin-top:14px; color:#c0392b; font-size:13px; min-height:1em; }
-  /* Context header + restyle/sort toolbar — server-rendered above each page of cards. */
-  .cms-facet { display:flex; align-items:center; gap:10px; padding:2px 0 12px; }
-  .cms-facet-label { font-size:19px; font-weight:600; color:var(--fg); }
-  .cms-facet-scope { color:var(--mut); font-size:14px; }
-  .cms-facet-clear { margin-left:auto; width:26px; height:26px; border-radius:50%; border:1px solid var(--line); background:var(--card); color:var(--mut); font:16px/1 system-ui; cursor:pointer; }
-  .cms-facet-clear:hover { border-color:var(--accent); color:var(--accent); }
-  .cms-toolbar { display:flex; gap:10px; flex-wrap:wrap; padding:0 0 16px; }
-  .cms-seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  .cms-seg-btn { border:none; border-right:1px solid var(--line); background:var(--card); color:var(--mut); padding:6px 13px; font:13px system-ui; cursor:pointer; }
-  .cms-seg-btn:last-child { border-right:none; }
-  .cms-seg-btn:hover { color:var(--fg); }
-  .cms-seg-btn.is-active { background:var(--accent-bg); color:var(--accent); font-weight:600; cursor:default; }
-  /* Purge confirm/result (rendered by urn:cms:purge, no stylesheet of its own). */
-  .cms-purge { max-width:520px; margin:24px auto; border:1px solid var(--line); border-radius:14px; padding:20px 22px; background:var(--card); }
-  .cms-purge p { margin:0 0 16px; line-height:1.5; }
-  .cms-purge button { font:14px system-ui; padding:7px 16px; border:1px solid var(--line); border-radius:9px; background:var(--bg); color:var(--fg); cursor:pointer; margin-right:8px; }
-  .cms-purge button:hover { border-color:var(--accent); }
-  .cms-purge .cms-purge-go { border-color:#c0392b; color:#c0392b; }
-  .cms-purge .cms-purge-go:hover { background:#c0392b; color:#fff; }
-  #room { margin-top:16px; }
-  /* variables the server-rendered stylesheets (tags.xsl etc.) read for theming */
-  #room { --cms-border:var(--line); --cms-accent-soft:var(--accent-bg); }
-  .cms-error { color:#c0392b; font-size:14px; }
-  .cms-pager { display:flex; align-items:center; justify-content:center; gap:14px; flex-wrap:wrap; padding:20px 0 6px; }
-  .cms-page { font:14px system-ui; padding:7px 15px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); cursor:pointer; }
-  .cms-page:hover { border-color:var(--accent); color:var(--accent); }
-  .cms-page-off { opacity:.38; cursor:default; }
-  .cms-page-off:hover { border-color:var(--line); color:var(--fg); }
-  .cms-page-info { color:var(--mut); font-size:13px; }
-  /* Per-type accent: each card carries data-kind (a cms:kind slug); the kind label + a left
-     rule are tinted by kind. ADDING A TYPE → add a colour pair below (+ its dark variant),
-     plus cms_class in native.rs. The rendering is generic, so a new kind with no rule just
-     shows no accent. */
-  .cms-kind { display:block; font-size:10.5px; letter-spacing:.1em; text-transform:capitalize; font-weight:700; color:var(--mut); margin-bottom:1px; }
-  .cms-card[data-kind] { border-left-style:solid; border-left-width:3px; }
-  .cms-card[data-kind="bookmark"] { border-left-color:#3f6ea8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#3f6ea8; }
-  .cms-card[data-kind="book"] { border-left-color:#9e7b33; } .cms-card[data-kind="book"] .cms-kind { color:#9e7b33; }
-  .cms-card[data-kind="presentation"] { border-left-color:#b0563f; } .cms-card[data-kind="presentation"] .cms-kind { color:#b0563f; }
-  @media (prefers-color-scheme: dark) {
-    .cms-card[data-kind="bookmark"] { border-left-color:#7ba6d8; } .cms-card[data-kind="bookmark"] .cms-kind { color:#7ba6d8; }
-    .cms-card[data-kind="book"] { border-left-color:#c7a35e; } .cms-card[data-kind="book"] .cms-kind { color:#c7a35e; }
-    .cms-card[data-kind="presentation"] { border-left-color:#d38a72; } .cms-card[data-kind="presentation"] .cms-kind { color:#d38a72; }
-  }
-</style>
+<!-- The shell's CSS is a file: the page's Content-Security-Policy admits no inline style but the
+     views' own blocks, by hash (src/csp.rs). -->
+<link rel="stylesheet" href="room.css" />
+<!-- htmx runs with eval off: under the page's Content-Security-Policy it could not run one
+     anyway, and off means an `hx-on`, a `js:` hx-vals or a trigger filter fails closed. Its
+     indicator styles are off too: it injects them as an inline <style>, which the policy refuses,
+     and the room uses no htmx indicator. -->
+<meta name="htmx-config" content='{"allowEval":false,"includeIndicatorStyles":false}' />
 <!-- Vendored htmx (self-contained, no CDN). The whole room is htmx attributes over the
      `/r/{iri}` HTTP routes — no custom application JavaScript. -->
 <script src="htmx.min.js"></script>
@@ -95,10 +30,12 @@
     <!-- Link-check indicator: htmx polls the status resource; shows run progress or the last-run
          tally. Targets itself (not #room). Empty until the first pass. The status is the private
          collection's, so it is gated like the room: auth.js fires `cms:open` once a session
-         exists, and the poll runs only while the room is open (a signed-out page would otherwise
-         poll a refusal into the header every five seconds). -->
+         exists, then `cms:poll` every five seconds while the room is open (a signed-out page
+         would otherwise poll a refusal into the header). The interval lives in auth.js rather
+         than as an htmx trigger filter, because a filter is evaluated JavaScript, which the
+         page's Content-Security-Policy refuses. -->
     <span id="linkcheck" class="linkcheck" hx-get="/r/urn:cms:linkstatus"
-          hx-trigger="cms:open, every 5s [!document.getElementById('nav').hidden]"
+          hx-trigger="cms:open, cms:poll"
           hx-target="this"></span>
   </header>
 
