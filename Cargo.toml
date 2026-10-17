@@ -105,7 +105,11 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # secret space became THREE enumerable endpoints there (the store plus generate and unlock)
 # and tests/conformance.rs asserts the maintenance catalog exactly — under 0.1.5 that list is
 # a different set and the walk fails.
-ikigai-secret = { version = "0.1.8", optional = true } # security floor (ledger #854 at 0.1.7: 0600 atomic, injective names; ledger #874 at 0.1.8: a name beginning with `-` is refused at every face)
+# 0.2.0 is a CEILING crossing (`^0.1.8` = `<0.2.0`, ledger #11, the naming wave): the store's
+# endpoint id is `secret`, no longer `urn:secret` (its IRIs are unchanged), which the conformance
+# walk's inherited list names. It also adds Exists and Delete on a stored secret, Delete under its
+# own `urn:cap:secret:delete:<name>` scope, which no grant this room issues holds.
+ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger #854 at 0.1.7: 0600 atomic, injective names; ledger #874 at 0.1.8: a name beginning with `-` is refused at every face)
 # Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.6 = lenient
 # Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
 # failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.

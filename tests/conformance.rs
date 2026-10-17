@@ -1072,9 +1072,9 @@ fn the_maintenance_kernel_conforms() {
         "llm-ollama-installed",
         "llm-ollama-model",
         // ikigai-secret's space is three endpoints as of 0.1.6 — the store itself plus
-        // generate and unlock. Its ids are mixed: the store kept its IRI id, the two new
-        // ones are labels.
-        "urn:secret",
+        // generate and unlock. Since 0.2.0 (the naming wave) all three ids are labels: the
+        // store's id is `secret`, no longer `urn:secret`; its IRIs are unchanged.
+        "secret",
         "secret-generate",
         "secret-unlock",
     ]);

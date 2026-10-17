@@ -1660,9 +1660,9 @@ dependencies = [
 
 [[package]]
 name = "ikigai-secret"
-version = "0.1.8"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7304f00ce9d253b751cdc84ddd1ac5a48976f0dae84eec2bdb3c409378bbd541"
+checksum = "620e3ee36cd99885b5fedbfba655c0e29d6ee599fd8bf9170bb03285a8c55946"
 dependencies = [
  "age",
  "async-trait",
