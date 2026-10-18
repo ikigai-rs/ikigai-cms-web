@@ -1052,12 +1052,15 @@ fn the_maintenance_kernel_conforms() {
     ]);
     let mut inherited = INHERITED.to_vec();
     inherited.extend([
-        "httpGet",
-        "httpHead",
-        "httpPost",
-        "httpPut",
-        "httpPatch",
-        "httpDelete",
+        // ikigai-http 0.2.0 (the naming wave, ledger #11) renamed the six ids to kebab-case
+        // labels; the old `urn:httpGet`-style IRIs are deprecated aliases that the catalog
+        // does not list, so only the new ids appear here.
+        "http-get",
+        "http-head",
+        "http-post",
+        "http-put",
+        "http-patch",
+        "http-delete",
         // ikigai-llm 0.9.2 made a Description id a LABEL rather than an IRI, so these
         // are `llm-ask`, not `urn:llm:ask` — the binding IRIs are unchanged. 0.10.0
         // added the fourth per-provider endpoint (`urn:llm:{provider}:model`), which is

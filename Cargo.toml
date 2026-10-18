@@ -110,10 +110,16 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # walk's inherited list names. It also adds Exists and Delete on a stored secret, Delete under its
 # own `urn:cap:secret:delete:<name>` scope, which no grant this room issues holds.
 ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger #854 at 0.1.7: 0600 atomic, injective names; ledger #874 at 0.1.8: a name beginning with `-` is refused at every face)
-# Maintenance: the link-checker resolves urn:httpHead+Exists through the kernel. 0.1.6 = lenient
+# Maintenance: the link-checker resolves urn:http:head+Exists through the kernel. 0.1.6 = lenient
 # Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
 # failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.
-ikigai-http = { version = "0.1.6", optional = true }
+# 0.2.0 is a CEILING crossing (`^0.1.6` = `<0.2.0`, ledger #11, the naming wave): the ids are
+# `http-get`/`http-head`/… and the IRIs `urn:http:get`/`urn:http:head`/…, which this crate now
+# requests by name. The old `urn:httpGet`-style IRIs still resolve as deprecated aliases until 0.3.0.
+# `space()` returns core's `Alias` overlay rather than an `EndpointSpace`; this crate holds it as
+# `Arc<dyn Space>`, so that change does not reach here. Moves TOGETHER with ikigai-llm 0.15.0,
+# which implements the same `HttpTransport` trait.
+ikigai-http = { version = "0.2.0", optional = true }
 # An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
 # thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
 # system OpenSSL dep in CI.
@@ -157,7 +163,10 @@ ikigai-time = { version = "0.4.1", optional = true }
 # undeclared `as=` is refused. Neither reaches the room's behavior: the tag-suggest pass reads ANY
 # error from `urn:llm:{provider}:up` as "down, skip the run" and ANY error from `…:ask` as "fall back
 # to the OpenLibrary filter" (maintenance.rs `llm_up`, `llm_tags`), and it never sends `as=`.
-ikigai-llm = { version = "0.14.0", optional = true }
+# 0.15.0, a ceiling crossing (`^0.14.0` = `<0.15.0`): its only change is moving to ikigai-http 0.2.0,
+# so it moves with the ikigai-http pin above. Two copies of `HttpTransport` would not unify, and this
+# crate hands ONE transport to both spaces. The `llm-*` ids are unchanged.
+ikigai-llm = { version = "0.15.0", optional = true }
 # The page's Content-Security-Policy admits each view stylesheet's own `<style>` block by its
 # SHA-256 (src/csp.rs, ledger #1793). Both versions are the ones the lock already held through
 # other crates, so adding them added no package to the graph.
