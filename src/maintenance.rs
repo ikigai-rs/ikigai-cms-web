@@ -1,5 +1,5 @@
 //! Graph maintenance: the **link-check pass** as a resource. Sourcing `urn:cms:linkcheck` runs
-//! the whole pass — list every bookmark, check each by resolving `urn:httpHead`+`Exists` through
+//! the whole pass — list every bookmark, check each by resolving `urn:http:head`+`Exists` through
 //! the kernel (`ikigai-http`, honest status), reconcile a persisted JSON status cache, and write a
 //! `dead-links.org` review — returning a one-line summary. Both the `cms-linkcheck` bin and the
 //! `cms-server` `urn:time` schedule just *source* it, so there is one implementation.
@@ -7,7 +7,7 @@
 //! `ikigai-http` reports status honestly; the *policy* about what's "dead" lives here (the
 //! caller): `"true"` = alive, a transient error = unreachable, a permanent one (a 400/403 the server
 //! *answered* with) = alive. A HEAD `"false"` (404/410) is NOT trusted alone — many live servers
-//! 404 a HEAD but serve a GET — so it is confirmed with a real `urn:httpGet`; only a GET that *also*
+//! 404 a HEAD but serve a GET — so it is confirmed with a real `urn:http:get`; only a GET that *also*
 //! 404s is `gone`. Each check passes `max_age`, so in the long-lived server a URL checked within the
 //! week is a cache hit.
 //!
@@ -697,7 +697,7 @@ impl Endpoint for LinkCheckPass {
                     .optional(),
             )
             .output("text/plain")
-            // It dereferences the web, so it needs a net grant (the inner urn:httpHead enforces it).
+            // It dereferences the web, so it needs a net grant (the inner urn:http:head enforces it).
             .requires("urn:cap:net:*")
     }
 }
@@ -854,18 +854,21 @@ async fn check(inv: &Invocation<'_>, url: &str) -> Outcome {
     }
 }
 
-/// A single reachability check. The cheap first pass is `urn:httpHead`+`Exists` (cacheable a week):
+/// A single reachability check. The cheap first pass is `urn:http:head`+`Exists` (cacheable a week):
 /// `"true"` = alive, a **transient** error = unreachable, a **permanent** one (a status the server
 /// answered with) = alive (a HEAD-hostile but live site isn't condemned). A `"false"` (HEAD 404/410)
 /// is NOT trusted on its own — **many servers 404 a HEAD but serve a GET** — so we confirm with a
 /// real GET before ever concluding `gone`. Only a GET that *also* 404s is a removal candidate.
 async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
-    let request = Request::new(Verb::Exists, Iri::parse("urn:httpHead").expect("valid IRI"))
-        .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
-        .with_arg(
-            "max_age",
-            ArgRef::Inline(WEEK_SECS.to_string().into_bytes()),
-        );
+    let request = Request::new(
+        Verb::Exists,
+        Iri::parse("urn:http:head").expect("valid IRI"),
+    )
+    .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+    .with_arg(
+        "max_age",
+        ArgRef::Inline(WEEK_SECS.to_string().into_bytes()),
+    );
     match inv.issue(request).await {
         Ok(repr) => match repr.bytes.as_slice() {
             b"true" => Outcome::Alive,
@@ -916,12 +919,12 @@ fn clean_reason(text: &str) -> String {
 }
 
 /// A HEAD said 404/410 — but HEAD is unreliable (plenty of live servers reject it with a 404 while
-/// serving the same URL on GET). Ask the authority: a real `urn:httpGet`. A GET that succeeds means
+/// serving the same URL on GET). Ask the authority: a real `urn:http:get`. A GET that succeeds means
 /// the page is live (HEAD-hostile, not gone); a GET that *also* 404s (`Error::NotFound`) is a genuine
 /// `gone`; a transient GET error is `unreachable`; any other answered status (403/400/…) means the
 /// resource is there, just not fetchable this way — not gone.
 async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
-    let request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+    let request = Request::new(Verb::Source, Iri::parse("urn:http:get").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
         .with_arg(
             "max_age",
@@ -2183,10 +2186,10 @@ fn ol_bibkeys_url(isbn: &str) -> Option<String> {
     ))
 }
 
-/// One `urn:httpGet` to OpenLibrary (cacheable a week — its subject data is stable), parsed for the
+/// One `urn:http:get` to OpenLibrary (cacheable a week — its subject data is stable), parsed for the
 /// subject list per `shape`.
 async fn ol_fetch(inv: &Invocation<'_>, url: &str, shape: OlShape) -> Vec<String> {
-    let request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+    let request = Request::new(Verb::Source, Iri::parse("urn:http:get").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
         .with_arg(
             "max_age",
@@ -2822,12 +2825,12 @@ mod tests {
             "another keystore entry",
         );
         refused(
-            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
                 .with_arg("url", ArgRef::Inline(b"https://example.com/".to_vec())),
             "a host that is not the Zotero API",
         );
         refused(
-            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
                 .with_arg("url", ArgRef::Inline(b"https://openlibrary.org/".to_vec())),
             "OpenLibrary, which only tag-suggest asks",
         );
@@ -3021,12 +3024,12 @@ mod tests {
             other => panic!("{what}: expected Denied, got {other:?}"),
         };
         refused(
-            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
                 .with_arg("url", ArgRef::Inline(b"https://example.com/".to_vec())),
             "a host that is not OpenLibrary or the LLM",
         );
         refused(
-            Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
                 .with_arg("url", ArgRef::Inline(b"http://localhost:1062/".to_vec())),
             "another port on the LLM's host",
         );

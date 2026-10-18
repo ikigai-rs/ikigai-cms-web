@@ -167,7 +167,7 @@ impl Endpoint for ZoteroLinkPass {
                     .default_value(DAY_SECS.to_string()),
             )
             .output("text/plain")
-            // It sweeps the Zotero API (the inner urn:httpGet enforces the net grant) with a
+            // It sweeps the Zotero API (the inner urn:http:get enforces the net grant) with a
             // key read as `urn:secret:zotero-api-key` (ikigai-secret enforces the read grant).
             // Declared, so the manifold offers the pass only to a caller holding both, and the
             // kernel refuses one holding neither with a typed `Denied` before the first read.
@@ -243,7 +243,7 @@ async fn get_json(
     url: &str,
     max_age: u64,
 ) -> Result<serde_json::Value> {
-    let mut request = Request::new(Verb::Source, Iri::parse("urn:httpGet").expect("valid IRI"))
+    let mut request = Request::new(Verb::Source, Iri::parse("urn:http:get").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
         .with_arg(
             "headers",
@@ -259,7 +259,7 @@ async fn get_json(
 
 /// Page through a Zotero collection endpoint and return every item.
 ///
-/// **Offsets, not the `Link: rel="next"` header** — not by preference. `urn:httpGet` returns a
+/// **Offsets, not the `Link: rel="next"` header** — not by preference. `urn:http:get` returns a
 /// representation (bytes + media type) and drops the response headers, so `Link`, `Total-Results`
 /// and `Last-Modified-Version` are all unreachable from inside the kernel. `start`/`limit` is what
 /// `rel="next"` encodes anyway, and the stop rule is self-evident: a page shorter than `limit` is
