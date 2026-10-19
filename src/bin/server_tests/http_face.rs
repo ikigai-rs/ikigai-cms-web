@@ -25,7 +25,7 @@ use super::{handle, percent_decode, resolve_http, serve_http, HttpAuth, PageOrig
 use ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET;
 use ikigai_cms_web::session::{RecentLog, Rp};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
-use ikigai_wire::{encode, Call};
+use ikigai_wire::{decode, encode, Call, IssueWith, Reply, TraceContext};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PAYLOAD: &str = "<img src=x onerror=alert(1)>";
@@ -305,6 +305,88 @@ fn a_public_wire_session_cannot_dismiss_a_tag() {
     let dismissed =
         std::fs::read_to_string(dir.path().join("cms-tag-dismissed.ttl")).unwrap_or_default();
     assert!(!dismissed.contains("planted"), "{dismissed}");
+}
+
+/// Wire v9's `IssueWith` (ledger #1546) is served as the `IssueAs` it extends: the carried
+/// capability is clamped to the session's ceiling, so a public session carrying root reads a
+/// public stylesheet and is refused the gated bookmark graph, word for word as without the run
+/// context; and a recording peer is refused the way `IssueTraced` is. On main before this door
+/// knew the variant, the call did not decode at all.
+#[test]
+fn a_wire_v9_issue_with_is_clamped_like_an_issue_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, ent) = room(dir.path());
+    let rp = rp(dir.path());
+    let mut session = Session {
+        ceiling: Capability::scoped(Vec::<String>::new()),
+        auth_state: None,
+        reg_state: None,
+        principal: None,
+    };
+    let mut call = |call: &Call| {
+        let reply = handle(
+            &kernel,
+            &rp,
+            &HttpAuth::default(),
+            &ent,
+            &RecentLog::default(),
+            &mut session,
+            &encode(call).unwrap(),
+            DEFAULT_ANONYMOUS_SPARQL_BUDGET,
+        );
+        decode::<Reply>(&reply).expect("the door answers a Reply")
+    };
+    let with = IssueWith {
+        trace: None,
+        retries: Some(2),
+        time_left_ms: Some(30_000),
+    };
+    let source = |iri: &str| Request::new(Verb::Source, Iri::parse(iri).unwrap());
+
+    // A public resource resolves under the carried context exactly as it does without one.
+    let style = "urn:cms:style:catalog";
+    let plain = call(&Call::IssueAs(source(style), Capability::root()));
+    let carried = call(&Call::IssueWith(source(style), Capability::root(), with));
+    match (plain, carried) {
+        (Reply::Resolved(a, _), Reply::Resolved(b, _)) => assert_eq!(a.bytes, b.bytes),
+        other => panic!("the public stylesheet resolves both ways: {other:?}"),
+    }
+
+    // A gated one is refused: root carried by a public session is clamped to the empty ceiling.
+    let gated = "urn:cms:graph:bookmarks";
+    let plain = call(&Call::IssueAs(source(gated), Capability::root()));
+    let carried = call(&Call::IssueWith(source(gated), Capability::root(), with));
+    match (plain, carried) {
+        (Reply::Error(a), Reply::Error(b)) => {
+            assert_eq!(a, b);
+            assert!(
+                !a.contains("sci.example"),
+                "the graph leaked into the refusal: {a}"
+            );
+        }
+        other => panic!("the bookmark graph is gated both ways: {other:?}"),
+    }
+
+    // A recording peer gets the `IssueTraced` refusal, in the same words.
+    let ctx = TraceContext {
+        trace_id: 1,
+        parent_span: None,
+    };
+    let recording = IssueWith {
+        trace: Some(ctx),
+        ..with
+    };
+    let traced = call(&Call::IssueWith(
+        source(style),
+        Capability::root(),
+        recording,
+    ));
+    let legacy = call(&Call::IssueTraced(source(style), Capability::root(), ctx));
+    assert_eq!(traced, legacy);
+    match traced {
+        Reply::Error(m) => assert!(m.contains("traced resolution"), "{m}"),
+        other => panic!("a recording peer is refused: {other:?}"),
+    }
 }
 
 // ---- The anonymous door's SPARQL time budget (ledger #964) ----

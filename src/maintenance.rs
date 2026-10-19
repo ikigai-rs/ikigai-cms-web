@@ -923,6 +923,12 @@ fn clean_reason(text: &str) -> String {
 /// the page is live (HEAD-hostile, not gone); a GET that *also* 404s (`Error::NotFound`) is a genuine
 /// `gone`; a transient GET error is `unreachable`; any other answered status (403/400/…) means the
 /// resource is there, just not fetchable this way — not gone.
+///
+/// "Transient" is `Error::is_transient()`, which ikigai-http 0.3.0 narrowed (ledger #1546): an
+/// answered 429 is `RetryAfter` and an answered 500 is `Endpoint`, neither transient, so both fall
+/// to the "answered, therefore there" arm and the link is `ok`. Under 0.2.0 both were `Unavailable`
+/// and the link went `unreachable` (and was retried once). A 502, or a 503 with no `Retry-After`,
+/// is still `Unavailable`, still transient, still `unreachable`.
 async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
     let request = Request::new(Verb::Source, Iri::parse("urn:http:get").expect("valid IRI"))
         .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
@@ -3195,6 +3201,16 @@ mod tests {
         clock: TestClock,
         status_path: PathBuf,
     ) -> Kernel {
+        kernel_through(Arc::new(Canned { status, sends }), clock, status_path)
+    }
+
+    /// [`kernel_over`] with the transport supplied: one fixture bookmark (`https://sci.example`),
+    /// the link-check pass, and the status file at `status_path`.
+    fn kernel_through(
+        transport: Arc<dyn HttpTransport>,
+        clock: TestClock,
+        status_path: PathBuf,
+    ) -> Kernel {
         let dir = tempfile::tempdir().unwrap();
         let bm = dir.path().join("old-org/pinboard-bookmarks.org");
         std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
@@ -3207,14 +3223,75 @@ mod tests {
         let src = dir.keep();
         let mut spaces =
             crate::cms_spaces_with(src, None, None, None, tags, Some(status_path.clone()));
-        spaces.push(
-            Arc::new(ikigai_http::space(Arc::new(Canned { status, sends }))) as Arc<dyn Space>,
-        );
+        spaces.push(Arc::new(ikigai_http::space(transport)) as Arc<dyn Space>);
         spaces.push(Arc::new(EndpointSpace::new().bind(
             Exact::new("urn:cms:linkcheck"),
             LinkCheckPass { status_path },
         )) as Arc<dyn Space>);
         Kernel::new(Arc::new(Fallback::new(spaces))).with_clock(Arc::new(clock))
+    }
+
+    /// A HEAD-hostile origin: every HEAD is answered `head`, every GET `get`, and the sends are
+    /// counted so a test can say how many times the pass knocked.
+    struct HeadThenGet {
+        head: u16,
+        get: u16,
+        sends: Arc<AtomicU32>,
+    }
+    #[async_trait]
+    impl HttpTransport for HeadThenGet {
+        async fn send(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(HttpResponse {
+                status: if req.method == ikigai_http::Method::Head {
+                    self.head
+                } else {
+                    self.get
+                },
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        }
+    }
+
+    /// A HEAD 404 is confirmed with a GET, and the GET's answer is read through ikigai-http 0.3.0's
+    /// status table (ledger #1546): a 429 is `RetryAfter` and a 500 is `Endpoint`, neither
+    /// transient, so the origin ANSWERED and the link is `ok`, in two sends and with no backoff
+    /// retry. Under ikigai-http 0.2.0 both were the transient `Unavailable`, the link went
+    /// `unreachable`, and the pass knocked a third time after the backoff. A 401 was `Denied` and
+    /// is `Refused`: `ok` both before and after, pinned so the arm stays shared. A 503 with no
+    /// `Retry-After` is still `Unavailable`, so it is still `unreachable`, still retried.
+    #[test]
+    fn a_get_that_answers_429_or_500_after_a_head_404_is_alive() {
+        for (get, status, sends_expected) in [
+            (429, "ok", 2),
+            (500, "ok", 2),
+            (401, "ok", 2),
+            (503, "unreachable", 3),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let status_path = dir.path().join("status.json");
+            let sends = Arc::new(AtomicU32::new(0));
+            let kernel = kernel_through(
+                Arc::new(HeadThenGet {
+                    head: 404,
+                    get,
+                    sends: Arc::clone(&sends),
+                }),
+                TestClock(Arc::new(AtomicU64::new(0))),
+                status_path.clone(),
+            );
+            run_pass(&kernel);
+            let entry = load_status(&status_path)
+                .remove("https://sci.example")
+                .unwrap_or_else(|| panic!("GET {get}: the fixture link was checked"));
+            assert_eq!(entry.status, status, "GET {get}: {}", entry.reason);
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                sends_expected,
+                "GET {get}: HEAD, GET, and a backoff retry only for a transient failure"
+            );
+        }
     }
 
     /// A transport whose every send fails with the given error string, counting the attempts (so a

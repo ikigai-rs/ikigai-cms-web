@@ -25,14 +25,23 @@ crate-type = ["cdylib", "rlib"]
 # now derives every home from it rather than joining ".config/ikigai" and ".ikigai" itself.
 # The pin says 0.1.58, not 0.1.57, because 0.1.57 was never published — the registry goes
 # 0.1.56 → 0.1.58 — so 0.1.58 is the earliest version that actually resolves.
-ikigai-core = "0.1.58"
+# 0.1.108 is a REAL floor (ledger #1546, #1923): `Error::class()` and the failure classes, the four
+# variants an origin's answer is now typed as (`RetryAfter`, `OverBudget`, `Refused`,
+# `Unsupported`), and `IssueContext`, which the WebTransport door builds from a wire v9
+# `Call::IssueWith` (src/bin/server.rs `handle`). `^0.1.108` reads `<0.2.0`: no ceiling in sight.
+ikigai-core = "0.1.108"
 # The on-wire Call/Reply codec — the SAME bytes ikigai-ipc/quic speak. The server
 # encodes/decodes it natively; the browser's wire codec does it in wasm.
 # 0.1.10 is a REAL floor, not caution: `handle` matches `Call::IssueTraced`, which
 # protocol v3 added and 0.1.9 does not have. A bare "0.1" resolved to 0.1.9 under the
 # old lock, so `cargo build` (locked) and `cargo install --path` (fresh) compiled
 # different source and disagreed about what existed.
-ikigai-wire = "0.1.10"
+# 0.1.66 is a REAL floor (wire v9, ledger #1546): `Call::IssueWith` (variant 5, a peer's run
+# context) is what the door matches, and `WireError` gains tags 9-13 for the failure classes.
+# The browser codec (dist/, `./build-wasm.sh`) is built from THIS crate at the same version, so
+# the door and the page always speak the same wire; a dist/ built before this pin decodes the
+# `Reply::Error` strings this door still sends, and nothing newer.
+ikigai-wire = "0.1.66"
 serde_json = "1"
 
 # The native kernel + server. Gated off wasm — the browser links only the wire codec,
@@ -85,7 +94,9 @@ notify = { version = "6.1", optional = true }
 # through the kernel.
 async-trait = "0.1"
 # Resolver::issue drives a request against the kernel (the server bin, examples, tests).
-ikigai-resolve = "0.1.9"
+# 0.1.66 is a REAL floor (ledger #1546): `issue_as_with_context` runs a wire peer's `IssueWith`
+# under the run context it carried. Moves in lockstep with ikigai-wire.
+ikigai-resolve = "0.1.66"
 # The WebTransport server (rung 2). Behind the `server` feature so the default build
 # and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
 wtransport = { version = "0.7", optional = true }
@@ -119,7 +130,14 @@ ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger 
 # `space()` returns core's `Alias` overlay rather than an `EndpointSpace`; this crate holds it as
 # `Arc<dyn Space>`, so that change does not reach here. Moves TOGETHER with ikigai-llm 0.15.0,
 # which implements the same `HttpTransport` trait.
-ikigai-http = { version = "0.2.0", optional = true }
+# 0.3.0 is a CEILING crossing (`^0.2.0` = `<0.3.0`, ledger #1546) and the one status table: an
+# origin's 401/403 is `Refused` (was `Denied`), 429 is `RetryAfter` (was `Unavailable`, and is NOT
+# transient), 500 is `Endpoint` (was `Unavailable`), 503 with a `Retry-After` is `RetryAfter`.
+# The link checker's GET confirmation reads these (maintenance.rs `confirm_gone_with_get`): a
+# 429 or a 500 after a HEAD 404 is now `ok`, where 0.2.0 typed both transient and the link went
+# `unreachable`. `Exists` on `urn:http:head` is unchanged (only 404/410 are absent). Moves
+# TOGETHER with ikigai-llm 0.16.0, which calls this table.
+ikigai-http = { version = "0.3.0", optional = true }
 # An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
 # thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
 # system OpenSSL dep in CI.
@@ -166,7 +184,11 @@ ikigai-time = { version = "0.4.1", optional = true }
 # 0.15.0, a ceiling crossing (`^0.14.0` = `<0.15.0`): its only change is moving to ikigai-http 0.2.0,
 # so it moves with the ikigai-http pin above. Two copies of `HttpTransport` would not unify, and this
 # crate hands ONE transport to both spaces. The `llm-*` ids are unchanged.
-ikigai-llm = { version = "0.15.0", optional = true }
+# 0.16.0, a ceiling crossing (`^0.15.0` = `<0.16.0`, ledger #1546): every failure typed by
+# ikigai-http 0.3.0's status table (its own copy deleted), so it moves with the ikigai-http pin
+# above. The room's behavior does not change: `llm_up` reads ANY error from `…:up` as "down,
+# skip the run" and `llm_tags` ANY error from `…:ask` as "fall back", class or no class.
+ikigai-llm = { version = "0.16.0", optional = true }
 # The page's Content-Security-Policy admits each view stylesheet's own `<style>` block by its
 # SHA-256 (src/csp.rs, ledger #1793). Both versions are the ones the lock already held through
 # other crates, so adding them added no package to the graph.
@@ -238,4 +260,7 @@ tempfile = "3"
 # 0.8.0, a ceiling crossing again (`^0.6.1` = `<0.7.0`): VALIDATE (0.7), REQUIRED and
 # `Suite::own` (0.8). The walk is scoped to `urn:cms:*` + `cms-style`; the dependencies are
 # inherited, pinned exactly, and certified in their own repos.
-ikigai-conformance = "0.8.0"
+# 0.10.0, a ceiling crossing again (`^0.8.0` = `<0.9.0`, ledger #1546): FAILURES (declared =
+# produced failure classes), opt-in through `Suite::check_failures()` until 0.11 makes it the
+# default; both walks opt in. Requires ikigai-core 0.1.108, the library's own floor now.
+ikigai-conformance = "0.10.0"
