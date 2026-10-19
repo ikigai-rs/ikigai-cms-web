@@ -280,6 +280,12 @@ fn suite() -> Suite {
         // This module's endpoints; everything else the kernel binds is inherited, not walked.
         .own("urn:cms:*")
         .own("cms-style")
+        // FAILURES (ikigai-conformance 0.10, opt-in until 0.11; ledger #1546): an action that
+        // states its failure classes fails only with one it admits. None of the room's own
+        // actions states any yet, so each is listed on a `failures:` line and nothing is a
+        // finding; opting in now is what makes the first declaration checked rather than
+        // decorative.
+        .check_failures()
         .required_on_mutating()
         .namespace(CMS)
         .pure("cms-style")
@@ -1061,6 +1067,11 @@ fn the_maintenance_kernel_conforms() {
         "http-put",
         "http-patch",
         "http-delete",
+        // ikigai-http 0.2.2 (ledger #1875) added the two WebDAV methods, `urn:http:propfind` and
+        // `urn:http:report`, crossed here on the way to 0.3.0 (ledger #1546): two more ids
+        // bound beside the pass kernel, which asks neither.
+        "http-propfind",
+        "http-report",
         // ikigai-llm 0.9.2 made a Description id a LABEL rather than an IRI, so these
         // are `llm-ask`, not `urn:llm:ask` — the binding IRIs are unchanged. 0.10.0
         // added the fourth per-provider endpoint (`urn:llm:{provider}:model`), which is

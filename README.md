@@ -86,7 +86,10 @@ at the screen: a replaced binary can re-prompt for the Keychain (the passkey sto
 source jail under `~/Dropbox`, and a denial is silent until `/tmp/ikigai-cms.log` says so.
 
 The browser codec in `dist/` does not need rebuilding for a dependency bump unless
-`ikigai-wire` moved; `./build-wasm.sh` rebuilds it when it did.
+`ikigai-wire` moved; `./build-wasm.sh` rebuilds it when it did. The service serves the `dist`
+directory `cms.toml` names, so when that is not this checkout's `dist/`, copy the three
+generated files (`ikigai_cms_web.js`, `ikigai_cms_web_bg.wasm`, `ikigai_cms_web.d.ts`) there
+after the rebuild; they are gitignored, so a `git pull` never carries them.
 
 ### Reaching the room from another machine
 
@@ -280,3 +283,29 @@ then re-register `dev.ikigai-rs.cms` (see "Install as a service").
 
 Reinstall the same way: `cargo install --path . --features server --locked --force`, then
 re-register `dev.ikigai-rs.cms`. No `cms.toml` change is needed for the 1 s default.
+
+### 2026-10-19: wire v9 and the failure classes
+
+- **Dependencies** (ledger #1546, #1923): `ikigai-core` 0.1.108 (`Error::class()` and the
+  `RetryAfter`, `OverBudget`, `Refused` and `Unsupported` variants), `ikigai-wire` and
+  `ikigai-resolve` 0.1.66 (wire v9), `ikigai-http` 0.3.0 and `ikigai-llm` 0.16.0 (one status
+  table: an origin's 401/403 is `Refused`, 429 is `RetryAfter`, 500 is `Endpoint`),
+  `ikigai-conformance` 0.10.0 (the FAILURES check, opted into). Four of the six pins were
+  ceilings under Cargo's 0.x caret rules.
+- **The WebTransport door answers a wire v9 `IssueWith`**: a peer's run context (retries left,
+  time left) runs the request under that context, with the carried capability clamped to the
+  session's ceiling exactly as an `IssueAs` is; a recording peer is refused the way `IssueTraced`
+  is. The page's own codec sends neither, so nothing in the room changes.
+- **The link checker reads the new classes.** A HEAD 404 confirmed by a GET that answers 429 or
+  500 is now `ok` (the origin answered, so the page is there), where it was `unreachable` and
+  retried once after the backoff; a 502, or a 503 with no `Retry-After`, is still `unreachable`.
+  A 401/403 was `ok` and stays `ok`.
+- **What did not change**: the page face still answers every resolution error as `200 OK` with a
+  `cms-error` fragment, because htmx swaps on a 2xx and the room is built on that swap; the wire
+  still sends `Reply::Error` strings, so a failure class does not yet reach the page. Both are
+  the same later change (a typed error the page renders), noted at `resolve` in
+  `src/bin/server.rs`.
+
+Reinstall: `./build-wasm.sh` first (the wire moved), copy the three generated codec files into
+the `dist` directory `cms.toml` names, then `cargo install --path . --features server --locked
+--force` and re-register `dev.ikigai-rs.cms`.

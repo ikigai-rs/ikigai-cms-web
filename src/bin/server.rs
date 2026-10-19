@@ -48,7 +48,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use ikigai_core::{
-    ArgRef, Capability, Iri, Kernel, ReprType, Representation, Request, SystemClock, Verb,
+    ArgRef, Capability, Clock, Iri, IssueContext, Kernel, ReprType, Representation, Request,
+    SystemClock, Verb,
 };
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
@@ -1623,17 +1624,55 @@ fn handle(
         // trace surface to render spans into, and honouring it would mean recording a
         // trace nothing consumes. Refuse in words the caller can act on rather than
         // silently answering an untraced Resolved, which would look like it worked.
-        Ok(Call::IssueTraced(..)) => {
-            Reply::Error("traced resolution is not offered by the reading room".to_string())
+        Ok(Call::IssueTraced(..)) => Reply::Error(TRACED_NOT_OFFERED.to_string()),
+        // Wire v9 (ledger #1546): a peer's run context rides with the request. The page's own
+        // codec never sends it (`encodeIssue`/`encodeIssueAs` in src/wire_client.rs), so this is a
+        // wire peer: another kernel resolving through the room. One that is recording gets the
+        // same refusal as `IssueTraced`, for the same reason. Otherwise the carried capability is
+        // clamped exactly as an `IssueAs` is, and the request runs under the carried context:
+        // the time left added to THIS door's now (the `SystemClock` the kernel runs on), the
+        // retries narrowed by the kernel to the clamped capability's entitlement and dropped on a
+        // kernel with no retry budget, which this one is.
+        Ok(Call::IssueWith(_, _, with)) if with.trace.is_some() => {
+            Reply::Error(TRACED_NOT_OFFERED.to_string())
+        }
+        Ok(Call::IssueWith(req, carried, with)) => {
+            let iri = req.target.as_str().to_string();
+            let scope = inline_arg(&req, "type")
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(str::to_string);
+            let context = with.issue_context(SystemClock.now());
+            let reply = match door(req, session) {
+                Ok(req) => resolve_within(kernel, &session.ceiling.clamp(&carried), req, context),
+                Err(e) => Reply::Error(e.to_string()),
+            };
+            if matches!(reply, Reply::Resolved(..)) {
+                note_recent(recent, session.principal.as_deref(), &iri, scope.as_deref());
+            }
+            reply
         }
         Err(e) => Reply::Error(format!("undecodable call: {e}")),
     };
     encode(&reply).unwrap_or_default()
 }
 
+/// The refusal a recording caller gets, on `IssueTraced` and on a recording `IssueWith` alike.
+const TRACED_NOT_OFFERED: &str = "traced resolution is not offered by the reading room";
+
 /// Resolve a request under `cap` and wrap the result as a `Reply`.
 fn resolve(kernel: &Kernel, cap: &Capability, request: Request) -> Reply {
-    match Resolver::issue_as(kernel, request, cap) {
+    resolve_within(kernel, cap, request, IssueContext::new())
+}
+
+/// [`resolve`] under a run context: the retry pool and deadline a wire v9 peer carried, or the
+/// empty context (what every request ran under before core 0.1.108) for the page's own calls.
+fn resolve_within(
+    kernel: &Kernel,
+    cap: &Capability,
+    request: Request,
+    context: IssueContext,
+) -> Reply {
+    match ikigai_resolve::issue_as_with_context(kernel, request, cap, context) {
         Ok((representation, status)) => Reply::Resolved(representation, status),
         // FLATTENED ON PURPOSE, not for want of a better variant. wire v7 added
         // `Reply::ErrorTyped(WireError)` and every other server in the ecosystem now
