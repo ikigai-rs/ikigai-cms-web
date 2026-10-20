@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::StreamExt;
+use ikigai_fn::html::{attr, html_text, url_segment};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
@@ -1315,14 +1316,11 @@ fn review_xml(b: &Buckets<'_>, now: u64) -> String {
     }
     if !b.observing.is_empty() {
         s.push_str("<note>");
-        xml_text(
-            &mut s,
-            &format!(
-                "{} more unreachable under observation — not yet eligible (need 3 failed checks \
-                 over a week).",
-                group(b.observing.len())
-            ),
-        );
+        s.push_str(&html_text(&format!(
+            "{} more unreachable under observation — not yet eligible (need 3 failed checks \
+             over a week).",
+            group(b.observing.len())
+        )));
         s.push_str("</note>");
     }
     s.push_str("</review>");
@@ -1333,13 +1331,13 @@ fn review_xml(b: &Buckets<'_>, now: u64) -> String {
 /// section `kind` (for card colour) is the items' shared status.
 fn section_xml(s: &mut String, items: &[&Status], now: u64, label: &str, action: &str, cta: &str) {
     s.push_str("<section kind=\"");
-    xml_attr(s, &items[0].status);
+    s.push_str(&attr(&items[0].status));
     s.push_str("\" label=\"");
-    xml_attr(s, label);
+    s.push_str(&attr(label));
     s.push_str("\" action=\"");
-    xml_attr(s, action);
+    s.push_str(&attr(action));
     s.push_str("\" cta=\"");
-    xml_attr(s, cta);
+    s.push_str(&attr(cta));
     s.push_str("\">");
     items_xml(s, items, now);
     s.push_str("</section>");
@@ -1350,9 +1348,9 @@ fn section_xml(s: &mut String, items: &[&Status], now: u64, label: &str, action:
 /// conditionals — the absence of a purge button has to be structural.
 fn flagged_xml(s: &mut String, items: &[&Status], now: u64, label: &str) {
     s.push_str("<flagged kind=\"");
-    xml_attr(s, &items[0].status);
+    s.push_str(&attr(&items[0].status));
     s.push_str("\" label=\"");
-    xml_attr(s, label);
+    s.push_str(&attr(label));
     s.push_str("\">");
     items_xml(s, items, now);
     s.push_str("</flagged>");
@@ -1366,43 +1364,18 @@ fn items_xml(s: &mut String, items: &[&Status], now: u64) {
     for it in items {
         let days = now.saturating_sub(it.first_broken_at) / 86_400;
         s.push_str("<item status=\"");
-        xml_attr(s, &it.status);
+        s.push_str(&attr(&it.status));
         s.push_str("\" reason=\"");
-        xml_attr(s, &it.reason);
+        s.push_str(&attr(&it.reason));
         s.push_str("\" age=\"");
-        xml_attr(s, &age_phrase(&it.status, days));
+        s.push_str(&attr(&age_phrase(&it.status, days)));
         s.push_str("\" enc=\"");
-        xml_attr(s, &url_encode(&it.url));
+        s.push_str(&attr(&url_segment(&it.url)));
         s.push_str("\" url=\"");
-        xml_attr(s, &it.url);
+        s.push_str(&attr(&it.url));
         s.push_str("\" title=\"");
-        xml_attr(s, &it.title);
+        s.push_str(&attr(&it.title));
         s.push_str("\"/>");
-    }
-}
-
-/// Escape a value for an XML double-quoted attribute.
-fn xml_attr(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-}
-
-/// Escape a value for XML element text content.
-fn xml_text(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
-        }
     }
 }
 
@@ -2164,7 +2137,7 @@ async fn openlibrary_subjects(inv: &Invocation<'_>, isbn: &str, title: &str) -> 
     if !title.is_empty() {
         let url = format!(
             "https://{OPENLIBRARY_HOST}/search.json?title={}&fields=subject&limit=1",
-            url_encode(title)
+            url_segment(title)
         );
         return ol_fetch(inv, &url, OlShape::Search).await;
     }
@@ -2237,20 +2210,6 @@ async fn ol_fetch(inv: &Invocation<'_>, url: &str, shape: OlShape) -> Vec<String
             })
             .unwrap_or_default(),
     }
-}
-
-/// Percent-encode a query-string value (the OpenLibrary title search).
-fn url_encode(s: &str) -> String {
-    let mut o = String::new();
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                o.push(b as char)
-            }
-            _ => o.push_str(&format!("%{b:02X}")),
-        }
-    }
-    o
 }
 
 /// Raw OpenLibrary subjects → clean candidate tags: drop classification/BISAC codes and all-caps

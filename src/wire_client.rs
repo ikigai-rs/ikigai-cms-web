@@ -61,9 +61,8 @@ pub fn decode_reply(bytes: Vec<u8>) -> String {
 }
 
 fn error_html(msg: &str) -> String {
-    let esc = msg
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!("<p class=\"cms-error\">{esc}</p>")
+    format!(
+        "<p class=\"cms-error\">{}</p>",
+        ikigai_fn::html::html_text(msg)
+    )
 }

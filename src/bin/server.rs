@@ -51,6 +51,7 @@ use ikigai_core::{
     ArgRef, Capability, Clock, Iri, IssueContext, Kernel, ReprType, Representation, Request,
     SystemClock, Verb,
 };
+use ikigai_fn::html::{attr, html_text};
 use ikigai_resolve::{CacheStatus, Resolver};
 use ikigai_wire::{decode, encode, Call, Reply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1357,20 +1358,7 @@ fn served_type(repr_type: &ReprType) -> String {
 /// An inline error fragment (`<{tag} class="cms-error">…</{tag}>`) with the message escaped, so
 /// htmx swaps something visible and nothing the message quotes can become markup.
 fn error_fragment(tag: &str, message: &str) -> Vec<u8> {
-    format!(
-        "<{tag} class=\"cms-error\">{}</{tag}>",
-        escape_html(message)
-    )
-    .into_bytes()
-}
-
-/// Escape text for an HTML text node or a quoted attribute value.
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    format!("<{tag} class=\"cms-error\">{}</{tag}>", html_text(message)).into_bytes()
 }
 
 /// Minimal percent-decoding for a URL path/query segment (`%XX` and `+`→space).
@@ -1785,30 +1773,17 @@ fn recent_xml(items: &[Recent]) -> String {
     } else {
         for it in items {
             s.push_str("<item iri=\"");
-            xml_escape_into(&mut s, &it.iri);
+            s.push_str(&attr(&it.iri));
             // Always emit scope (empty = unscoped) so the stylesheet can render it flatly.
             s.push_str("\" scope=\"");
-            xml_escape_into(&mut s, it.scope.as_deref().unwrap_or(""));
+            s.push_str(&attr(it.scope.as_deref().unwrap_or("")));
             s.push_str("\">");
-            xml_escape_into(&mut s, &it.label);
+            s.push_str(&html_text(&it.label));
             s.push_str("</item>");
         }
     }
     s.push_str("</recent>");
     s
-}
-
-/// Escape a value into XML text / attribute context.
-fn xml_escape_into(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
 }
 
 /// The passkey ceremony, over the wire as `urn:auth:*` resources. Registration is a

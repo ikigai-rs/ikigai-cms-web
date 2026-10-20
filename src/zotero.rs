@@ -593,11 +593,10 @@ fn overlay_turtle(rows: &[Row]) -> String {
             ));
         }
         if let Some(url) = &r.reader_url {
-            lines.push(format!(
-                "<{}> <{CMS_READER_URL}> \"{}\" .",
-                r.book,
-                escape(url)
-            ));
+            // oxrdf writes the literal, so a URL holding a quote, a backslash or a control
+            // character is still one valid Turtle string (ledger #1813).
+            let url = oxrdf::LiteralRef::new_simple_literal(url);
+            lines.push(format!("<{}> <{CMS_READER_URL}> {url} .", r.book));
         }
     }
     lines.sort();
@@ -615,14 +614,6 @@ fn write_overlay(path: &Path, rows: &[Row]) {
     let _ = crate::filelock::write_atomic(path, overlay_turtle(rows).as_bytes());
 }
 
-/// Turtle string-literal escaping (a URL can legally contain a quote or a backslash).
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -634,6 +625,49 @@ mod tests {
     }
 
     use super::*;
+
+    /// A reader URL survives the overlay as Turtle, whatever it holds: the literal is oxrdf's,
+    /// and the graph reads the file with a Turtle parser (ledger #1813). It replaced a hand-written
+    /// escaper that differed from the tag overlays' copy (only that one escaped a tab).
+    #[test]
+    fn a_reader_url_round_trips_through_the_overlay_turtle() {
+        let urls = [
+            "https://www.zotero.org/u/items/K/reader",
+            "https://example.org/a?q=\"x\"&b=\\c",
+            "https://example.org/\ttab\nline\rreturn",
+            "https://example.org/\u{1}\u{7f}",
+        ];
+        let rows: Vec<Row> = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| Row {
+                book: format!("urn:cms:book:{i}"),
+                item: format!("ITEM{i}"),
+                attachment: None,
+                reader_url: Some(u.to_string()),
+            })
+            .collect();
+        let ttl = overlay_turtle(&rows);
+        let mut back: Vec<(String, String)> = oxttl::TurtleParser::new()
+            .for_slice(ttl.as_bytes())
+            .filter_map(|t| {
+                let t = t.expect("the overlay is valid Turtle");
+                match (t.predicate.as_str(), t.object) {
+                    (CMS_READER_URL, oxrdf::Term::Literal(l)) => {
+                        Some((t.subject.to_string(), l.value().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        back.sort();
+        let want: Vec<(String, String)> = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (format!("<urn:cms:book:{i}>"), u.to_string()))
+            .collect();
+        assert_eq!(back, want, "{ttl}");
+    }
 
     #[test]
     fn a_reader_link_points_at_the_reader_not_the_library_page() {
