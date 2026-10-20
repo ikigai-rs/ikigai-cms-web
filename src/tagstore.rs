@@ -12,9 +12,9 @@
 //! Promote moves a triple suggestions→approved; dismiss drops it from suggestions. Both are
 //! authorized mutations, mirroring the reviewed purge — never automatic.
 //!
-//! The on-disk format is one canonical triple per line with full IRIs (valid standalone Turtle,
-//! and trivially line-parseable since we are the only writer):
-//! `<iri> <predicate> "escaped tag" .`
+//! The on-disk format is N-Triples (so also valid standalone Turtle): one canonical triple per
+//! line with full IRIs, `<iri> <predicate> "escaped tag" .`, the literal written by oxrdf and each
+//! line read back by oxttl's N-Triples parser, never a hand-written escaper (ledger #1813).
 //!
 //! # What an overlay is keyed on
 //!
@@ -152,24 +152,28 @@ pub struct Entry {
 }
 
 /// Parse an overlay file's entries (empty if absent/unreadable). Tolerant: skips any line that
-/// isn't our canonical `<iri> <pred> "tag" .` shape.
+/// isn't one N-Triples statement of the canonical `<iri> <pred> "tag" .` shape.
 pub fn entries(path: &Path) -> Vec<Entry> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines().filter_map(parse_line).collect()
 }
 
 fn parse_line(line: &str) -> Option<Entry> {
-    let line = line.trim();
-    let iri = line.strip_prefix('<')?;
-    let (iri, rest) = iri.split_once('>')?;
-    // rest = ` <pred> "tag" .`
-    let rest = rest.trim_start();
-    let after_pred = rest.strip_prefix('<')?.split_once('>')?.1.trim_start();
-    let inner = after_pred.strip_prefix('"')?;
-    let close = inner.rfind("\" .")?;
+    // One line is one N-Triples statement, read by oxttl: the same reading of the literal's
+    // escapes that `urn:cms:graph` gives the file, so the tag a mutation sees is the tag the room
+    // serves (ledger #1813).
+    let triple = oxttl::NTriplesParser::new()
+        .for_slice(line.trim().as_bytes())
+        .next()?
+        .ok()?;
+    let (oxrdf::NamedOrBlankNode::NamedNode(subject), oxrdf::Term::Literal(tag)) =
+        (triple.subject, triple.object)
+    else {
+        return None;
+    };
     Some(Entry {
-        iri: iri.to_string(),
-        tag: unescape(&inner[..close]),
+        iri: subject.into_string(),
+        tag: tag.value().to_string(),
     })
 }
 
@@ -258,7 +262,10 @@ fn parse_link_line(line: &str) -> Option<(String, String)> {
 fn serialize(entries: &[Entry], predicate: &str) -> String {
     let mut lines: Vec<String> = entries
         .iter()
-        .map(|e| format!("<{}> <{predicate}> \"{}\" .", e.iri, escape(&e.tag)))
+        .map(|e| {
+            let tag = oxrdf::LiteralRef::new_simple_literal(&e.tag);
+            format!("<{}> <{predicate}> {tag} .", e.iri)
+        })
         .collect();
     lines.sort();
     lines.dedup();
@@ -300,34 +307,6 @@ fn update<T>(path: &Path, predicate: &str, f: impl FnOnce(&mut Vec<Entry>) -> T)
             None
         }
     }
-}
-
-/// Turtle string-literal escaping (the subset a tag can contain).
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other), // \\ and \" land here
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 impl TagPaths {
@@ -713,6 +692,53 @@ mod tests {
         assert!(home.path().join(".ikigai").is_dir(), "state dir created");
 
         assert!(TagPaths::in_state_dir(Path::new("")).is_none());
+    }
+
+    /// Every tag survives the overlay file, read by this module AND by a Turtle parser, which is
+    /// how `urn:cms:graph` reads it. Before ledger #1813 a hand-written escaper and unescaper did
+    /// this job (correctly, as far as tests reached); oxrdf writes the literal and oxttl reads it.
+    #[test]
+    fn a_tag_with_any_character_round_trips_through_the_overlay_file() {
+        let tags = [
+            "plain",
+            "quoted \"x\" & odd",
+            "back\\slash",
+            "line\nbreak\rreturn\ttab",
+            "bell\u{7}nul\u{0}del\u{7f}",
+            "\u{8}\u{c}form feed",
+            "café ✓ 日本",
+            "",
+        ];
+        let es: Vec<Entry> = tags
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Entry {
+                iri: format!("urn:cms:book:{i}"),
+                tag: t.to_string(),
+            })
+            .collect();
+        let ttl = serialize(&es, DC_SUBJECT);
+        assert_eq!(ttl.lines().count(), tags.len(), "one line per entry: {ttl}");
+
+        let mut ours: Vec<Entry> = ttl.lines().filter_map(parse_line).collect();
+        ours.sort_by(|a, b| a.iri.cmp(&b.iri));
+        assert_eq!(ours, es, "this module reads back what it wrote");
+
+        let mut graph: Vec<Entry> = oxttl::TurtleParser::new()
+            .for_slice(ttl.as_bytes())
+            .map(|t| {
+                let t = t.expect("the overlay is valid Turtle");
+                let oxrdf::Term::Literal(tag) = t.object else {
+                    panic!("a literal object: {t}");
+                };
+                Entry {
+                    iri: t.subject.to_string().trim_matches(['<', '>']).to_string(),
+                    tag: tag.value().to_string(),
+                }
+            })
+            .collect();
+        graph.sort_by(|a, b| a.iri.cmp(&b.iri));
+        assert_eq!(graph, es, "a Turtle parser reads the same tags");
     }
 
     #[test]

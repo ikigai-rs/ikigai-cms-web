@@ -43,6 +43,12 @@ ikigai-core = "0.1.108"
 # `Reply::Error` strings this door still sends, and nothing newer.
 ikigai-wire = "0.1.66"
 serde_json = "1"
+# The ecosystem's ONE escaping and link module, `ikigai_fn::html` (FND-H, ledger #1813): element
+# text, attribute values, URL segments, link targets from data and `hx-vals` JSON all go through
+# it, on both faces (the browser codec's error fragment too). 0.5.0 is a REAL floor: it is the
+# first release with the module, and the one whose `html_text` maps C0 controls to U+FFFD, which
+# `tests/vectors/html_vectors.json` (a verbatim copy of ikigai-fn's) pins. `^0.5.0` reads `<0.6.0`.
+ikigai-fn = "0.5.0"
 
 # The native kernel + server. Gated off wasm — the browser links only the wire codec,
 # never the SPARQL/fs stack.
@@ -61,9 +67,13 @@ ikigai-cms = "0.2.0"
 # heading carries by transrepting the record and reading its dc:identifier, rather than parsing
 # org a second time (ledger #882). Both are already in the graph through ikigai-sparql's Oxigraph;
 # 0.2.0/0.3.0 are the first releases with `TurtleParser::for_slice` and the Term this matches.
-# Optional: only the maintenance feature (which owns `strike`) links them.
-oxttl = { version = "0.2.0", optional = true }
-oxrdf = { version = "0.3.0", optional = true }
+# Not optional since ledger #1813: the tag overlays (tagstore.rs, every native build) write their
+# literals with oxrdf's `Literal` and read them back with oxttl's N-Triples parser, in place of a
+# hand-written Turtle escaper, and the Zotero link overlay writes its reader URLs the same way.
+# Both were already in every native build's graph through ikigai-sparql, so making them direct
+# dependencies adds no package.
+oxttl = "0.2.0"
+oxrdf = "0.3.0"
 # SPARQL over graph=<uri> sources resolved through the kernel (Oxigraph in-memory).
 # 0.1.12 is a REAL floor (ledger #964): it is the first release with a TIME budget on every
 # evaluation — algebra bounds before planning, a watchdog deadline, a typed `Timeout` — and the
@@ -222,7 +232,7 @@ server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url
 # ikigai-secret: the Zotero link pass reads its API key as `urn:secret:zotero-api-key` through the
 # kernel, so the maintenance kernel mounts the secret space (the server feature already had the dep
 # for the passkey store; maintenance needs it in its own right).
-maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:oxttl", "dep:oxrdf", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml", "dep:url"]
+maintenance = ["dep:ikigai-http", "dep:ikigai-llm", "dep:ikigai-secret", "dep:reqwest", "dep:futures", "dep:futures-timer", "dep:tokio", "dep:serde", "dep:toml", "dep:url"]
 
 [[bin]]
 name = "cms-server"
@@ -246,6 +256,9 @@ required-features = ["maintenance"]
 
 [dev-dependencies]
 futures = "0.3"
+# Only the pin on the shared HTML vectors (src/native.rs tests): the copy in tests/vectors/ must be
+# byte-for-byte the file at the ikigai-fn commit it names. The version the lock already holds.
+sha2 = "0.10.9"
 # A throwaway source jail for the hermetic integration test.
 tempfile = "3"
 # The module recipe as one test (tests/conformance.rs). Its floor is ikigai-core 0.1.67

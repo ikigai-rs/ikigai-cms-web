@@ -10,6 +10,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, FnEndpoint,
     Invocation, Iri, Kernel, ReprType, Representation, Request, Result, Space, UriTemplate, Verb,
 };
+use ikigai_fn::html::{html_text, json_attr, url_segment};
 
 /// The default bookmarks file, as a path within the CMS source jail (`urn:cms:src:*`,
 /// relative to the jail root). Overridable via the `bookmarks` config key / `--bookmarks`.
@@ -1007,7 +1008,9 @@ impl Endpoint for TagApprove {
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
         self.tags.approve(&book, &tag);
-        let (t, seg) = (html_escape(&tag), url_segment(&tag));
+        // The segment is RFC 3986's unreserved set, the same output as SPARQL's `ENCODE_FOR_URI`,
+        // which the stylesheets' chips are built from; the server's `/r/` route decodes it back.
+        let (t, seg) = (html_text(&tag), url_segment(&tag));
         let html = format!(
             "<a class=\"cms-tag\" hx-target=\"#room\" href=\"/r/urn:cms:view:{seg}\" \
              hx-get=\"/r/urn:cms:view:{seg}\">#{t}</a>"
@@ -1087,64 +1090,6 @@ impl Endpoint for DeckFiles {
     fn describe(&self) -> Description {
         self.0.describe()
     }
-}
-
-/// Percent-encode `s` for one segment of a `/r/` path: every byte but the RFC 3986 unreserved
-/// characters (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`, the same output as SPARQL's `ENCODE_FOR_URI`,
-/// which the stylesheets' chips are built from. The server's `/r/` route decodes it back.
-///
-/// ```
-/// use ikigai_cms_web::url_segment;
-/// assert_eq!(url_segment("quic"), "quic");
-/// assert_eq!(url_segment("c++"), "c%2B%2B");
-/// assert_eq!(url_segment("what? #1 / 100%"), "what%3F%20%231%20%2F%20100%25");
-/// assert_eq!(url_segment("café"), "caf%C3%A9");
-/// ```
-pub fn url_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Whether a link target that came from library data may be a link: past any leading whitespace,
-/// it starts with `http://` or `https://` (in any case), or with a single `/` (a path on the room's own origin; `//` and
-/// `/\` name another host). Anything else, `javascript:`, `data:`, `vbscript:`, `file:` or a
-/// target with no scheme, renders as text (ledger #1793).
-///
-/// The rule for markup built in Rust. Markup built by XSLT uses the `safe-link` template in
-/// `styles/links.xsl`, the same rule, and a test holds the two to the same answers.
-///
-/// ```
-/// use ikigai_cms_web::safe_href;
-/// assert!(safe_href("https://example.org/a?b=1"));
-/// assert!(safe_href("HTTP://EXAMPLE.ORG/"));
-/// assert!(safe_href("/r/urn:cms:tags"));
-/// assert!(!safe_href("javascript:alert(1)"));
-/// assert!(safe_href(" https://example.org/"));
-/// assert!(!safe_href(" javascript:alert(1)"));
-/// assert!(!safe_href("data:text/html,x"));
-/// assert!(!safe_href("//evil.example/"));
-/// assert!(!safe_href("file:///decks/talk"));
-/// ```
-pub fn safe_href(href: &str) -> bool {
-    // Past leading whitespace, as a browser reads a URL and as the stylesheet's
-    // `normalize-space` does. Only the XML whitespace: data that reached a view through XML can
-    // hold no other control character.
-    let href = href.trim_start_matches([' ', '\t', '\n', '\r']);
-    let starts = |p: &str| {
-        href.get(..p.len())
-            .is_some_and(|h| h.eq_ignore_ascii_case(p))
-    };
-    starts("https://")
-        || starts("http://")
-        || (href.starts_with('/') && !href.starts_with("//") && !href.starts_with("/\\"))
 }
 
 /// Percent-decode an IRI segment (`%XX` → the byte; a `%` not followed by two hex digits is kept
@@ -1425,23 +1370,17 @@ enum Facet<'a> {
     Type(&'a str),
 }
 
-/// The view context as an HTML-attribute-escaped JSON object for `hx-vals`.
+/// The view context as an HTML-attribute-escaped JSON object for `hx-vals` (FND-H's `json_attr`,
+/// ledger #1813), in the order style, dir, type, q.
 fn view_hxvals(ctx: &ViewCtx<'_>) -> String {
-    let mut m = serde_json::Map::new();
-    m.insert("style".into(), ctx.style.into());
-    m.insert("dir".into(), ctx.dir.into());
+    let mut pairs = vec![("style", ctx.style), ("dir", ctx.dir)];
     if let Some(t) = ctx.type_scope {
-        m.insert("type".into(), t.into());
+        pairs.push(("type", t));
     }
     if let Some(q) = ctx.q {
-        m.insert("q".into(), q.into());
+        pairs.push(("q", q));
     }
-    serde_json::Value::Object(m)
-        .to_string()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    json_attr(pairs)
 }
 
 /// The context header: what the view is faceted on, plus a `×` control that clears back to the
@@ -1453,8 +1392,8 @@ fn facet_html(ctx: &ViewCtx<'_>) -> String {
     let (label, clear_iri) = match ctx.facet {
         // A tag view's binding is the IRI's text, so a tag an IRI cannot carry raw is still
         // percent-encoded here; the header names the tag itself.
-        Facet::Tag(t) => (format!("#{}", html_escape(&pct_decode(t))), "urn:cms:tags"),
-        Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_escape(q)), "urn:cms:tags"),
+        Facet::Tag(t) => (format!("#{}", html_text(&pct_decode(t))), "urn:cms:tags"),
+        Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_text(q)), "urn:cms:tags"),
         Facet::Type(t) => (type_label(t).to_string(), "urn:cms:types"),
     };
     let scope = match ctx.type_scope {
@@ -1509,17 +1448,6 @@ fn toolbar_html(ctx: &ViewCtx<'_>) -> String {
     t.push_str(&seg(ctx.dir == "desc", "{\"dir\":\"desc\"}", "Z\u{2192}A"));
     t.push_str("</div></div>");
     t
-}
-
-/// Minimal HTML-text escaping for the few view-context strings (tag/query/type) that reach the
-/// server-rendered chrome. The card bodies go through XSLT; only these header labels are
-/// interpolated by hand, so they escape the five markup-significant characters here.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 /// Render one page of a card view: a wrapper carrying the view context as `hx-vals`, the
@@ -2665,58 +2593,127 @@ mod tests {
         assert!(dropped_whitespace_text("<!-- <xsl:text> </xsl:text> -->").is_empty());
     }
 
-    /// Ledger #1693: the spaces the room's views do emit survive xrust. Each lives inside
-    /// non-whitespace text: the count line's ` resources` after a number, in each card style,
-    /// and the ` · ` between a dead link's reason and its age in the review.
-    /// The two copies of the link rule (ledger #1793) give the same answer for every target:
-    /// `safe_href` in Rust, and the `safe-link` template the views call, here through the
-    /// dead-links review, whose title links to a bookmark's URL.
+    /// The shared HTML vectors (FND-H, ledger #1813): `tests/vectors/html_vectors.json` is a
+    /// VERBATIM copy of ikigai-fn's `tests/vectors/html_vectors.json` at ikigai-fn commit 53d50c5
+    /// (ikigai-rs/ikigai-fn PR 18; unchanged through the 0.5.0 release this crate depends on), the
+    /// same file ikigai-python and ikigai-deno pin. To pick up new vectors, copy that file again,
+    /// unedited, and update the digest below; it stays `eol=lf` through `.gitattributes`.
+    const HTML_VECTORS: &str = include_str!("../tests/vectors/html_vectors.json");
+    const HTML_VECTORS_SHA256: &str =
+        "e6b3f0aea44302f58ae98e5158ac8d69aef325e91aaa6d7e42b56e18d1a07f91";
+
     #[test]
-    fn the_rust_and_the_stylesheet_link_rules_agree() {
-        let (_dir, kernel) = kernel_over_fixture();
-        let targets = [
-            ("https://example.org/a?b=1&c=2", true),
-            ("http://example.org/", true),
-            ("HTTPS://EXAMPLE.ORG/", true),
-            ("HtTp://example.org/", true),
-            ("/r/urn:cms:tags", true),
-            ("/", true),
-            ("//evil.example/", false),
-            ("/\\evil.example/", false),
-            ("javascript:alert(1)", false),
-            ("JAVASCRIPT:alert(1)", false),
-            (" https://example.org/", true),
-            ("\t javascript:alert(1)", false),
-            ("data:text/html,<b>x</b>", false),
-            ("vbscript:msgbox(1)", false),
-            ("file:///decks/talk", false),
-            ("mailto:someone@example.org", false),
-            ("r/urn:cms:tags", false),
-            ("https:/example.org", false),
-            ("http:example.org", false),
-            ("", false),
-        ];
-        for (url, want) in targets {
-            assert_eq!(safe_href(url), want, "Rust rule on {url:?}");
-            let enc = url_segment(url);
-            let attr = url
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('"', "&quot;");
-            let review = format!(
-                "<review xmlns=\"urn:cms:review#\">\
-                 <section label=\"Gone\" action=\"urn:cms:purge:gone\" cta=\"Remove all\">\
-                 <item status=\"gone\" url=\"{attr}\" title=\"The Title\" reason=\"HTTP 404\" \
-                 age=\"9d\" enc=\"{enc}\"/></section></review>"
-            );
-            let html = render_via_xslt(&kernel, &review, "review");
-            let linked = html.contains("<a class='cms-dead-title'");
-            assert_eq!(linked, want, "stylesheet rule on {url:?}: {html}");
-            assert!(
-                html.contains(">The Title<"),
-                "{url:?}: the title shows either way: {html}"
-            );
+    fn the_html_vectors_are_the_pinned_ikigai_fn_copy_byte_for_byte() {
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(HTML_VECTORS.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            digest, HTML_VECTORS_SHA256,
+            "tests/vectors/html_vectors.json is not the pinned ikigai-fn copy; copy it again \
+             verbatim (no header, LF endings) and update the digest with the commit it came from"
+        );
+    }
+
+    /// Whether `s` can ride in an XML 1.0 document at all. A C0 control other than tab, line feed
+    /// and carriage return cannot, not even as a character reference, so no value the views
+    /// receive (every one arrives as XML) can hold one: those vectors have no stylesheet case.
+    fn xml_representable(s: &str) -> bool {
+        s.chars()
+            .all(|c| c >= ' ' || matches!(c, '\t' | '\n' | '\r'))
+    }
+
+    /// The vectors the `safe-link` template cannot answer as the shared rule does, each for a
+    /// reason in xrust rather than in the template. The test fails if one of these starts
+    /// agreeing, so the list can only shrink.
+    ///
+    /// - A LEADING no-break space: the shared rule refuses it (a browser does not strip U+00A0,
+    ///   so the target is not `https://…`), but xrust's `normalize-space` trims it (its
+    ///   whitespace handling counts U+00A0 elsewhere too, ledger #1693), and no XPath literal can
+    ///   name it to tell it apart:
+    ///   xrust reads `&#160;`, and a literal U+00A0, in a stylesheet attribute as a space. The
+    ///   template links, with the target unchanged, which a browser reads as a relative path on
+    ///   the room's own origin: not a script and not another host.
+    const XSL_KNOWN_DIFFERENCES: &[&str] = &["\u{a0}https://example.org/"];
+
+    /// `s` as XML element text that parses back to exactly `s`: carriage return goes as a
+    /// character reference, since a parser reads a literal one as a line feed.
+    fn xml_text_exact(s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '\r' => out.push_str("&#13;"),
+                c => out.push(c),
+            }
         }
+        out
+    }
+
+    /// The link rule's two implementations give the shared vectors' answers for every target:
+    /// `ikigai_fn::html::safe_href` for markup built in Rust, and the `safe-link` template every
+    /// view calls (styles/links.xsl), here through a catalog card, whose title links to the
+    /// resource's `dc:identifier`. Every case is run; every disagreement is reported at once.
+    ///
+    /// The target rides as ELEMENT text, as a card's identifier does in the views' RDF/XML. An
+    /// attribute cannot carry every vector into xrust: its parser reads a tab or newline
+    /// character reference in an attribute value as a space and trims a leading no-break space,
+    /// so `url="/&#9;/host"` reaches the review's template as `/ /host` (a same-origin path, and
+    /// the shared rule's answer for that value too).
+    #[test]
+    fn the_stylesheet_link_rule_gives_the_shared_vectors_answers() {
+        let doc: serde_json::Value = serde_json::from_str(HTML_VECTORS).expect("vectors are JSON");
+        let cases = doc["safe_href"].as_array().expect("a safe_href section");
+        assert!(cases.len() >= 40, "{} safe_href cases", cases.len());
+        let (_dir, kernel) = kernel_over_fixture();
+        let mut failures = Vec::new();
+        let mut run = 0;
+        for case in cases {
+            let url = case["in"].as_str().expect("a string input");
+            let want = case["out"].as_str();
+            let why = case["why"].as_str().unwrap_or("");
+            if ikigai_fn::html::safe_href(url) != want {
+                failures.push(format!("ikigai_fn::html::safe_href({url:?}) ({why})"));
+            }
+            if !xml_representable(url) {
+                continue;
+            }
+            run += 1;
+            let card = format!(
+                "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" \
+                 xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+                 <rdf:Description rdf:about=\"urn:cms:bookmark:x\">\
+                 <dc:title>The Title</dc:title><dc:identifier>{}</dc:identifier>\
+                 </rdf:Description></rdf:RDF>",
+                xml_text_exact(url)
+            );
+            let html = render_via_xslt(&kernel, &card, "catalog");
+            let linked = html.contains("<a class='cms-title'");
+            let known = XSL_KNOWN_DIFFERENCES.contains(&url);
+            if (linked != want.is_some()) != known {
+                failures.push(format!(
+                    "stylesheet on {url:?} ({why}): linked = {linked}, want {want:?}{}",
+                    if known {
+                        " (listed as a known difference, and it no longer differs: drop it)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if !html.contains(">The Title<") {
+                failures.push(format!("{url:?}: the title shows either way: {html}"));
+            }
+        }
+        assert!(run >= 40, "ran {run} stylesheet cases");
+        assert!(
+            failures.is_empty(),
+            "{} case(s) differ from the shared vectors:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// The `<style>` bodies [`style_blocks`] reads from the authored stylesheets are exactly what
@@ -2755,6 +2752,9 @@ mod tests {
         }
     }
 
+    /// Ledger #1693: the spaces the room's views do emit survive xrust. Each lives inside
+    /// non-whitespace text: the count line's ` resources` after a number, in each card style,
+    /// and the ` · ` between a dead link's reason and its age in the review.
     #[test]
     fn the_spaces_a_view_renders_survive_the_transform() {
         let (_dir, kernel) = kernel_over_fixture();

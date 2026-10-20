@@ -309,3 +309,31 @@ re-register `dev.ikigai-rs.cms`. No `cms.toml` change is needed for the 1 s defa
 Reinstall: `./build-wasm.sh` first (the wire moved), copy the three generated codec files into
 the `dist` directory `cms.toml` names, then `cargo install --path . --features server --locked
 --force` and re-register `dev.ikigai-rs.cms`.
+
+### 2026-10-19: one escaping and link module
+
+- **`ikigai-fn` 0.5.0's `ikigai_fn::html`** (FND-H, ledger #1813) is now the only place this crate
+  escapes HTML or XML text and attribute values (`html_text`, `attr`), percent-encodes a URL
+  segment or query value (`url_segment`), and writes `hx-vals` JSON (`json_attr`), on both faces.
+  Seven hand-written HTML and XML escapers and two percent-encoders are gone, and so are this
+  crate's public `safe_href` and `url_segment` (nothing outside it used them).
+- **What changes on the page**: `'` is now escaped (`&#39;`) everywhere, including the error
+  fragments and the XML the review and recent-items views are built from, and a C0 control
+  character other than tab, line feed and carriage return becomes U+FFFD (XML 1.0 cannot carry
+  one at all, so before, one in a dead link's title or a recent item's label reached the view's
+  XML raw).
+- **The link rule in `styles/links.xsl` is stricter**, and a test now runs every `safe_href` case
+  of ikigai-fn's shared vectors (`tests/vectors/html_vectors.json`, a verbatim copy pinned by
+  digest) through it: a target with a tab, line feed or carriage return between its first and
+  last visible character, or a DEL anywhere, renders as text. One case still differs, and the
+  test lists it: a LEADING no-break space links here (xrust's `normalize-space` trims U+00A0),
+  which a browser reads as a relative path on the room's own origin. For the same reason a
+  no-break space INSIDE a target renders it as text, where the shared rule would link it.
+- **The tag and Zotero link overlays write their literals with oxrdf**, and the tag overlays read
+  them back with oxttl's N-Triples parser, so a tag or reader URL holding any character round-trips
+  and the graph reads it the same way. The files the room already holds parse unchanged.
+
+Reinstall: `./build-wasm.sh` first (the browser codec's error fragment now escapes through
+`ikigai_fn::html`), copy the three generated codec files into the `dist` directory `cms.toml`
+names, then `cargo install --path . --features server --locked --force` and re-register
+`dev.ikigai-rs.cms`.

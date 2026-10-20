@@ -1,0 +1,4 @@
+# The shared HTML vectors are a VERBATIM copy of ikigai-fn's tests/vectors/html_vectors.json,
+# pinned by digest (src/native.rs) and compared byte for byte across the faces by ikigai-devtools'
+# vector drift, so a CRLF checkout (Git for Windows' core.autocrlf=true) must never rewrite it.
+tests/vectors/html_vectors.json text eol=lf

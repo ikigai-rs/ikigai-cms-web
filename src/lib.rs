@@ -20,8 +20,7 @@ mod native;
 mod presentations;
 #[cfg(not(target_family = "wasm"))]
 pub use native::{
-    build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with, pct_decode, safe_href,
-    style_blocks, url_segment,
+    build_cms_kernel, build_cms_kernel_with, cms_spaces, cms_spaces_with, pct_decode, style_blocks,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use presentations::Presentations;
