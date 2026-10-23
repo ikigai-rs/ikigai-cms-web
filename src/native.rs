@@ -1276,6 +1276,20 @@ fn dir_arg(inv: &Invocation<'_>) -> &'static str {
     }
 }
 
+/// The CONSTRUCT template fragment that carries a card view's ORDER onto every card:
+/// `cms:sortKey` is the value the page query ordered by (`var`), `cms:sortDir` the direction
+/// (`dir_arg`'s `"asc"`/`"desc"`, never client text). The card stylesheets sort on them.
+///
+/// The page's `ORDER BY` chooses WHICH resources are on the page; it cannot fix the order the
+/// cards render in, because a CONSTRUCT answers a GRAPH, and a graph has no order. The rows
+/// used to come out in solution order, which the stylesheets relied on, until ikigai-sparql
+/// 0.2.6 started writing every CONSTRUCT answer in one canonical order so its cacheable bytes
+/// are stable (ledger #1566): then `dir=desc` rendered in the same order as `asc`. So the
+/// order the reader sees is stated as data and applied where the cards are laid out.
+fn sort_construct(inv: &Invocation<'_>, var: &str) -> String {
+    format!(" ; cms:sortKey {var} ; cms:sortDir \"{}\"", dir_arg(inv))
+}
+
 /// A paginated resource subquery `{ SELECT {vars} … }` yielding the page
 /// `[offset, offset+PAGE_SIZE)` of DISTINCT resources matching `body`, ordered by `order`.
 ///
@@ -1510,6 +1524,7 @@ impl Endpoint for TagView {
         };
         let offset = page_offset(inv);
         let order = order_by(inv, "?st");
+        let sort = sort_construct(inv, "?st");
         let count_query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {type_filter}?s dc:subject \"{safe}\" }}"
@@ -1525,7 +1540,7 @@ impl Endpoint for TagView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT}{sort} }} \
              WHERE {{ {paged} \
                       ?s dc:title ?t ; dc:identifier ?u ; dc:subject ?tag .{TAG_CHIP_BIND} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
@@ -1590,6 +1605,7 @@ impl Endpoint for SearchView {
         let safe = sparql_lit(q);
         let offset = page_offset(inv);
         let order = order_by(inv, "?t");
+        let sort = sort_construct(inv, "?t");
         // Match on title-contains; page the resources in a subquery so LIMIT/OFFSET slice
         // *resources*, then join each one's tags for its chips.
         let count_query = format!(
@@ -1606,7 +1622,7 @@ impl Endpoint for SearchView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT}{sort} }} \
              WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag{TAG_CHIP_BIND} }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
@@ -1692,6 +1708,7 @@ impl Endpoint for TypeView {
         let class = cms_class(&ty).ok_or_else(|| Error::Endpoint(format!("no type `{ty}`")))?;
         let offset = page_offset(inv);
         let order = order_by(inv, "?t");
+        let sort = sort_construct(inv, "?t");
         let count_query = format!(
             "PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
              SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s a cms:{class} }}"
@@ -1705,7 +1722,7 @@ impl Endpoint for TypeView {
         let query = format!(
             "PREFIX dc: <http://purl.org/dc/elements/1.1/> \
              PREFIX cms: <https://ikigai-rs.dev/ns/cms#> \
-             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT} }} \
+             CONSTRUCT {{ {READER_CONSTRUCT}{TAG_CHIP_CONSTRUCT} ; dc:creator ?c{KIND_CONSTRUCT}{SUGGEST_CONSTRUCT}{sort} }} \
              WHERE {{ {paged} \
              OPTIONAL {{ ?s dc:subject ?tag{TAG_CHIP_BIND} }} OPTIONAL {{ ?s dc:creator ?c }}{KIND_WHERE}{SUGGEST_WHERE}{READER_WHERE} }}"
         );
@@ -2220,26 +2237,35 @@ mod tests {
             None,
         );
 
-        // Ascending (the default): Alpha renders before Zulu.
-        let asc = resolve_html(
-            &kernel,
-            "urn:cms:view:sorted",
-            &[("style", "catalog"), ("dir", "asc")],
-        );
-        assert!(
-            asc.find("Alpha").unwrap() < asc.find("Zulu").unwrap(),
-            "asc puts Alpha before Zulu"
-        );
-        // Descending: the same graph, order flipped.
-        let desc = resolve_html(
-            &kernel,
-            "urn:cms:view:sorted",
-            &[("style", "catalog"), ("dir", "desc")],
-        );
-        assert!(
-            desc.find("Zulu").unwrap() < desc.find("Alpha").unwrap(),
-            "desc puts Zulu before Alpha"
-        );
+        // Every card theme lays the page out in the asked-for order, all three cards of it: the
+        // order is applied by the stylesheet, so each one is checked (a CONSTRUCT answer has no
+        // order of its own, see `sort_construct`).
+        let at = |html: &str, title: &str| {
+            html.find(title)
+                .unwrap_or_else(|| panic!("{title} missing: {html}"))
+        };
+        for style in CARD_STYLES {
+            // Ascending (the default): Alpha, Mike, Zulu.
+            let asc = resolve_html(
+                &kernel,
+                "urn:cms:view:sorted",
+                &[("style", style), ("dir", "asc")],
+            );
+            assert!(
+                at(&asc, "Alpha") < at(&asc, "Mike") && at(&asc, "Mike") < at(&asc, "Zulu"),
+                "{style}: asc renders Alpha, Mike, Zulu: {asc}"
+            );
+            // Descending: the same graph, order flipped.
+            let desc = resolve_html(
+                &kernel,
+                "urn:cms:view:sorted",
+                &[("style", style), ("dir", "desc")],
+            );
+            assert!(
+                at(&desc, "Zulu") < at(&desc, "Mike") && at(&desc, "Mike") < at(&desc, "Alpha"),
+                "{style}: desc renders Zulu, Mike, Alpha: {desc}"
+            );
+        }
     }
 
     #[test]
