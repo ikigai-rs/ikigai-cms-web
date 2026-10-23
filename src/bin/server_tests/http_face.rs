@@ -82,7 +82,7 @@ async fn start_budgeted(dir: &Path, origin: &str, dev_open: bool, budget: Durati
         Arc::new(RecentLog::default()),
         Arc::new(ent),
         Arc::new(PageOrigin::parse(origin).unwrap()),
-        Arc::from(ikigai_cms_web::csp::policy(4433)),
+        Arc::from(ikigai_cms_web::csp::headers(4433)),
         dev_open,
         budget,
     ));

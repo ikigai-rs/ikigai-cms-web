@@ -17,6 +17,12 @@
 //!
 //! The wire (WebTransport) is a connection on its own port, so `connect-src` names that port on
 //! any host: the page dials whichever host it was loaded from (`dist/wire.js`).
+//!
+//! Against ikigai-web's page preset, `SecurityHeaders::html_door()` (ledger #2155): this policy is
+//! the preset's `HTML_DOOR_CSP`, every directive exactly as the preset writes it, plus these three
+//! allowances and nothing else (`src/bin/server_tests/door.rs` pins it). The preset as written
+//! refuses all three, so the room cannot send it. The preset's other headers it sends as they
+//! are ([`headers`]).
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -46,6 +52,40 @@ pub fn policy(wire_port: u16) -> String {
          connect-src 'self' https://*:{wire_port}; object-src 'none'; base-uri 'none'; \
          frame-ancestors 'none'; form-action 'self'"
     )
+}
+
+/// The security header lines every page-face response carries, each ending in CRLF: the policy
+/// for `wire_port` ([`policy`]), then the companion headers of ikigai-web's page preset,
+/// `SecurityHeaders::html_door()`, as it names them: `X-Content-Type-Options: nosniff`,
+/// `Referrer-Policy: no-referrer` (a card opened from the room does not tell the bookmarked site
+/// which room URL it came from) and `Cross-Origin-Opener-Policy: same-origin`. Not its HSTS: the
+/// preset sends that only on a request that arrived over HTTPS, and this face never terminates
+/// TLS.
+///
+/// ```
+/// let h = ikigai_cms_web::csp::headers(4433);
+/// assert!(h.starts_with("Content-Security-Policy: default-src 'self'; "));
+/// assert!(h.ends_with(
+///     "\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
+///      Cross-Origin-Opener-Policy: same-origin\r\n"
+/// ));
+/// assert!(!h.contains("Strict-Transport-Security"));
+/// ```
+pub fn headers(wire_port: u16) -> String {
+    let preset = ikigai_web::SecurityHeaders::html_door();
+    let mut out = format!("Content-Security-Policy: {}\r\n", policy(wire_port));
+    if preset.nosniff {
+        out.push_str("X-Content-Type-Options: nosniff\r\n");
+    }
+    for (name, value) in [
+        ("Referrer-Policy", &preset.referrer_policy),
+        ("Cross-Origin-Opener-Policy", &preset.coop),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    out
 }
 
 /// The CSP hash source (`'sha256-…'`) that admits a `<style>` element whose text is `css`.

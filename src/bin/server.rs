@@ -277,9 +277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&recent),
         Arc::clone(&entitlement),
         page_origin,
-        // One policy for the process: it names the wire's port and hashes the views' styles,
-        // neither of which changes while the server runs.
-        Arc::from(ikigai_cms_web::csp::policy(port)),
+        // One set of security headers for the process: the policy names the wire's port and
+        // hashes the views' styles, neither of which changes while the server runs.
+        Arc::from(ikigai_cms_web::csp::headers(port)),
         dev_open,
         anonymous_budget,
     ));
@@ -840,7 +840,7 @@ async fn serve_http(
     recent: Arc<RecentLog>,
     entitlement: Arc<Vec<String>>,
     page_origin: Arc<PageOrigin>,
-    csp: Arc<str>,
+    security: Arc<str>,
     dev_open: bool,
     anonymous_budget: Duration,
 ) {
@@ -863,7 +863,7 @@ async fn serve_http(
         let recent = Arc::clone(&recent);
         let entitlement = Arc::clone(&entitlement);
         let page_origin = Arc::clone(&page_origin);
-        let csp = Arc::clone(&csp);
+        let security = Arc::clone(&security);
         tokio::spawn(async move {
             let _ = handle_http(
                 sock,
@@ -874,7 +874,7 @@ async fn serve_http(
                 &recent,
                 &entitlement,
                 &page_origin,
-                &csp,
+                &security,
                 dev_open,
                 anonymous_budget,
             )
@@ -902,7 +902,7 @@ async fn handle_http(
     recent: &RecentLog,
     entitlement: &[String],
     page_origin: &PageOrigin,
-    csp: &str,
+    security: &str,
     dev_open: bool,
     anonymous_budget: Duration,
 ) -> std::io::Result<()> {
@@ -1018,12 +1018,12 @@ async fn handle_http(
     let cookie_line = set_cookie
         .map(|c| format!("Set-Cookie: {c}\r\n"))
         .unwrap_or_default();
-    // The policy rides on every response, whatever its type: it governs only the documents and
-    // workers a browser builds from one, and a page that is not HTML is harmless under it.
+    // The security headers (`csp::headers`: the policy, nosniff, the referrer and opener
+    // policies) ride on every response, whatever its type: the policy governs only the documents
+    // and workers a browser builds from one, and a page that is not HTML is harmless under it.
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         {cookie_line}Cache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n\
-         Content-Security-Policy: {csp}\r\nConnection: close\r\n\r\n",
+         {cookie_line}Cache-Control: no-cache\r\n{security}Connection: close\r\n\r\n",
         out.len()
     );
     sock.write_all(header.as_bytes()).await?;
@@ -1949,6 +1949,12 @@ mod jobs;
 #[path = "server_tests/links.rs"]
 mod links;
 
+/// Every response carries the companion headers of ikigai-web's page preset, and the room's own
+/// CSP is that preset's plus three named allowances (ledger #2155).
+#[cfg(test)]
+#[path = "server_tests/door.rs"]
+mod door;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2253,7 +2259,7 @@ mod tests {
             Arc::new(RecentLog::default()),
             Arc::new(ent),
             Arc::new(super::PageOrigin::parse("http://localhost:8080").unwrap()),
-            Arc::from(ikigai_cms_web::csp::policy(4433)),
+            Arc::from(ikigai_cms_web::csp::headers(4433)),
             true, // dev-open, so /r/ resolves under the entitlement
             ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
         ));
