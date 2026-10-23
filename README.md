@@ -116,8 +116,11 @@ Whatever the arrangement, the page face answers only for its own origin: a reque
 `Host` names another host (DNS rebinding), or whose `Origin` is not the origin its `Host`
 names (a cross-site form, another localhost port), is refused with 403 before it is routed.
 A loopback `rp_origin` admits any loopback name on any port, so a tunnel that remaps the
-port still works. Every response carries `X-Content-Type-Options: nosniff`, and `/r/` serves
-each body as its own media type (a graph is `text/turtle`, never HTML).
+port still works. Every response carries the room's Content-Security-Policy and the companion
+headers of ikigai-web's page preset, `SecurityHeaders::html_door()`: `X-Content-Type-Options:
+nosniff`, `Referrer-Policy: no-referrer` and `Cross-Origin-Opener-Policy: same-origin` (see
+`src/csp.rs`). `/r/` serves each body as its own media type (a graph is `text/turtle`, never
+HTML).
 
 So two arrangements actually reach the room from elsewhere, and they are not equivalent:
 
@@ -337,3 +340,21 @@ Reinstall: `./build-wasm.sh` first (the browser codec's error fragment now escap
 `ikigai_fn::html`), copy the three generated codec files into the `dist` directory `cms.toml`
 names, then `cargo install --path . --features server --locked --force` and re-register
 `dev.ikigai-rs.cms`.
+
+### 2026-10-23: the page preset's headers
+
+- **Every page-face response now carries `Referrer-Policy: no-referrer` and
+  `Cross-Origin-Opener-Policy: same-origin`**, next to `nosniff` and the room's CSP, read from
+  ikigai-web's page preset, `SecurityHeaders::html_door()` (FND-H, ledger #2155). A card opened
+  from the room no longer tells the bookmarked site which room URL it came from. The room's
+  `fetch` and htmx POSTs still send their `Origin` under `no-referrer` (checked in Chromium), so
+  the Origin check admits them as before.
+- **The CSP stays the room's own.** The preset's `HTML_DOOR_CSP` as written refuses the wire
+  codec's WebAssembly, the WebTransport dial to the wire's port, and each view's own `<style>`
+  block. So `src/csp.rs` is the preset plus exactly those three allowances, and
+  `src/bin/server_tests/door.rs` fails if it differs from the preset in any other way. No HSTS:
+  the preset sends it only on a request that arrived over HTTPS, and this server never
+  terminates TLS.
+
+Reinstall: `cargo install --path . --features server --locked --force` and re-register
+`dev.ikigai-rs.cms`. The browser codec did not change.

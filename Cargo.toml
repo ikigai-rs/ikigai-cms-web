@@ -148,6 +148,12 @@ ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger 
 # `unreachable`. `Exists` on `urn:http:head` is unchanged (only 404/410 are absent). Moves
 # TOGETHER with ikigai-llm 0.16.0, which calls this table.
 ikigai-http = { version = "0.3.0", optional = true }
+# The ecosystem's page preset for a door that serves HTML, `SecurityHeaders::html_door()` (FND-H,
+# ledger #2155): the page face sends its companion headers (nosniff, `Referrer-Policy: no-referrer`,
+# `Cross-Origin-Opener-Policy: same-origin`) as the preset names them, and `src/csp.rs` is pinned
+# against its `HTML_DOOR_CSP`. Only the `server` feature, which has the page face. Its dependencies
+# were all in the graph already.
+ikigai-web = { version = "0.1.69", optional = true }
 # An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
 # thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
 # system OpenSSL dep in CI.
@@ -225,7 +231,7 @@ wasm-bindgen = "=0.2.108"
 # wasm/browser build and the fast CI lean); enable for `cms-server`.
 # The server includes the maintenance stack + the time transport so it can schedule the
 # link-check pass (urn:time) alongside serving the room.
-server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time", "dep:notify", "dep:sha2", "dep:base64"]
+server = ["dep:wtransport", "dep:tokio", "dep:libc", "dep:webauthn-rs", "dep:url", "dep:uuid", "dep:serde", "dep:ikigai-secret", "maintenance", "dep:ikigai-time", "dep:notify", "dep:sha2", "dep:base64", "dep:ikigai-web"]
 # The graph-maintenance tools (link-checker). Off by default; a dedicated bin.
 # serde derives the persisted link-status cache (the reconcile state across runs);
 # tokio runs the async fan-out; reqwest + futures back it.

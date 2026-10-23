@@ -1566,6 +1566,7 @@ dependencies = [
  "ikigai-secret",
  "ikigai-sparql",
  "ikigai-time",
+ "ikigai-web",
  "ikigai-wire",
  "ikigai-xslt",
  "libc",
@@ -1739,6 +1740,21 @@ checksum = "eaf2d110f7d3a3887152e470312c8aab5db7d32527f9ca033d4713491750c56b"
 dependencies = [
  "ikigai-core",
  "serde_json",
+]
+
+[[package]]
+name = "ikigai-web"
+version = "0.1.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbca1952544b3a967a7f632ab54917b3ddd8dfd7d31a6e32cccd3e29330f4d9a"
+dependencies = [
+ "blake3",
+ "chrono",
+ "ikigai-core",
+ "ikigai-fn",
+ "libc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
