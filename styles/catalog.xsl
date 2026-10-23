@@ -21,7 +21,17 @@
 .cms-sug-yes:hover,.cms-sug-no:hover{font-weight:700}</style>
     <section class="cms-room">
       <div class="cms-count"><xsl:value-of select="count(rdf:Description)"/> resources</div>
-      <xsl:apply-templates select="rdf:Description"/>
+      <!-- The cards in the order the reader asked for. The page query chose them, but a CONSTRUCT
+           answers a graph, which has no order, so each card carries its sort key and the
+           direction (native.rs sort_construct). xrust takes no expression in order=, hence the choose. -->
+      <xsl:choose>
+        <xsl:when test="rdf:Description[position() = 1]/cms:sortDir = 'desc'">
+          <xsl:apply-templates select="rdf:Description"><xsl:sort select="cms:sortKey" order="descending"/></xsl:apply-templates>
+        </xsl:when>
+        <xsl:otherwise>
+          <xsl:apply-templates select="rdf:Description"><xsl:sort select="cms:sortKey"/></xsl:apply-templates>
+        </xsl:otherwise>
+      </xsl:choose>
     </section>
   </xsl:template>
 
