@@ -29,7 +29,9 @@ crate-type = ["cdylib", "rlib"]
 # variants an origin's answer is now typed as (`RetryAfter`, `OverBudget`, `Refused`,
 # `Unsupported`), and `IssueContext`, which the WebTransport door builds from a wire v9
 # `Call::IssueWith` (src/bin/server.rs `handle`). `^0.1.108` reads `<0.2.0`: no ceiling in sight.
-ikigai-core = "0.1.108"
+# 0.2.0 is the streams release (ledger #2261) and a CEILING crossing: the old `^0.1.108` meant
+# `<0.2.0` under 0.x rules. Every ikigai crate below moves with it, so the graph links ONE core.
+ikigai-core = "0.2.0"
 # The on-wire Call/Reply codec — the SAME bytes ikigai-ipc/quic speak. The server
 # encodes/decodes it natively; the browser's wire codec does it in wasm.
 # 0.1.10 is a REAL floor, not caution: `handle` matches `Call::IssueTraced`, which
@@ -41,14 +43,17 @@ ikigai-core = "0.1.108"
 # The browser codec (dist/, `./build-wasm.sh`) is built from THIS crate at the same version, so
 # the door and the page always speak the same wire; a dist/ built before this pin decodes the
 # `Reply::Error` strings this door still sends, and nothing newer.
-ikigai-wire = "0.1.66"
+# 0.2.0 is the core 0.2.0 sweep (ledger #2261), a CEILING crossing (`^0.1.66` = `<0.2.0`). Its
+# source is unchanged from 0.1.69: still wire v9, so the committed dist/ codec needs no rebuild.
+ikigai-wire = "0.2.0"
 serde_json = "1"
 # The ecosystem's ONE escaping and link module, `ikigai_fn::html` (FND-H, ledger #1813): element
 # text, attribute values, URL segments, link targets from data and `hx-vals` JSON all go through
 # it, on both faces (the browser codec's error fragment too). 0.5.0 is a REAL floor: it is the
 # first release with the module, and the one whose `html_text` maps C0 controls to U+FFFD, which
 # `tests/vectors/html_vectors.json` (a verbatim copy of ikigai-fn's) pins. `^0.5.0` reads `<0.6.0`.
-ikigai-fn = "0.5.0"
+# 0.7.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.5.0` = `<0.6.0`).
+ikigai-fn = "0.7.0"
 
 # The native kernel + server. Gated off wasm — the browser links only the wire codec,
 # never the SPARQL/fs stack.
@@ -62,7 +67,8 @@ ikigai-fn = "0.5.0"
 # URL it strikes is exactly the dc:identifier the graph serves (ledger #882).
 # 0.2.0 is a CEILING crossing (`^0.1.4` = `<0.2.0`, ledger #1039): its space() names itself
 # `urn:iki:space:cms` (ledger #987). The parser and `bookmarks_to_turtle` are unchanged from 0.1.4.
-ikigai-cms = "0.2.0"
+# 0.3.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.2.0` = `<0.3.0`).
+ikigai-cms = "0.3.0"
 # Read back the Turtle ikigai-cms emits: `strike` (maintenance.rs) asks ikigai-cms which URL a
 # heading carries by transrepting the record and reading its dc:identifier, rather than parsing
 # org a second time (ledger #882). Both are already in the graph through ikigai-sparql's Oxigraph;
@@ -84,7 +90,8 @@ oxrdf = "0.3.0"
 # 0.2.1 is a CEILING crossing (`^0.1.12` = `<0.2.0`, ledger #1039) and a real floor: 0.2.0 names
 # the space `urn:iki:space:sparql` (ledger #987) and bounds every answer's size (ledger #970);
 # 0.2.1 runs the query on a thread sized for the build, so debug and release agree (ledger #1025).
-ikigai-sparql = "0.2.1"
+# 0.3.1 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.2.1` = `<0.3.0`).
+ikigai-sparql = "0.3.1"
 # XSLT transform (urn:xslt:transform, xrust) — the view pipes its CONSTRUCT'd RDF/XML
 # through a `urn:cms:style:*` stylesheet to render cards. Native/server-side only.
 # 0.2.1 is a SECURITY floor and the `0.1.0` it replaces was a CEILING (`^0.1.0` = `<0.2.0`, so the
@@ -93,9 +100,13 @@ ikigai-sparql = "0.2.1"
 # public door still hands the engine a caller's document under a room style, so this is the bound
 # that keeps one anonymous GET from taking the room down (server_tests/privacy.rs pins it).
 # 0.2.0, crossed on the way, names the space `urn:iki:space:xslt` (ledger #987).
-ikigai-xslt = "0.2.1"
+# 0.4.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.2.1` = `<0.3.0`).
+ikigai-xslt = "0.4.0"
 # Capability-gated, cacheable, golden-threaded file reads for the CMS source jail.
-ikigai-fs = "0.1.8" # security floor (audit round 3, ledger #856): the jail authorizes the file it opens
+# The jail authorizing the file it opens is a security floor since 0.1.8 (audit round 3, ledger
+# #856). 0.2.2 is its newest release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.1.8` =
+# `<0.2.0`).
+ikigai-fs = "0.2.2"
 # The platform watcher (FSEvents / inotify) behind `DeckWatch`: the serving host cuts the deck
 # listing's and the deck files' threads when the decks tree changes (ledger #286). The same major
 # ikigai-browse and ikigai-embedded watch with. Only the server runs a watch.
@@ -106,7 +117,9 @@ async-trait = "0.1"
 # Resolver::issue drives a request against the kernel (the server bin, examples, tests).
 # 0.1.66 is a REAL floor (ledger #1546): `issue_as_with_context` runs a wire peer's `IssueWith`
 # under the run context it carried. Moves in lockstep with ikigai-wire.
-ikigai-resolve = "0.1.66"
+# 0.2.1 is its newest release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.1.66` =
+# `<0.2.0`), in lockstep with ikigai-wire 0.2.0, which requires it.
+ikigai-resolve = "0.2.1"
 # The WebTransport server (rung 2). Behind the `server` feature so the default build
 # and CI (lib + tests) stay lean; a dedicated CI step builds `--features server`.
 wtransport = { version = "0.7", optional = true }
@@ -130,7 +143,8 @@ serde = { version = "1", features = ["derive"], optional = true }          # the
 # endpoint id is `secret`, no longer `urn:secret` (its IRIs are unchanged), which the conformance
 # walk's inherited list names. It also adds Exists and Delete on a stored secret, Delete under its
 # own `urn:cap:secret:delete:<name>` scope, which no grant this room issues holds.
-ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger #854 at 0.1.7: 0600 atomic, injective names; ledger #874 at 0.1.8: a name beginning with `-` is refused at every face)
+# 0.3.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.2.0` = `<0.3.0`).
+ikigai-secret = { version = "0.3.0", optional = true } # security floor (ledger #854 at 0.1.7: 0600 atomic, injective names; ledger #874 at 0.1.8: a name beginning with `-` is refused at every face)
 # Maintenance: the link-checker resolves urn:http:head+Exists through the kernel. 0.1.6 = lenient
 # Exists (a server that answers anything but 404/410 is reachable → 429/5xx = alive, only a transport
 # failure is unreachable), atop 0.1.5's honest status + caller `max_age` freshness directive.
@@ -147,13 +161,19 @@ ikigai-secret = { version = "0.2.0", optional = true } # security floor (ledger 
 # 429 or a 500 after a HEAD 404 is now `ok`, where 0.2.0 typed both transient and the link went
 # `unreachable`. `Exists` on `urn:http:head` is unchanged (only 404/410 are absent). Moves
 # TOGETHER with ikigai-llm 0.16.0, which calls this table.
-ikigai-http = { version = "0.3.0", optional = true }
+# 0.4.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.3.0` = `<0.4.0`), and
+# it STREAMS: `HttpResponse::body` is an `HttpBody` the endpoint collects under a byte budget (8 MiB
+# by default) and drops unread for HEAD, redirects and errors. The reqwest transport
+# (maintenance.rs `stream_body`) now hands the body over as a reader instead of buffering it whole.
+# Moves TOGETHER with ikigai-llm 0.17.1, which requires it.
+ikigai-http = { version = "0.4.0", optional = true }
 # The ecosystem's page preset for a door that serves HTML, `SecurityHeaders::html_door()` (FND-H,
 # ledger #2155): the page face sends its companion headers (nosniff, `Referrer-Policy: no-referrer`,
 # `Cross-Origin-Opener-Policy: same-origin`) as the preset names them, and `src/csp.rs` is pinned
 # against its `HTML_DOOR_CSP`. Only the `server` feature, which has the page face. Its dependencies
 # were all in the graph already.
-ikigai-web = { version = "0.1.69", optional = true }
+# 0.2.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.1.69` = `<0.2.0`).
+ikigai-web = { version = "0.2.0", optional = true }
 # An ASYNC outbound transport for it: reqwest parks on its I/O, so the kernel resolves
 # thousands of HEAD checks concurrently on one runtime (no thread pool). rustls to avoid a
 # system OpenSSL dep in CI.
@@ -174,7 +194,8 @@ futures-timer = { version = "3", optional = true }
 # REQUIRED argument, which server.rs now passes. `JobRegistry::new(backend, clock)` is unchanged
 # across 0.2 → 0.4 (checked against both sources). 0.3.0's awake-time job health
 # (`with_sleep_clock`, public `JobHealth`) is now reachable, but this host reads no health yet.
-ikigai-time = { version = "0.4.1", optional = true }
+# 0.5.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.4.1` = `<0.5.0`).
+ikigai-time = { version = "0.5.0", optional = true }
 # S3 tag suggestion: urn:llm:ask over a local Ollama (OpenAI-compat) refines the noisy OpenLibrary
 # subjects onto the user's tag vocabulary; urn:llm:ollama:up gates the pass on the LLM being up.
 # Reuses the same HttpTransport as the link-checker.
@@ -204,7 +225,9 @@ ikigai-time = { version = "0.4.1", optional = true }
 # ikigai-http 0.3.0's status table (its own copy deleted), so it moves with the ikigai-http pin
 # above. The room's behavior does not change: `llm_up` reads ANY error from `…:up` as "down,
 # skip the run" and `llm_tags` ANY error from `…:ask` as "fall back", class or no class.
-ikigai-llm = { version = "0.16.0", optional = true }
+# 0.17.1 is its newest release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.16.0` =
+# `<0.17.0`), on ikigai-http 0.4.0, so it moves with the ikigai-http pin above.
+ikigai-llm = { version = "0.17.1", optional = true }
 # The page's Content-Security-Policy admits each view stylesheet's own `<style>` block by its
 # SHA-256 (src/csp.rs, ledger #1793). Both versions are the ones the lock already held through
 # other crates, so adding them added no package to the graph.
@@ -282,4 +305,7 @@ tempfile = "3"
 # 0.10.0, a ceiling crossing again (`^0.8.0` = `<0.9.0`, ledger #1546): FAILURES (declared =
 # produced failure classes), opt-in through `Suite::check_failures()` until 0.11 makes it the
 # default; both walks opt in. Requires ikigai-core 0.1.108, the library's own floor now.
-ikigai-conformance = "0.10.0"
+# 0.11.0, a ceiling crossing again (`^0.10.0` = `<0.11.0`, ledger #2261): the release on core 0.2.0,
+# which turns DATATYPES (a literal carries its property's declared range) and FAILURES on by default.
+# Both walks run both with no finding.
+ikigai-conformance = "0.11.0"

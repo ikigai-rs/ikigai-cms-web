@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
+use futures::SinkExt;
 use ikigai_fn::html::{attr, html_text, url_segment};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -31,7 +32,7 @@ use ikigai_core::{
     ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Exact, Fallback, Invocation,
     Iri, Kernel, ReprType, Representation, Request, Result, Space, SystemClock, Verb,
 };
-use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+use ikigai_http::{HttpBody, HttpRequest, HttpResponse, HttpTransport};
 
 /// A fresh `ok` result is trusted for a week (also the `max_age` passed to each check); broken
 /// URLs are re-checked every run.
@@ -223,16 +224,36 @@ async fn do_request(
                 .map(|v| (k.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let body = response
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
     Ok(HttpResponse {
         status,
         headers,
-        body,
+        body: stream_body(response),
     })
+}
+
+/// The response body as ikigai-http 0.4's streamed [`HttpBody`], returned before any of it is
+/// read: the endpoint collects at most its byte budget and drops HEAD, redirect and error bodies
+/// unread, where this transport used to buffer every body whole first. The reads stay on the
+/// runtime that owns the connection: a task spawned here pumps one chunk at a time into a
+/// one-slot channel, and the reader the endpoint polls (perhaps from a bare `block_on` on the
+/// timer thread) drains it. Dropping the body closes the channel, and the pump stops at its next
+/// send, dropping the response and its connection.
+fn stream_body(mut response: reqwest::Response) -> HttpBody {
+    let (mut tx, rx) = futures::channel::mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            let next = match response.chunk().await {
+                Ok(Some(chunk)) => Ok(chunk),
+                Ok(None) => break,
+                Err(e) => Err(std::io::Error::other(send_error_string(e))),
+            };
+            let failed = next.is_err();
+            if tx.send(next).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    HttpBody::from_reader(rx.into_async_read())
 }
 
 // ---- the persisted status + its policy ---------------------------------------------------------
@@ -2542,6 +2563,60 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
 
+    /// The reqwest transport returns once the headers are in, with the body still unread (ikigai-http
+    /// 0.4 counts and bounds the bytes as it collects them), and the reads that follow run on the
+    /// transport's runtime even when the caller is a bare `block_on` off it, the timer thread's
+    /// shape. The origin holds the rest of the body until `send` has returned, so a transport that
+    /// buffered the whole body first would never return here.
+    #[test]
+    fn the_reqwest_transport_streams_the_body_from_off_the_runtime() {
+        use std::io::{BufRead, BufReader, Write};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let transport = {
+            let _guard = rt.enter();
+            ReqwestTransport::new()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let origin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("request") > 2 {
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello ")
+                .expect("head");
+            stream.flush().expect("flush");
+            released.recv().expect("release");
+            stream.write_all(b"world").expect("tail");
+        });
+        let (sent, response) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reply = futures::executor::block_on(transport.send(HttpRequest {
+                method: ikigai_http::Method::Get,
+                url: format!("http://{addr}/"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            }));
+            sent.send(reply).expect("send the reply back");
+        });
+        let reply = response
+            .recv_timeout(Duration::from_secs(20))
+            .expect("send returns before the body is complete")
+            .expect("a response");
+        assert_eq!(reply.status, 200);
+        release.send(()).expect("release the tail");
+        let body = futures::executor::block_on(reply.body.collect(1024)).expect("the body");
+        assert_eq!(body, b"hello world");
+        origin.join().expect("origin");
+    }
+
     /// The status cache sits in the ikigai data home under the given home — and a home that
     /// names nothing yields NO path rather than a working-directory-relative `.ikigai/`, which
     /// is the failure that reads as an empty cache. `dead-links.org` and the meta file are
@@ -2610,7 +2685,7 @@ mod tests {
             Ok(HttpResponse {
                 status: self.status,
                 headers: Vec::new(),
-                body: Vec::new(),
+                body: Vec::new().into(),
             })
         }
     }
@@ -2633,7 +2708,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: body.to_vec(),
+                body: body.to_vec().into(),
             })
         }
     }
@@ -2670,7 +2745,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: body.to_vec(),
+                body: body.to_vec().into(),
             })
         }
     }
@@ -3208,7 +3283,7 @@ mod tests {
                     self.get
                 },
                 headers: Vec::new(),
-                body: Vec::new(),
+                body: Vec::new().into(),
             })
         }
     }
