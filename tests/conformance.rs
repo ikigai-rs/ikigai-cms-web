@@ -284,7 +284,8 @@ fn suite() -> Suite {
         // states its failure classes fails only with one it admits. None of the room's own
         // actions states any yet, so each is listed on a `failures:` line and nothing is a
         // finding; opting in now is what makes the first declaration checked rather than
-        // decorative.
+        // decorative. 0.11 runs FAILURES (and DATATYPES) by default; the call stays as the
+        // statement that this walk judges failure classes.
         .check_failures()
         .required_on_mutating()
         .namespace(CMS)
@@ -1012,7 +1013,7 @@ fn the_maintenance_kernel_conforms() {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: body.to_vec(),
+                body: body.to_vec().into(),
             })
         }
     }

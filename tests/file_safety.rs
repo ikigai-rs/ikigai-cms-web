@@ -281,7 +281,7 @@ impl ikigai_http::HttpTransport for Gated {
         Ok(ikigai_http::HttpResponse {
             status: 404,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Vec::new().into(),
         })
     }
 }
