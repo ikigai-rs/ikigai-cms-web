@@ -2315,6 +2315,34 @@ pub fn maintenance_kernel(
     registry: ikigai_llm::Registry,
     llm_provider: &str,
 ) -> Kernel {
+    Kernel::new(std::sync::Arc::new(maintenance_space(
+        src_dir,
+        zotero,
+        bookmarks,
+        status_path,
+        tags,
+        transport,
+        secrets,
+        registry,
+        llm_provider,
+    )))
+    .with_clock(std::sync::Arc::new(SystemClock))
+}
+
+/// The space composed by [`maintenance_kernel`], exposed so conformance probes can invoke
+/// the same endpoints directly while their sub-requests use the kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn maintenance_space(
+    src_dir: PathBuf,
+    zotero: Option<PathBuf>,
+    bookmarks: Option<String>,
+    status_path: PathBuf,
+    tags: crate::tagstore::TagPaths,
+    transport: std::sync::Arc<dyn HttpTransport>,
+    secrets: std::sync::Arc<dyn ikigai_secret::Backend>,
+    registry: ikigai_llm::Registry,
+    llm_provider: &str,
+) -> Fallback {
     let zotero_links = tags.zotero_links.clone();
     let mut spaces = crate::cms_spaces_with(
         src_dir,
@@ -2354,8 +2382,7 @@ pub fn maintenance_kernel(
                 crate::zotero::ZoteroLinkPass { path: zotero_links },
             ),
     ) as std::sync::Arc<dyn Space>);
-    Kernel::new(std::sync::Arc::new(Fallback::new(spaces)))
-        .with_clock(std::sync::Arc::new(SystemClock))
+    Fallback::new(spaces)
 }
 
 /// The compiled-in registry when no `llm.json` exists: a local Ollama, small model.
