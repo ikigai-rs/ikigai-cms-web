@@ -313,4 +313,6 @@ tempfile = "3"
 # 0.11.0, a ceiling crossing again (`^0.10.0` = `<0.11.0`, ledger #2261): the release on core 0.2.0,
 # which turns DATATYPES (a literal carries its property's declared range) and FAILURES on by default.
 # Both walks run both with no finding.
-ikigai-conformance = "0.11.0"
+# 0.12.0 enables BODIES and BODY-INPUTS by default; both walks share their kernel
+# space and content store with the suite so the new probes can run.
+ikigai-conformance = "0.12.0"

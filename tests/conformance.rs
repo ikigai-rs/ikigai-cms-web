@@ -3,7 +3,7 @@
 //!
 //! ## The fixture is a scratch room, never the live one
 //!
-//! `build_cms_kernel_with` over one tempdir: a two-bookmark org file in a scratch source
+//! `cms_spaces_with` over one tempdir: a two-bookmark org file in a scratch source
 //! jail, a one-book Zotero export, one lectern deck under a scratch presentations root, and
 //! the four overlays in a scratch store — each seeded with one row, so every Turtle face
 //! the walk parses carries a triple (a face that parses to nothing passes SKOLEM-RDF and
@@ -88,12 +88,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ikigai_cms_web::tagstore::TagPaths;
-use ikigai_cms_web::{build_cms_kernel_with, Presentations};
-use ikigai_conformance::{rdf, Check, Report, Suite};
+use ikigai_cms_web::{cms_spaces_with, Presentations};
+use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Error, Expiry, Iri, Kernel, Representation, Request, Result, Verb,
+    ArgRef, Capability, Error, Expiry, Fallback, Iri, Kernel, MemoryContentStore, Representation,
+    Request, Result, Space, Verb,
 };
 
 /// The vocabulary this crate coins for the room, registered with the suite.
@@ -211,6 +213,8 @@ const INHERITED: &[&str] = &[
 struct Room {
     _dir: tempfile::TempDir,
     kernel: Kernel,
+    space: Arc<dyn Space>,
+    body_inputs: Arc<MemoryContentStore>,
     tags: TagPaths,
     zotero: PathBuf,
 }
@@ -258,17 +262,21 @@ fn scratch(dir: &Path) -> (PathBuf, PathBuf, Presentations, TagPaths, PathBuf) {
 fn room() -> Room {
     let dir = tempfile::tempdir().expect("tempdir");
     let (src, zotero, presentations, tags, status) = scratch(dir.path());
-    let kernel = build_cms_kernel_with(
+    let space: Arc<dyn Space> = Arc::new(Fallback::new(cms_spaces_with(
         src,
         Some(zotero.clone()),
         Some(presentations),
         Some(BOOKMARKS.to_string()),
         tags.clone(),
         Some(status),
-    );
+    )));
+    let body_inputs = Arc::new(MemoryContentStore::new(1024 * 1024));
+    let kernel = Kernel::new(space.clone()).with_content_store(body_inputs.clone());
     Room {
         _dir: dir,
         kernel,
+        space,
+        body_inputs,
         tags,
         zotero,
     }
@@ -418,6 +426,60 @@ fn assert_findings(report: &Report, kernel: &Kernel, ours: &[&str], inherited: &
         expected,
         "the catalog is exactly the two lists"
     );
+    // Pin the coverage gaps as tightly as the findings. In particular, removing
+    // missing body wiring must fail when the suite reports it as unprobed.
+    let live_sources = [
+        "urn:cms:graph:bookmarks",
+        "urn:cms:graph:zotero-links",
+        "urn:cms:graph:tags-approved",
+        "urn:cms:graph:suggestions",
+        "urn:cms:graph:dismissed",
+        "urn:cms:graph",
+        "urn:cms:view",
+        "urn:cms:search",
+        "urn:cms:tags",
+        "urn:cms:type",
+        "urn:cms:types",
+        "urn:cms:linkstatus",
+        "urn:cms:review",
+        "urn:cms:purge",
+        "urn:cms:purge-domains",
+        "urn:cms:purge-unreachable",
+        "urn:cms:linkcheck",
+        "urn:cms:tag-suggest",
+        "urn:cms:zotero-links",
+    ];
+    let unfired_sinks = [
+        "urn:cms:purge",
+        "urn:cms:purge-domains",
+        "urn:cms:purge-unreachable",
+    ];
+    let expected_unprobed: BTreeSet<_> = live_sources
+        .iter()
+        .filter(|id| ours.contains(**id))
+        .map(|id| format!("{id} Source BODIES"))
+        .chain(
+            unfired_sinks
+                .iter()
+                .filter(|id| ours.contains(**id))
+                .map(|id| format!("{id} Sink OUTPUTS")),
+        )
+        .collect();
+    let unprobed: BTreeSet<_> = report
+        .unprobed
+        .iter()
+        .map(|gap| {
+            let reason = match gap.check {
+                Check::Bodies => "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)",
+                Check::Outputs => "never fired under root: a mutating action is fired only by the pipeline probe (PIPELINE, on an action declaring `content`), so what it serves was not observed",
+                _ => panic!("unexpected coverage gap: {gap:?}"),
+            };
+            assert_eq!(gap.reason, reason, "{gap:?}");
+            format!("{} {:?} {}", gap.endpoint, gap.verb, gap.check)
+        })
+        .collect();
+    assert_eq!(unprobed, expected_unprobed, "{report}");
+
     assert_eq!(report.endpoints, ours.len(), "{report}");
     assert_eq!(
         report.checks.skipped().count(),
@@ -440,7 +502,18 @@ fn conforms() {
     let room = room();
     // The deck listing is bound only where decks are configured, so it is declared here, over
     // the serving kernel, and not in `suite()`, which the pass kernel shares.
+    // BODIES narrows root to scoped grants for the bounded call. The declaration's
+    // `fs:read:*` is a requirement pattern, not a filesystem ACL path; use the same
+    // concrete scratch-root grant for the baseline and bounded calls.
+    let deck_read = Capability::scoped([format!(
+        "urn:cap:fs:read:{}",
+        room._dir.path().join("decks").display()
+    )]);
     let report = suite()
+        .fixture(Fixture::new("urn:cms:decks", Verb::Source).capability(deck_read.clone()))
+        .fixture(Fixture::new("urn:cms:graph:presentations", Verb::Source).capability(deck_read))
+        .body_space(room.space.clone())
+        .body_input_store(room.body_inputs.clone())
         .cacheable("urn:cms:decks")
         .run_blocking(&room.kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
@@ -990,7 +1063,6 @@ fn the_fixture_id_is_the_description_id() {
 fn the_maintenance_kernel_conforms() {
     use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
     use ikigai_secret::Backend;
-    use std::sync::Arc;
 
     /// Every origin the passes reach, canned: routed by URL, always 200.
     struct Canned;
@@ -1025,7 +1097,7 @@ fn the_maintenance_kernel_conforms() {
         .set("zotero-api-key", b"s3cret")
         .expect("seed the key");
     let registry = ikigai_llm::Registry::single(ikigai_llm::OpenAiConfig::ollama("llama3.2"));
-    let kernel = ikigai_cms_web::maintenance::maintenance_kernel(
+    let space = Arc::new(ikigai_cms_web::maintenance::maintenance_space(
         src,
         Some(zotero),
         Some(BOOKMARKS.to_string()),
@@ -1035,9 +1107,15 @@ fn the_maintenance_kernel_conforms() {
         Arc::new(secrets),
         registry,
         "ollama",
-    );
+    ));
+    let body_inputs = Arc::new(MemoryContentStore::new(1024 * 1024));
+    let kernel = Kernel::new(space.clone())
+        .with_clock(Arc::new(ikigai_core::SystemClock))
+        .with_content_store(body_inputs.clone());
 
     let report = suite()
+        .body_space(space)
+        .body_input_store(body_inputs)
         // The pass kernel never has a presentations root (`maintenance_kernel` passes
         // `None`), so its presentations graph is the constant empty document: a pure
         // function of nothing, cached forever correctly. Over the SERVING kernel the same
