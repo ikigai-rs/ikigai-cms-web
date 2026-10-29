@@ -53,7 +53,8 @@ serde_json = "1"
 # first release with the module, and the one whose `html_text` maps C0 controls to U+FFFD, which
 # `tests/vectors/html_vectors.json` (a verbatim copy of ikigai-fn's) pins. `^0.5.0` reads `<0.6.0`.
 # 0.7.0 is its release on core 0.2.0 (ledger #2261), a CEILING crossing (`^0.5.0` = `<0.6.0`).
-ikigai-fn = "0.7.0"
+# 0.8.0 crosses the ^0.7 ceiling: unquoted compose `<iri>` arguments are kernel references (ledger #2617).
+ikigai-fn = "0.8.0"
 
 # The native kernel + server. Gated off wasm — the browser links only the wire codec,
 # never the SPARQL/fs stack.
