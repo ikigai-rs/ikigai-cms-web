@@ -2620,13 +2620,14 @@ mod tests {
     }
 
     /// The shared HTML vectors (FND-H, ledger #1813): `tests/vectors/html_vectors.json` is a
-    /// VERBATIM copy of ikigai-fn's `tests/vectors/html_vectors.json` at ikigai-fn commit 53d50c5
-    /// (ikigai-rs/ikigai-fn PR 18; unchanged through the 0.5.0 release this crate depends on), the
-    /// same file ikigai-python and ikigai-deno pin. To pick up new vectors, copy that file again,
+    /// VERBATIM copy of ikigai-fn's `tests/vectors/html_vectors.json` at ikigai-fn commit
+    /// c5c871a662f36eb978d47b0b0877ea2b5a05a883 (PR 33, version 0.9.0). The XSLT port runs
+    /// the escaping and link cases; it does not run the percent_decode cases, since the
+    /// stylesheets do not implement percent decoding. To pick up new vectors, copy that file again,
     /// unedited, and update the digest below; it stays `eol=lf` through `.gitattributes`.
     const HTML_VECTORS: &str = include_str!("../tests/vectors/html_vectors.json");
     const HTML_VECTORS_SHA256: &str =
-        "e6b3f0aea44302f58ae98e5158ac8d69aef325e91aaa6d7e42b56e18d1a07f91";
+        "af9856c706e04da365aa5b60df37a1950a23632592966ca8db35bf30c2dab8ce";
 
     #[test]
     fn the_html_vectors_are_the_pinned_ikigai_fn_copy_byte_for_byte() {
