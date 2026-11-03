@@ -291,6 +291,9 @@ required-features = ["maintenance"]
 
 [dev-dependencies]
 futures = "0.3"
+# The contrast floor (tests/palette.rs): the ecosystem's own WCAG math and thresholds over the
+# palette `dist/room.css` declares, the way ikigai-gonk's palette test reads them. Tests only.
+ikigai-a11y = "0.5.0"
 # Only the pin on the shared HTML vectors (src/native.rs tests): the copy in tests/vectors/ must be
 # byte-for-byte the file at the ikigai-fn commit it names. The version the lock already holds.
 sha2 = "0.10.9"

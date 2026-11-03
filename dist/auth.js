@@ -1,5 +1,4 @@
-// Passkey auth for the reading room over HTTP — the ONLY app-specific JavaScript in the page,
-// and it does nothing but the standard WebAuthn ceremony: fetch a challenge, hand it to
+// Passkey auth for the reading room over HTTP. It does nothing but the standard WebAuthn ceremony: fetch a challenge, hand it to
 // navigator.credentials, post the result back. The room itself stays pure htmx.
 //
 // It uses the native WebAuthn JSON API (PublicKeyCredential.parse*OptionsFromJSON + cred.toJSON),
@@ -31,6 +30,9 @@
 
   // Reveal the room (and hand control to htmx to load it) or the login panel.
   function show(open, canSignOut) {
+    // Whichever button was just used is about to be hidden, which would drop focus to the body.
+    const used = document.activeElement;
+    const lost = used && used.closest && used.closest("#auth, #auth-logout");
     $("auth").hidden = open;
     $("nav").hidden = !open;
     $("auth-logout").hidden = !canSignOut;
@@ -43,6 +45,11 @@
     } else {
       $("room").innerHTML = "";
       $("linkcheck").innerHTML = "";
+      document.title = "ikigai — reading room";
+    }
+    if (lost) {
+      const next = open ? $("room") : $("auth").querySelector("button:not([hidden])");
+      if (next) next.focus();
     }
   }
 

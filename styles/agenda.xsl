@@ -8,15 +8,16 @@
 
   <xsl:template match="/rdf:RDF">
     <style>.cms-count{color:var(--mut);font-family:ui-monospace,monospace;font-size:12px;margin-bottom:6px}
-.cms-card{display:flex;align-items:baseline;gap:10px;font-family:ui-monospace,monospace;padding:7px 2px;border-bottom:1px solid var(--line)}
-.cms-title{flex:1;color:var(--fg);text-decoration:none;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cms-card{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px;font-family:ui-monospace,monospace;padding:7px 2px;border-bottom:1px solid var(--line)}
+.cms-title{flex:1 1 16ch;min-width:0;color:var(--fg);text-decoration:none;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cms-title:hover{text-decoration:underline}
 .cms-author{color:var(--mut);font-size:12px;font-style:italic;white-space:nowrap}
-.cms-tags{display:flex;gap:6px}
+.cms-tags{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
 .cms-tag{font-size:12px;color:var(--mut);text-decoration:none;cursor:pointer}
 .cms-sug{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--mut);border:1px dashed var(--line);border-radius:10px;padding:0 2px 0 7px}
 .cms-sug-yes,.cms-sug-no{font:12px ui-monospace,monospace;border:none;background:transparent;cursor:pointer;padding:0;line-height:1;min-width:24px;min-height:24px;display:inline-flex;align-items:center;justify-content:center}
-.cms-sug-yes{color:#3a8a3a}.cms-sug-no{color:#c0392b}</style>
+.cms-sug-yes{color:var(--ok)}.cms-sug-no{color:var(--danger)}
+@media (max-width:480px){.cms-title{flex-basis:100%;white-space:normal}}</style>
     <section class="cms-room">
       <div class="cms-count"><xsl:value-of select="count(rdf:Description)"/> resources</div>
       <!-- The cards in the order the reader asked for. The page query chose them, but a CONSTRUCT
@@ -67,9 +68,11 @@
             <input type="hidden" name="book"><xsl:attribute name="value"><xsl:value-of select="../@rdf:about"/></xsl:attribute></input>
             <input type="hidden" name="tag"><xsl:attribute name="value"><xsl:value-of select="."/></xsl:attribute></input>
             <button class="cms-sug-yes" hx-post="/tag/approve" hx-include="closest .cms-sug" hx-target="closest .cms-sug" hx-swap="outerHTML" title="promote to a tag">
+              <xsl:attribute name="aria-label">promote #<xsl:value-of select="."/> to a tag</xsl:attribute>
               <xsl:text>+</xsl:text>
             </button>
             <button class="cms-sug-no" hx-post="/tag/reject" hx-include="closest .cms-sug" hx-target="closest .cms-sug" hx-swap="outerHTML" title="dismiss">
+              <xsl:attribute name="aria-label">dismiss #<xsl:value-of select="."/></xsl:attribute>
               <xsl:text>x</xsl:text>
             </button>
           </span>

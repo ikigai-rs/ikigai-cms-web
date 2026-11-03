@@ -1055,7 +1055,7 @@ fn handle_purge(
         return (
             "200 OK",
             "text/html; charset=utf-8",
-            b"<p class=\"cms-error\">Sign in to purge.</p>".to_vec(),
+            b"<p class=\"cms-error\" role=\"alert\">Sign in to purge.</p>".to_vec(),
         );
     }
     let req = Request::new(Verb::Sink, Iri::parse(purge_iri).expect("valid IRI"));
@@ -1093,7 +1093,7 @@ fn handle_link(
         return (
             "200 OK",
             "text/html; charset=utf-8",
-            b"<span class=\"cms-error\">Sign in to curate links.</span>".to_vec(),
+            b"<span class=\"cms-error\" role=\"alert\">Sign in to curate links.</span>".to_vec(),
         );
     }
     let url = query
@@ -1136,7 +1136,7 @@ fn handle_tag(
         return (
             "200 OK",
             "text/html; charset=utf-8",
-            b"<span class=\"cms-error\">Sign in to curate tags.</span>".to_vec(),
+            b"<span class=\"cms-error\" role=\"alert\">Sign in to curate tags.</span>".to_vec(),
         );
     }
     let (book, tag) = (
@@ -1355,10 +1355,15 @@ fn served_type(repr_type: &ReprType) -> String {
     canonical
 }
 
-/// An inline error fragment (`<{tag} class="cms-error">…</{tag}>`) with the message escaped, so
-/// htmx swaps something visible and nothing the message quotes can become markup.
+/// An inline error fragment (`<{tag} class="cms-error" role="alert">…</{tag}>`) with the message
+/// escaped, so htmx swaps something visible, a screen reader announces it, and nothing the message
+/// quotes can become markup.
 fn error_fragment(tag: &str, message: &str) -> Vec<u8> {
-    format!("<{tag} class=\"cms-error\">{}</{tag}>", html_text(message)).into_bytes()
+    format!(
+        "<{tag} class=\"cms-error\" role=\"alert\">{}</{tag}>",
+        html_text(message)
+    )
+    .into_bytes()
 }
 
 /// Minimal percent-decoding for a URL path/query segment (`%XX` and `+`→space).

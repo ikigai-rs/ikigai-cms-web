@@ -39,6 +39,11 @@
           <xsl:attribute name="class"><xsl:value-of select="$class"/></xsl:attribute>
           <xsl:attribute name="href"><xsl:value-of select="$href"/></xsl:attribute>
           <xsl:value-of select="$label"/>
+          <!-- A card opens in a new tab: say so, to the eye and to a screen reader (ledger #1641). The
+               spaces are inside the spans, since the engine drops a whitespace-only text node and
+               an element boundary alone would run the words together in a link's name. -->
+          <span class="cms-newtab" aria-hidden="true"> &#8599;</span>
+          <span class="visually-hidden"> (opens in a new tab)</span>
         </a>
       </xsl:when>
       <xsl:otherwise>

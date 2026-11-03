@@ -1350,7 +1350,7 @@ fn pager_html(iri: &str, offset: usize, total: usize) -> String {
             format!("<span class=\"cms-page cms-page-off\">{label}</span>")
         }
     };
-    let mut nav = String::from("<nav class=\"cms-pager\">");
+    let mut nav = String::from("<nav class=\"cms-pager\" aria-label=\"pages\">");
     nav.push_str(&ctl(!at_start, 0, "« first"));
     nav.push_str(&ctl(!at_start, offset.saturating_sub(PAGE_SIZE), "‹ prev"));
     nav.push_str(&format!(
@@ -1410,6 +1410,11 @@ fn facet_html(ctx: &ViewCtx<'_>) -> String {
         Facet::Search(q) => (format!("&ldquo;{}&rdquo;", html_text(q)), "urn:cms:tags"),
         Facet::Type(t) => (type_label(t).to_string(), "urn:cms:types"),
     };
+    // Fixed text, not the facet: it goes into two attributes and needs no escaping.
+    let clear_name = match ctx.facet {
+        Facet::Type(_) => "clear, back to the type index",
+        Facet::Tag(_) | Facet::Search(_) => "clear, back to the tag index",
+    };
     let scope = match ctx.type_scope {
         Some(s) if !s.is_empty() => {
             format!(
@@ -1420,28 +1425,34 @@ fn facet_html(ctx: &ViewCtx<'_>) -> String {
         _ => String::new(),
     };
     format!(
-        "<div class=\"cms-facet\"><span class=\"cms-facet-label\">{label}</span>{scope}\
-         <button class=\"cms-facet-clear\" hx-get=\"/r/{clear_iri}\" title=\"clear\">&times;</button></div>"
+        "<div class=\"cms-facet\"><h2 class=\"cms-facet-label\">{label}</h2>{scope}\
+         <button class=\"cms-facet-clear\" hx-get=\"/r/{clear_iri}\" title=\"{clear_name}\" \
+         aria-label=\"{clear_name}\">&times;</button></div>"
     )
 }
 
 /// The restyle + sort toolbar. Each control overrides exactly ONE axis (style or dir) via its
 /// own `hx-vals` and inherits the rest from the enclosing `.cms-view` wrapper — so restyling
 /// keeps the tag/query and resorting keeps the style, with no context baked into the link.
-/// Overriding only style/dir (never offset) means both actions land back on page one. The
-/// current selection renders inert (a `<span>`), the alternatives as buttons. Markup-only.
+/// Overriding only style/dir (never offset) means both actions land back on page one. Each group
+/// is a set of toggle buttons: the current selection is `aria-pressed="true"` and does nothing,
+/// so its state is announced, not only drawn. Markup-only.
 fn toolbar_html(ctx: &ViewCtx<'_>) -> String {
     let iri = ctx.iri;
     let seg = |current: bool, overrides: &str, label: &str| -> String {
         if current {
-            format!("<span class=\"cms-seg-btn is-active\">{label}</span>")
+            format!(
+                "<button class=\"cms-seg-btn is-active\" type=\"button\" aria-pressed=\"true\">{label}</button>"
+            )
         } else {
             format!(
-                "<button class=\"cms-seg-btn\" hx-get=\"/r/{iri}\" hx-vals='{overrides}'>{label}</button>"
+                "<button class=\"cms-seg-btn\" type=\"button\" aria-pressed=\"false\" hx-get=\"/r/{iri}\" hx-vals='{overrides}'>{label}</button>"
             )
         }
     };
-    let mut t = String::from("<div class=\"cms-toolbar\"><div class=\"cms-seg\">");
+    let mut t = String::from(
+        "<div class=\"cms-toolbar\"><div class=\"cms-seg\" role=\"group\" aria-label=\"style\">",
+    );
     t.push_str(&seg(
         ctx.style == "catalog",
         "{\"style\":\"catalog\"}",
@@ -1457,7 +1468,7 @@ fn toolbar_html(ctx: &ViewCtx<'_>) -> String {
         "{\"style\":\"agenda\"}",
         "Agenda",
     ));
-    t.push_str("</div><div class=\"cms-seg\">");
+    t.push_str("</div><div class=\"cms-seg\" role=\"group\" aria-label=\"sort\">");
     t.push_str(&seg(ctx.dir == "asc", "{\"dir\":\"asc\"}", "A\u{2192}Z"));
     t.push_str(&seg(ctx.dir == "desc", "{\"dir\":\"desc\"}", "Z\u{2192}A"));
     t.push_str("</div></div>");
@@ -1997,22 +2008,26 @@ mod tests {
             html.contains("class=\"cms-facet-clear\" hx-get=\"/r/urn:cms:tags\""),
             "clear returns to the tag index: {html}"
         );
-        // Toolbar: the current style is inert; an alternative overrides only `style` via its own
+        // Toolbar: the current style is a pressed button that requests nothing; an alternative overrides only `style` via its own
         // hx-vals (dir/type/q ride the inherited wrapper), and re-requests the same view IRI.
         assert!(
-            html.contains("<span class=\"cms-seg-btn is-active\">Mosaic</span>"),
-            "the active style is inert: {html}"
+            html.contains(
+                "<button class=\"cms-seg-btn is-active\" type=\"button\" aria-pressed=\"true\">Mosaic</button>"
+            ),
+            "the active style is pressed and inert: {html}"
         );
         assert!(
             html.contains(
-                "<button class=\"cms-seg-btn\" hx-get=\"/r/urn:cms:view:quic\" \
-                 hx-vals='{\"style\":\"catalog\"}'>Catalog</button>"
+                "<button class=\"cms-seg-btn\" type=\"button\" aria-pressed=\"false\" \
+                 hx-get=\"/r/urn:cms:view:quic\" hx-vals='{\"style\":\"catalog\"}'>Catalog</button>"
             ),
             "restyle overrides only style: {html}"
         );
         // Sort: default asc is active; Z→A overrides only `dir`.
         assert!(
-            html.contains("<span class=\"cms-seg-btn is-active\">A\u{2192}Z</span>"),
+            html.contains(
+                "<button class=\"cms-seg-btn is-active\" type=\"button\" aria-pressed=\"true\">A\u{2192}Z</button>"
+            ),
             "ascending is the default active sort: {html}"
         );
         assert!(

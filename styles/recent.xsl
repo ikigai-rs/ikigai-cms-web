@@ -11,10 +11,11 @@
   <xsl:template match="/r:recent">
     <style>
       .cms-recent{display:flex;flex-direction:column;gap:6px;padding:4px 0}
-      .cms-recent-item{padding:8px 12px;border:1px solid var(--cms-border,rgba(128,128,128,.35));border-radius:10px;text-decoration:none;color:inherit;cursor:pointer}
-      .cms-recent-item:hover{background:var(--cms-accent-soft,rgba(128,128,128,.14))}
-      .cms-recent-empty{color:var(--cms-mut,rgba(128,128,128,.85));font-size:.95rem;padding:4px 0}
+      .cms-recent-item{padding:8px 12px;border:1px solid var(--cms-border);border-radius:10px;text-decoration:none;color:inherit;cursor:pointer}
+      .cms-recent-item:hover{background:var(--cms-accent-soft)}
+      .cms-recent-empty{color:var(--mut);font-size:.95rem;padding:4px 0}
     </style>
+    <h2 class="cms-view-title">Recent</h2>
     <section class="cms-recent">
       <xsl:apply-templates/>
     </section>
