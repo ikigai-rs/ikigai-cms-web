@@ -13,11 +13,15 @@
      and the room uses no htmx indicator. -->
 <meta name="htmx-config" content='{"allowEval":false,"includeIndicatorStyles":false}' />
 <!-- Vendored htmx (self-contained, no CDN). The whole room is htmx attributes over the
-     `/r/{iri}` HTTP routes — no custom application JavaScript. -->
+     `/r/{iri}` HTTP routes; the room's behavior is declared there. -->
 <script src="htmx.min.js"></script>
-<!-- The one bit of app JS: the standard WebAuthn passkey ceremony (isolated from the room).
+<!-- One bit of app JS: the standard WebAuthn passkey ceremony (isolated from the room).
      Deferred so the DOM + htmx global are ready when it runs. -->
 <script src="auth.js" defer></script>
+<!-- The other bit: when a swap removes the control that had focus, put focus somewhere useful, and
+     name the view (the title, a live status line). htmx has no attribute for "only if focus was
+     lost". Deferred for the same reason. -->
+<script src="room.js" defer></script>
 <!-- Optional WebTransport transport: when a signed-in page can reach cms-server over QUIC, the
      /r/ requests ride the wire instead of HTTP (htmx untouched, HTTP fallback). A module (it
      imports the wasm wire codec); runs after the DOM, like the deferred scripts. -->
@@ -39,6 +43,23 @@
           hx-target="this"></span>
   </header>
 
+  <!-- Navigation: every control is vanilla htmx over the /r/ HTTP routes. hx-target/hx-swap
+       set here are inherited by the buttons, the search form, AND everything swapped into
+       #room (so a card's tag chips and the pager navigate the same way). Hidden until sign-in. -->
+  <nav id="nav" class="nav" aria-label="library" hx-target="#room" hx-swap="innerHTML" hidden>
+    <button hx-get="/r/urn:cms:tags">tags</button>
+    <button hx-get="/r/urn:cms:types">types</button>
+    <button hx-get="/r/urn:cms:recent">recent</button>
+    <button hx-get="/r/urn:cms:review">dead links</button>
+    <form role="search" hx-get="/r/urn:cms:search">
+      <label for="search-q">search titles</label>
+      <input id="search-q" name="q" type="search" autocomplete="off" spellcheck="false" />
+    </form>
+    <span id="wire-status" class="wire-status" aria-live="polite"></span>
+    <button id="auth-logout" class="nav-signout" type="button" hidden>sign out</button>
+  </nav>
+
+  <main>
   <!-- Passkey login. Shown until a session is established; auth.js runs the WebAuthn ceremony
        against the /auth/* routes, then reveals the nav + loads the room. -->
   <section id="auth" class="auth" hidden>
@@ -46,28 +67,17 @@
     <p>A personal semantic library. Sign in with your passkey to enter.</p>
     <button id="auth-login" hidden>Sign in</button>
     <button id="auth-enroll" hidden>Enroll a passkey</button>
-    <div id="auth-status" class="auth-status"></div>
+    <div id="auth-status" class="auth-status" role="alert"></div>
   </section>
-
-  <!-- Navigation: every control is vanilla htmx over the /r/ HTTP routes. hx-target/hx-swap
-       set here are inherited by the buttons, the search form, AND everything swapped into
-       #room (so a card's tag chips and the pager navigate the same way). Hidden until sign-in. -->
-  <nav id="nav" class="nav" hx-target="#room" hx-swap="innerHTML" hidden>
-    <button hx-get="/r/urn:cms:tags">tags</button>
-    <button hx-get="/r/urn:cms:types">types</button>
-    <button hx-get="/r/urn:cms:recent">recent</button>
-    <button hx-get="/r/urn:cms:review">dead links</button>
-    <form hx-get="/r/urn:cms:search">
-      <input name="q" type="search" placeholder="search titles…" autocomplete="off" spellcheck="false" />
-    </form>
-    <span id="wire-status" class="wire-status" aria-live="polite"></span>
-    <button id="auth-logout" class="nav-signout" type="button" hidden>sign out</button>
-  </nav>
 
   <!-- The reading room. auth.js loads the tag index once a session exists (so it isn't
        requested before login); each fragment carries its view context as an inherited
        hx-vals wrapper, so paging/tag clicks preserve it. -->
-  <div id="room" hx-target="#room" hx-swap="innerHTML"></div>
+  <!-- tabindex: room.js and auth.js move focus here when the control that had it is gone. -->
+  <div id="room" tabindex="-1" hx-target="#room" hx-swap="innerHTML"></div>
+  <!-- A view that opens while focus stays put (the navigation bar) is named here by room.js. -->
+  <div id="room-status" class="visually-hidden" role="status"></div>
+  </main>
 </div>
 </body>
 </html>

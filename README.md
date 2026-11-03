@@ -209,10 +209,10 @@ components are the interactive islands (the WebGPU graph).
 ## Accessibility
 
 The room targets WCAG 2.2 AA and makes no conformance claim. [ACCESSIBILITY.md](ACCESSIBILITY.md)
-says what has been checked (one axe run in Chrome, signed in through a virtual authenticator, in
-both color schemes), what has not (no screen reader, no check in CI), and the barriers known
-today, among them that the tag chips cannot be reached by keyboard. Report a barrier with an issue
-labeled `accessibility`.
+says what has been checked (axe runs in Chrome and Chromium in both color schemes; in CI, the
+palette's contrast floor and the markup), what has not (no screen reader, no browser in CI, and in
+the latest run no real passkey ceremony), and the barriers known today. Report a barrier with an
+issue labeled `accessibility`.
 
 ## Conformance
 
@@ -358,3 +358,17 @@ names, then `cargo install --path . --features server --locked --force` and re-r
 
 Reinstall: `cargo install --path . --features server --locked --force` and re-register
 `dev.ikigai-rs.cms`. The browser codec did not change.
+
+### 2026-11-02: the room's accessibility barriers
+
+- **`dist/` changed, and a new file joined it.** `dist/room.js` is new, and `index.html`, `auth.js`,
+  `wire.js` and `room.css` moved with the server's views: every view now names its colors through
+  tokens only `room.css` declares. So a service whose `dist` directory in `cms.toml` is not this
+  checkout's `dist/` must copy those five files there along with the new binary; a new binary over
+  an old `room.css` draws those colors as its inherited text color.
+- **The palette has a floor.** `tests/palette.rs` holds every text pair to `ikigai-a11y`'s contrast
+  floor in both schemes. The light scheme's muted text is darker, and several colors changed; a
+  new color is a token in `room.css` with its pairs in that test.
+- **What a person sees differently:** a visible "search titles" label instead of a placeholder, a
+  heading on every view, an arrow on a link that opens a new tab, and an Agenda row that wraps
+  rather than losing its title on a narrow screen. See [ACCESSIBILITY.md](ACCESSIBILITY.md).

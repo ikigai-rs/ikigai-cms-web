@@ -150,7 +150,11 @@ document.body.addEventListener("htmx:beforeRequest", (evt) => {
   }
   const swapStyle = (elt.getAttribute("hx-swap") || "innerHTML").split(" ")[0];
   wireCall(encodeIssue(pathIri(iriEnc), JSON.stringify(args)))
-    .then((html) => htmx.swap(target, html, { swapStyle }))
+    .then((html) => {
+      htmx.swap(target, html, { swapStyle });
+      // htmx.swap fires no afterRequest; room.js moves focus and names the view on this instead.
+      document.body.dispatchEvent(new CustomEvent("cms:swapped", { detail: { target } }));
+    })
     .catch(() => {
       // Wire failed mid-request → drop to HTTP for this request and everything after it.
       drop();

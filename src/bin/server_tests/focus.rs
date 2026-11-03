@@ -16,7 +16,8 @@
 //!
 //! The same views also hold this file's pointer check, the target size of the suggestion buttons
 //! (ledger #1672, SC 2.5.8), and the separation of a chip's words in its name from content
-//! (ledger #1716), at the end.
+//! (ledger #1716), at the end, and what a screen reader is told (ledger #1641): names, state,
+//! headings, landmarks, live regions and new-tab warnings, as markup.
 
 use std::path::Path;
 
@@ -420,4 +421,224 @@ fn the_name_check_sees_words_joined_by_an_element_boundary() {
             ("#solo".to_string(), "#solo".to_string()),
         ]
     );
+}
+
+/// Every start tag of `element` in `html` with `class` among its classes.
+fn tags_with<'a>(html: &'a str, element: &str, class: &str) -> Vec<&'a str> {
+    start_tags(html, element)
+        .into_iter()
+        .filter(|tag| attr(tag, "class").is_some_and(|c| c.split(' ').any(|k| k == class)))
+        .collect()
+}
+
+/// Every start tag of `element` in `html`.
+fn start_tags<'a>(html: &'a str, element: &str) -> Vec<&'a str> {
+    let open = format!("<{element}");
+    html.match_indices(&open)
+        .filter(|(i, _)| {
+            html[i + open.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == ' ' || c == '>' || c == '/')
+        })
+        .map(|(i, _)| &html[i..i + html[i..].find('>').unwrap() + 1])
+        .collect()
+}
+
+/// A room with one suggestion on the quic bookmark, the same way `suggestion_buttons` seeds it.
+fn room_with_suggestion(dir: &Path) -> Kernel {
+    let k = room(dir);
+    let select = Request::new(Verb::Source, Iri::parse("urn:sparql:select").unwrap())
+        .with_arg(
+            "query",
+            ArgRef::Inline(
+                b"SELECT ?s WHERE { ?s <http://purl.org/dc/elements/1.1/subject> \"quic\" }"
+                    .to_vec(),
+            ),
+        )
+        .with_arg("graph", ArgRef::Inline(b"urn:cms:graph".to_vec()));
+    let (rows, _) = Resolver::issue_as(&k, select, &Capability::root()).expect("select");
+    let rows: serde_json::Value = serde_json::from_slice(&rows.bytes).unwrap();
+    let book = rows["results"]["bindings"][0]["s"]["value"]
+        .as_str()
+        .expect("the quic bookmark")
+        .to_string();
+    ikigai_cms_web::tagstore::TagPaths::in_dir(dir).add_suggestion(&book, "sug\"gested");
+    k
+}
+
+/// The `+`, `x` and `×` buttons say what they do and to what (SC 2.4.6, 4.1.2), and a tag cannot
+/// break out of the attribute that names it.
+#[test]
+fn symbol_buttons_are_named_for_their_purpose() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room_with_suggestion(dir.path());
+    let recent = RecentLog::default();
+    for style in ["catalog", "mosaic", "agenda"] {
+        let html = get(&k, &recent, &format!("urn:cms:view:quic?style={style}"));
+        let yes = tags_with(&html, "button", "cms-sug-yes");
+        let no = tags_with(&html, "button", "cms-sug-no");
+        assert_eq!((yes.len(), no.len()), (1, 1), "{style}: {html}");
+        let escaped = |name: &str| name.replace('"', "&quot;");
+        assert!(
+            [
+                "promote #sug\"gested to a tag",
+                &escaped("promote #sug\"gested to a tag")
+            ]
+            .contains(&attr(yes[0], "aria-label").unwrap_or_default()),
+            "{style}: {}",
+            yes[0]
+        );
+        assert!(
+            ["dismiss #sug\"gested", &escaped("dismiss #sug\"gested")]
+                .contains(&attr(no[0], "aria-label").unwrap_or_default()),
+            "{style}: {}",
+            no[0]
+        );
+        let clear = tags_with(&html, "button", "cms-facet-clear");
+        assert_eq!(
+            attr(clear[0], "aria-label"),
+            Some("clear, back to the tag index"),
+            "{style}"
+        );
+    }
+}
+
+/// The current style and sort are announced as a state, not only drawn (SC 1.3.1, 4.1.2).
+#[test]
+fn the_selected_style_and_sort_carry_a_pressed_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room(dir.path());
+    let recent = RecentLog::default();
+    let html = get(&k, &recent, "urn:cms:view:quic?style=mosaic&dir=desc");
+    let toggles = tags_with(&html, "button", "cms-seg-btn");
+    assert_eq!(toggles.len(), 5, "{html}");
+    let pressed: Vec<&&str> = toggles
+        .iter()
+        .filter(|t| attr(t, "aria-pressed") == Some("true"))
+        .collect();
+    assert_eq!(pressed.len(), 2, "one style and one sort: {html}");
+    for tag in &toggles {
+        let on = attr(tag, "aria-pressed") == Some("true");
+        assert_eq!(on, attr(tag, "hx-get").is_none(), "{tag}");
+        assert_eq!(on, tag.contains("is-active"), "{tag}");
+    }
+    assert!(html.contains(">Mosaic</button>") && html.contains(">Z\u{2192}A</button>"));
+    for group in ["style", "sort"] {
+        assert!(
+            html.contains(&format!("role=\"group\" aria-label=\"{group}\"")),
+            "{group}: {html}"
+        );
+    }
+}
+
+/// Every view opens with a heading of its own, which is what the title and focus are set from
+/// (`dist/room.js`), and a card that opens a new tab says so.
+#[test]
+fn each_view_has_a_heading_and_a_new_tab_is_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room(dir.path());
+    let recent = RecentLog::default();
+    for (target, heading) in [
+        ("urn:cms:tags", ">Tags</h2>"),
+        ("urn:cms:types", ">Types</h2>"),
+        ("urn:cms:recent", ">Recent</h2>"),
+        ("urn:cms:review", ">Dead links</h2>"),
+        ("urn:cms:view:quic", ">#quic</h2>"),
+        ("urn:cms:search?q=quic", "</h2>"),
+    ] {
+        let html = get(&k, &recent, target);
+        assert!(html.contains(heading), "{target}: {html}");
+        assert_eq!(html.matches("<h2").count(), 1, "{target}: {html}");
+    }
+    for style in ["catalog", "mosaic", "agenda"] {
+        let html = get(&k, &recent, &format!("urn:cms:view:quic?style={style}"));
+        let opens_a_tab = html.matches("_blank").count();
+        assert!(opens_a_tab > 0, "{style}: {html}");
+        assert_eq!(
+            html.matches("(opens in a new tab)").count(),
+            opens_a_tab,
+            "{style}: {html}"
+        );
+    }
+}
+
+/// The search field has a visible label, not only a placeholder (SC 3.3.2); the page has a `main`
+/// and its navs are told apart (axe `landmark-one-main`, `region`, `landmark-unique`); a failure
+/// on the sign-in panel is announced (SC 4.1.3); the focus script is loaded (SC 2.4.3).
+#[test]
+fn the_page_shell_labels_its_landmarks_and_regions() {
+    let page = include_str!("../../../dist/index.html");
+    // Comments mention elements by name; only the markup counts.
+    let mut markup = String::new();
+    let mut rest = page;
+    while let Some((before, after)) = rest.split_once("<!--") {
+        markup.push_str(before);
+        rest = after.split_once("-->").expect("a closed comment").1;
+    }
+    markup.push_str(rest);
+
+    let input = start_tags(&markup, "input")[0];
+    assert_eq!(attr(input, "name"), Some("q"));
+    assert!(attr(input, "placeholder").is_none(), "{input}");
+    let label = format!(
+        "<label for=\"{}\">search titles</label>",
+        attr(input, "id").unwrap()
+    );
+    assert!(markup.contains(&label), "{markup}");
+    assert!(markup.contains("<form role=\"search\""), "{markup}");
+
+    assert_eq!(start_tags(&markup, "main").len(), 1, "{markup}");
+    let (before, inside) = markup.split_once("<main>").expect("a plain <main>");
+    for id in ["id=\"auth\"", "id=\"room\"", "id=\"room-status\""] {
+        assert!(inside.contains(id), "{id} is outside <main>");
+    }
+    let nav = start_tags(before, "nav");
+    assert_eq!(attr(nav[0], "aria-label"), Some("library"));
+
+    assert!(markup.contains("id=\"auth-status\" class=\"auth-status\" role=\"alert\""));
+    assert!(markup.contains("id=\"room-status\" class=\"visually-hidden\" role=\"status\""));
+    assert!(markup.contains("<script src=\"room.js\" defer></script>"));
+    assert!(include_str!("../../../dist/room.js").contains("htmx:beforeRequest"));
+    assert!(include_str!("../../../dist/wire.js").contains("cms:swapped"));
+}
+
+/// The pager's nav is told apart from the page's, and a failed view is announced (SC 4.1.3).
+#[test]
+fn the_pager_is_named_and_an_error_fragment_is_an_alert() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = room(dir.path());
+    let recent = RecentLog::default();
+    let html = get(&k, &recent, "urn:cms:no-such-view");
+    assert!(
+        html.contains("class=\"cms-error\" role=\"alert\""),
+        "{html}"
+    );
+    let org: String = std::iter::once("* Bookmarks\n".to_string())
+        .chain((0..61).map(|i| {
+            format!(
+                "** [[https://p.example/{i}][P {i}]]\n   :PROPERTIES:\n   :TAGS: paged\n   :END:\n"
+            )
+        }))
+        .collect();
+    std::fs::write(dir.path().join("old-org/pinboard-bookmarks.org"), org).unwrap();
+    let k = room_over_current_file(dir.path());
+    let html = get(&k, &recent, "urn:cms:view:paged");
+    assert_eq!(
+        attr(start_tags(&html, "nav")[0], "aria-label"),
+        Some("pages"),
+        "{html}"
+    );
+}
+
+/// A kernel over whatever bookmarks file is already in `dir`.
+fn room_over_current_file(dir: &Path) -> Kernel {
+    ikigai_cms_web::build_cms_kernel_with(
+        dir.to_path_buf(),
+        None,
+        None,
+        None,
+        ikigai_cms_web::tagstore::TagPaths::in_dir(dir),
+        Some(dir.join("cms-linkstatus.json")),
+    )
 }

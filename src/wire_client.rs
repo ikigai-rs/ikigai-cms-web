@@ -62,7 +62,7 @@ pub fn decode_reply(bytes: Vec<u8>) -> String {
 
 fn error_html(msg: &str) -> String {
     format!(
-        "<p class=\"cms-error\">{}</p>",
+        "<p class=\"cms-error\" role=\"alert\">{}</p>",
         ikigai_fn::html::html_text(msg)
     )
 }

@@ -11,10 +11,11 @@
   <xsl:template match="/sr:sparql">
     <style>
       .cms-tags{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0;align-content:flex-start}
-      .cms-tag{display:inline-flex;align-items:baseline;gap:6px;padding:6px 12px;border:1px solid var(--cms-border,rgba(128,128,128,.35));border-radius:999px;text-decoration:none;color:inherit;cursor:pointer;font-size:.95rem}
-      .cms-tag:hover{background:var(--cms-accent-soft,rgba(128,128,128,.14))}
-      .cms-tag-n{font-size:.78em;opacity:.6}
+      .cms-tag{display:inline-flex;align-items:baseline;gap:6px;padding:6px 12px;border:1px solid var(--cms-border);border-radius:999px;text-decoration:none;color:inherit;cursor:pointer;font-size:.95rem}
+      .cms-tag:hover{background:var(--cms-accent-soft)}
+      .cms-tag-n{font-size:.78em;color:var(--mut)}
     </style>
+    <h2 class="cms-view-title">Tags</h2>
     <section class="cms-tags">
       <xsl:apply-templates select="sr:results/sr:result"/>
     </section>

@@ -1473,7 +1473,7 @@ impl PurgeView {
         let now = unix_now();
         let n = self.set.candidates(&cache, now).len();
         if n == 0 {
-            return "<div class=\"cms-purge\"><p>Nothing to purge.</p>\
+            return "<div class=\"cms-purge\"><h2 class=\"cms-view-title\">Purge dead links</h2><p>Nothing to purge.</p>\
                 <button hx-get=\"/r/urn:cms:review\">back</button></div>"
                 .to_string();
         }
@@ -1498,7 +1498,7 @@ impl PurgeView {
             ),
         };
         format!(
-            "<div class=\"cms-purge\"><p>Remove {what} from the bookmarks file? A backup is saved \
+            "<div class=\"cms-purge\"><h2 class=\"cms-view-title\">Purge dead links</h2><p>Remove {what} from the bookmarks file? A backup is saved \
              first — this can't be undone from the room.</p>\
              <button class=\"cms-purge-go\" hx-post=\"{}\">Confirm purge</button> \
              <button hx-get=\"/r/urn:cms:review\">Cancel</button></div>",
@@ -1517,7 +1517,7 @@ impl PurgeView {
         let removable: HashSet<String> = self.set.candidates(&cache, now);
         if removable.is_empty() {
             return Ok(fragment(
-                "<div class=\"cms-purge\"><p>Nothing to purge.</p></div>".to_string(),
+                "<div class=\"cms-purge\"><h2 class=\"cms-view-title\">Purge dead links</h2><p>Nothing to purge.</p></div>".to_string(),
             ));
         }
         let refs: HashSet<&str> = removable.iter().map(String::as_str).collect();
@@ -1531,7 +1531,7 @@ impl PurgeView {
         })
         .map_err(|e| Error::Endpoint(format!("write the link status cache: {e}")))?;
         Ok(fragment(format!(
-            "<div class=\"cms-purge\"><p>Removed <b>{}</b> dead links · backup saved. The room has \
+            "<div class=\"cms-purge\"><h2 class=\"cms-view-title\">Purge dead links</h2><p>Removed <b>{}</b> dead links · backup saved. The room has \
              refreshed.</p><button hx-get=\"/r/urn:cms:tags\">back to the room</button></div>",
             group(removed)
         )))
