@@ -83,13 +83,21 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
 impl ReqwestTransport {
-    /// A client with a per-request timeout and a polite user-agent (redirects followed by
-    /// default). Panics if not called within a tokio runtime — it needs a handle to spawn onto.
+    /// A client with a per-request timeout and a polite user-agent that never follows a
+    /// redirect. Panics if not called within a tokio runtime — it needs a handle to spawn onto.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(TOTAL_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent("ikigai-cms-linkcheck")
+            // ikigai-http's host-transport contract: a 3xx comes back as-is. The endpoint follows
+            // it (GET/HEAD only, at most 5 hops) and re-runs the capability ACL against every
+            // hop, which it cannot do for a hop the transport took on its own: reqwest's default
+            // policy sent the request, its custom headers (the `Zotero-API-Key`) and a `Referer`
+            // to whatever host the `Location` named (ledger #3466). The link check still follows
+            // redirects, through the endpoint. The LLM calls use this transport directly, so a
+            // provider's 3xx now comes back to ikigai-llm instead of being followed to its target.
+            .redirect(reqwest::redirect::Policy::none())
             // Every bookmark is a different host, so a per-host idle keep-alive pool is useless and
             // harmful: it accumulates hundreds of open connections and starves DNS/sockets, which
             // shows up as spurious "error sending request" once the pass has run for a while. Don't
@@ -900,7 +908,24 @@ async fn check_once(inv: &Invocation<'_>, url: &str) -> Outcome {
             }
         },
         Err(e) if e.is_transient() => transport_outcome(e.to_string()),
-        Err(_) => Outcome::Alive,
+        Err(e) => answered_failure(e),
+    }
+}
+
+/// A non-transient failure: a status the server answered with, so the link is alive — except a
+/// redirect chain ikigai-http's endpoint gave up on (a loop past its hop limit, or a `Location`
+/// that does not parse). The transport used to follow redirects itself and reported a loop as a
+/// failure past the door ([`REFUSED_MARKER`]); the endpoint follows them now (ledger #3466) and
+/// reports it as a plain endpoint error, which would read as alive. A server that only ever
+/// redirects never produced an answer about the page, so it stays `refused`, as the review says.
+fn answered_failure(e: Error) -> Outcome {
+    match e {
+        Error::Endpoint(why)
+            if why.starts_with("too many redirects") || why.starts_with("invalid redirect") =>
+        {
+            Outcome::Refused(why)
+        }
+        _ => Outcome::Alive,
     }
 }
 
@@ -962,7 +987,7 @@ async fn confirm_gone_with_get(inv: &Invocation<'_>, url: &str) -> Outcome {
         Ok(_) => Outcome::Alive,
         Err(Error::NotFound(_)) => Outcome::Gone("HTTP 404/410 (GET-confirmed)".to_string()),
         Err(e) if e.is_transient() => transport_outcome(e.to_string()),
-        Err(_) => Outcome::Alive,
+        Err(e) => answered_failure(e),
     }
 }
 
@@ -2642,6 +2667,190 @@ mod tests {
         let body = futures::executor::block_on(reply.body.collect(1024)).expect("the body");
         assert_eq!(body, b"hello world");
         origin.join().expect("origin");
+    }
+
+    /// A scratch HTTP/1.1 origin on its own loopback port. Every connection gets one reply,
+    /// `reply(request_head)`, and then the connection closes; each request head it read goes down
+    /// the returned channel, so a test can see what reached it (and with which headers). The
+    /// accept loop never ends on its own: the test process reaps it.
+    fn scratch_origin(
+        reply: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen, heads) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = stream.write_all(reply(&head).as_bytes());
+                let _ = stream.flush();
+                let _ = seen.send(head);
+            }
+        });
+        (port, heads)
+    }
+
+    /// The path on a request head's request line.
+    fn request_path(head: &str) -> &str {
+        head.split_whitespace().nth(1).unwrap_or("")
+    }
+
+    fn redirect_reply(status: u16, location: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} Moved\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        )
+    }
+
+    fn status_reply(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A transport built inside a fresh runtime, which is returned to keep it alive.
+    fn reqwest_transport() -> (tokio::runtime::Runtime, ReqwestTransport) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let transport = {
+            let _guard = rt.enter();
+            ReqwestTransport::new()
+        };
+        (rt, transport)
+    }
+
+    /// ikigai-http's host-transport contract (its crate doc, "Redirects"): a transport returns a
+    /// 3xx as-is and never follows it, because only the endpoint can re-run the capability ACL
+    /// against the redirect target (ledger #3466). Two scratch origins on two ports: the first
+    /// 302s to the second. The transport hands back the 302, and the second origin never hears
+    /// from it, so neither the request nor its `Zotero-API-Key` header gets there.
+    #[test]
+    fn the_reqwest_transport_returns_a_redirect_as_is() {
+        let (_rt, transport) = reqwest_transport();
+        let (second, second_seen) = scratch_origin(|_| status_reply(200, "second"));
+        let target = format!("http://127.0.0.1:{second}/landed");
+        let (first, first_seen) = {
+            let target = target.clone();
+            scratch_origin(move |_| redirect_reply(302, &target))
+        };
+        let reply = futures::executor::block_on(transport.send(HttpRequest {
+            method: ikigai_http::Method::Get,
+            url: format!("http://127.0.0.1:{first}/items"),
+            headers: vec![("Zotero-API-Key".into(), "scratch-key-3466".into())],
+            body: Vec::new(),
+        }))
+        .expect("a response");
+        let head = first_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first origin was asked");
+        assert!(
+            head.contains("scratch-key-3466"),
+            "the first origin got the key: {head}"
+        );
+        if let Ok(head) = second_seen.recv_timeout(Duration::from_millis(500)) {
+            panic!("the transport followed the redirect itself; the second origin got:\n{head}");
+        }
+        assert_eq!(reply.status, 302);
+        assert_eq!(reply.header("location"), Some(target.as_str()));
+    }
+
+    /// The same two origins, through `urn:http:get` under a capability granting only the first:
+    /// the endpoint follows the 302, re-runs the ACL against the second origin's port, and
+    /// refuses it with a typed `Denied`. The second origin never sees the request or the key.
+    #[test]
+    fn a_redirect_to_an_ungranted_port_is_denied_and_never_sent() {
+        let (_rt, transport) = reqwest_transport();
+        let kernel = Kernel::new(Arc::new(ikigai_http::space(Arc::new(transport))));
+        let (second, second_seen) = scratch_origin(|_| status_reply(200, "second"));
+        let (first, _) =
+            scratch_origin(move |_| redirect_reply(302, &format!("http://127.0.0.1:{second}/")));
+        let cap = Capability::scoped([format!("urn:cap:net:127.0.0.1:{first}")]);
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg(
+                "url",
+                ArgRef::Inline(format!("http://127.0.0.1:{first}/items").into_bytes()),
+            )
+            .with_arg(
+                "headers",
+                ArgRef::Inline(b"Zotero-API-Key: scratch-key-3466".to_vec()),
+            );
+        let result = futures::executor::block_on(kernel.issue(request, &cap));
+        if let Ok(head) = second_seen.recv_timeout(Duration::from_millis(500)) {
+            panic!("the request reached an ungranted origin:\n{head}");
+        }
+        match result {
+            Err(Error::Denied(why)) => assert!(why.contains("redirect target"), "{why}"),
+            other => panic!("expected a Denied redirect target, got {other:?}"),
+        }
+    }
+
+    /// The link check still follows redirects, now in ikigai-http's endpoint rather than in the
+    /// transport: a bookmark that redirects to a live page is `ok`, one that redirects to a page
+    /// that 404s on HEAD and GET is `gone`, and one that redirects forever is `refused`, as the
+    /// review has always said of a redirect loop.
+    #[test]
+    fn the_link_check_follows_redirects_through_the_endpoint() {
+        let (_rt, transport) = reqwest_transport();
+        let (second, _) = scratch_origin(|head| match request_path(head) {
+            "/alive" => status_reply(200, "alive"),
+            _ => status_reply(404, "missing"),
+        });
+        let (first, _) = scratch_origin(move |head| match request_path(head) {
+            "/to-alive" => redirect_reply(301, &format!("http://127.0.0.1:{second}/alive")),
+            "/to-missing" => redirect_reply(302, &format!("http://127.0.0.1:{second}/missing")),
+            _ => redirect_reply(302, "/loop"),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let bm = dir.path().join("old-org/pinboard-bookmarks.org");
+        std::fs::create_dir_all(bm.parent().unwrap()).unwrap();
+        let link =
+            |path: &str, title: &str| format!("** [[http://127.0.0.1:{first}/{path}][{title}]]\n");
+        std::fs::write(
+            &bm,
+            format!(
+                "* Bookmarks\n{}{}{}",
+                link("to-alive", "Alive"),
+                link("to-missing", "Missing"),
+                link("loop", "Loop")
+            ),
+        )
+        .unwrap();
+        let status_path = dir.path().join("st.json");
+        let kernel = maintenance_kernel(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            status_path.clone(),
+            crate::tagstore::TagPaths::in_dir(dir.path()),
+            Arc::new(transport),
+            test_secrets(),
+            default_llm_registry(),
+            "ollama",
+        );
+        let req = Request::new(Verb::Source, Iri::parse("urn:cms:linkcheck").unwrap());
+        futures::executor::block_on(kernel.issue(req, &Capability::root())).expect("pass runs");
+        let status: HashMap<String, String> = load_status(&status_path)
+            .into_values()
+            .map(|s| (s.url, s.status))
+            .collect();
+        let of = |path: &str| status[&format!("http://127.0.0.1:{first}/{path}")].as_str();
+        assert_eq!(of("to-alive"), "ok", "{status:?}");
+        assert_eq!(of("to-missing"), "gone", "{status:?}");
+        assert_eq!(of("loop"), "refused", "{status:?}");
     }
 
     /// The status cache sits in the ikigai data home under the given home — and a home that
