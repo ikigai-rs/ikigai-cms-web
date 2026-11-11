@@ -72,6 +72,12 @@ const MAX_CALL: usize = 8 * 1024 * 1024;
 /// `a_trickled_request_is_cut_off_at_the_read_deadline`).
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long the page face spends writing one response before it drops the connection: the same
+/// bound as the read, for the same reason. A visitor who asks for a large response and never reads
+/// it stalls the write on full socket buffers, and without a deadline that write waits as long as
+/// TCP keeps the zero window open (see `a_response_nobody_reads_is_cut_off_at_the_write_deadline`).
+const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// The most signed-out sessions the HTTP session table holds. Anyone can mint one
 /// (`/auth/login/start` without a cookie), so past this the oldest is evicted (see
 /// `signed_out_sessions_are_capped_and_signed_in_ones_survive`).
@@ -1085,9 +1091,16 @@ async fn handle_http(
          {cookie_line}Cache-Control: no-cache\r\n{security}Connection: close\r\n\r\n",
         out.len()
     );
-    sock.write_all(header.as_bytes()).await?;
-    sock.write_all(&out).await?;
-    sock.flush().await
+    // The whole response within one deadline (`RESPONSE_WRITE_DEADLINE`); a response the peer
+    // has not taken by then is abandoned and the connection dropped.
+    let write = async {
+        sock.write_all(header.as_bytes()).await?;
+        sock.write_all(&out).await?;
+        sock.flush().await
+    };
+    tokio::time::timeout(RESPONSE_WRITE_DEADLINE, write)
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
 }
 
 /// Resolve `/r/{iri}?args` to an HTML fragment via the kernel under `cap` — the same `resolve()`
@@ -1561,6 +1574,32 @@ struct Session {
     auth_state: Option<PasskeyAuthentication>,
     reg_state: Option<PasskeyRegistration>,
     principal: Option<String>,
+    /// The wire token this connection was raised with by `urn:auth:resume`, if that is how it
+    /// was raised: the elevation is borrowed from that HTTP session, so it lasts only while the
+    /// token still names a signed-in one ([`revoke_if_lapsed`]). `None` for a public connection
+    /// and for one signed in over the wire itself.
+    resumed: Option<String>,
+}
+
+/// Drop a connection raised by `urn:auth:resume` back to the public ceiling once the HTTP
+/// session it borrowed from no longer stands: signed out (`/auth/logout`), signed in again under
+/// a fresh id (which mints a fresh token), or gone. Checked before every call, so a logout on the
+/// page ends the wire's elevation at its next call rather than at disconnect.
+fn revoke_if_lapsed(http_auth: &HttpAuth, session: &mut Session) {
+    let Some(token) = session.resumed.as_deref() else {
+        return;
+    };
+    let standing = http_auth
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .any(|s| s.scopes.is_some() && s.wire_token.as_deref() == Some(token));
+    if !standing {
+        session.ceiling = Capability::scoped(Vec::<String>::new());
+        session.principal = None;
+        session.resumed = None;
+    }
 }
 
 /// Accept one WebTransport session and answer `Call`s on its bidi streams until the
@@ -1581,6 +1620,7 @@ async fn serve(
         auth_state: None,
         reg_state: None,
         principal: None,
+        resumed: None,
     };
     loop {
         let (mut send, recv) = match connection.accept_bi().await {
@@ -1623,6 +1663,7 @@ fn handle(
 ) -> Vec<u8> {
     // Signed in ⇔ a principal: both login paths and the HTTP resume set it with the ceiling, and
     // logout clears both.
+    revoke_if_lapsed(http_auth, session);
     let door = |req: Request, session: &Session| {
         if session.principal.is_none() {
             anonymous_door(req, anonymous_budget)
@@ -1878,6 +1919,7 @@ fn handle_auth(
                 Some(s) => {
                     session.ceiling = Capability::scoped(s.scopes.clone().unwrap_or_default());
                     session.principal = s.principal.clone();
+                    session.resumed = Some(token.to_string());
                     json_reply(br#"{"ok":true}"#.to_vec())
                 }
                 None => error_reply("unknown or unauthenticated wire token"),
@@ -1907,6 +1949,7 @@ fn handle_auth(
                     // passkey-workspace concern; today every credential grants the same room.)
                     session.ceiling = Capability::scoped(entitlement.to_vec());
                     session.principal = Some(principal); // scope the recency trail to them
+                    session.resumed = None; // its own login now, not one borrowed over HTTP
                     json_reply(br#"{"ok":true}"#.to_vec())
                 }
                 Err(e) => Reply::Error(e),
@@ -1949,6 +1992,7 @@ fn handle_auth(
             session.auth_state = None;
             session.reg_state = None;
             session.principal = None; // stop recording; the stored trail persists for next login
+            session.resumed = None;
             json_reply(br#"{"ok":true}"#.to_vec())
         }
         other => Reply::Error(format!("unknown auth resource `{other}`")),
@@ -2039,6 +2083,7 @@ mod tests {
             auth_state: None,
             reg_state: None,
             principal: None,
+            resumed: None,
         }
     }
 

@@ -289,6 +289,7 @@ fn a_public_wire_session_cannot_dismiss_a_tag() {
         auth_state: None,
         reg_state: None,
         principal: None,
+        resumed: None,
     };
     for verb in [Verb::Source, Verb::Exists, Verb::Delete] {
         let req = Request::new(verb, Iri::parse("urn:cms:tag-reject").unwrap())
@@ -325,6 +326,7 @@ fn a_wire_v9_issue_with_is_clamped_like_an_issue_as() {
         auth_state: None,
         reg_state: None,
         principal: None,
+        resumed: None,
     };
     let mut call = |call: &Call| {
         let reply = handle(
@@ -597,6 +599,7 @@ fn an_anonymous_wire_session_is_budgeted_too() {
         auth_state: None,
         reg_state: None,
         principal: None,
+        resumed: None,
     };
     let query = slow_cross_product();
     for budget in [
@@ -784,5 +787,52 @@ fn signed_out_sessions_are_capped_and_signed_in_ones_survive() {
     assert!(
         sessions.contains_key(&owner),
         "a signed-in session is never evicted"
+    );
+}
+
+/// A visitor who asks for a large response and then never reads it does not hold the connection
+/// past [`super::RESPONSE_WRITE_DEADLINE`]. Writing the response had no bound: once the socket
+/// buffers filled, the write waited on the peer for as long as TCP let it (no deadline of any
+/// kind, since the peer's window stays open at zero and the kernel keeps probing), pinning a task
+/// and a descriptor per connection the way an unbounded read did before
+/// `a_trickled_request_is_cut_off_at_the_read_deadline`. Reproduced on aff76e5: past the deadline
+/// the stalled connection was still held, and reading it then delivered the whole response.
+#[tokio::test]
+async fn a_response_nobody_reads_is_cut_off_at_the_write_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    // Far more than the loopback socket buffers on either side hold.
+    const SIZE: usize = 64 * 1024 * 1024;
+    std::fs::write(dir.path().join("big.bin"), vec![b'x'; SIZE]).unwrap();
+    let port = start(dir.path(), "http://localhost:8080", false).await;
+    let mut conn = None;
+    for _ in 0..50 {
+        if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            conn = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = conn.expect("page server listening");
+    c.write_all(b"GET /big.bin HTTP/1.1\r\nHost: localhost:8080\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    // Stop reading: the server's write stalls on full buffers.
+    tokio::time::sleep(super::RESPONSE_WRITE_DEADLINE + Duration::from_secs(3)).await;
+    // Now drain what is there. A server that gave up has closed the connection, so the response
+    // ends short (or the read is reset); one still holding it delivers every byte.
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    let drain = async {
+        loop {
+            match c.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(20), drain).await;
+    assert!(
+        got < SIZE,
+        "the server still held a stalled response open past the write deadline ({got} bytes read)"
     );
 }

@@ -601,6 +601,7 @@ fn an_anonymous_wire_session_cannot_supply_a_stylesheet() {
         auth_state: None,
         reg_state: None,
         principal: None,
+        resumed: None,
     };
     for call in [
         Call::Issue(req.clone()),
@@ -616,6 +617,7 @@ fn an_anonymous_wire_session_cannot_supply_a_stylesheet() {
         auth_state: None,
         reg_state: None,
         principal: Some("reader".into()),
+        resumed: None,
     };
     match ask(&mut signed_in, Call::Issue(req)) {
         Reply::Resolved(repr, _) => {
@@ -660,4 +662,107 @@ fn caller_xml_too_deep_is_refused_not_fatal() {
     );
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("cms-error"), "{body}");
+}
+
+/// An HTTP logout ends the wire elevation it lent. A WebTransport connection raised by
+/// `urn:auth:resume` (the page's wire token from `/auth/status`) adopted that HTTP session's
+/// capability once, at resume, and kept it after `/auth/logout` dropped the session: signed out
+/// on the page, the open connection still ran what only a signed-in caller may, until it
+/// disconnected. Reproduced on aff76e5, where the last call below was served. The connection now
+/// holds the token it resumed with and is dropped to the public ceiling on its next call once
+/// that token names no signed-in session.
+#[test]
+fn an_http_logout_revokes_the_wire_elevation_it_lent() {
+    use ikigai_wire::{decode, encode, Call, Reply};
+    let dir = tempfile::tempdir().unwrap();
+    let (kernel, entitlement) = room(dir.path());
+    let rp = ikigai_cms_web::session::Rp::new(
+        "localhost",
+        "http://localhost:8080",
+        std::sync::Arc::new(ikigai_secret::FileBackend::new(dir.path().join("keys"))),
+    )
+    .expect("a relying party over a scratch keystore");
+    let auth = HttpAuth::default();
+    auth.sessions.lock().unwrap().insert(
+        "sid".into(),
+        HttpSession {
+            scopes: Some(entitlement.clone()),
+            principal: Some("reader".into()),
+            pending: None,
+            wire_token: Some("tok-123".into()),
+            minted: 0,
+        },
+    );
+    let ask = |session: &mut super::Session, call: Call| {
+        let reply = super::handle(
+            &kernel,
+            &rp,
+            &auth,
+            &entitlement,
+            &RecentLog::default(),
+            session,
+            &encode(&call).unwrap(),
+            ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET,
+        );
+        decode::<Reply>(&reply).unwrap()
+    };
+    let gated = Request::new(Verb::Source, Iri::parse("urn:xslt:transform").unwrap())
+        .with_arg(
+            "stylesheet",
+            ikigai_core::ArgRef::Inline(inline_stylesheet().into_bytes()),
+        )
+        .with_arg("content", ikigai_core::ArgRef::Inline(b"<a/>".to_vec()));
+    let resume = Request::new(Verb::Source, Iri::parse("urn:auth:resume").unwrap())
+        .with_arg("token", ikigai_core::ArgRef::Inline(b"tok-123".to_vec()));
+
+    let mut wire = super::Session {
+        ceiling: Capability::scoped(Vec::<String>::new()),
+        auth_state: None,
+        reg_state: None,
+        principal: None,
+        resumed: None,
+    };
+    assert!(matches!(
+        ask(&mut wire, Call::Issue(resume)),
+        Reply::Resolved(..)
+    ));
+    match ask(&mut wire, Call::Issue(gated.clone())) {
+        Reply::Resolved(repr, _) => {
+            assert_eq!(String::from_utf8_lossy(&repr.bytes).trim(), INLINE_RAN)
+        }
+        other => panic!("resumed: {other:?}"),
+    }
+
+    // Sign out on the page: the HTTP session, and the token it minted, are gone.
+    let rp_http = ikigai_cms_web::session::Rp::new(
+        "localhost",
+        "http://localhost:8080",
+        std::sync::Arc::new(ikigai_secret::FileBackend::new(dir.path().join("keys"))),
+    )
+    .unwrap();
+    let (status, ..) = super::http_auth(
+        "logout",
+        "POST",
+        b"",
+        Some("sid"),
+        &rp_http,
+        &auth,
+        &entitlement,
+        false,
+    );
+    assert_eq!(status, "200 OK");
+
+    for call in [
+        Call::Issue(gated.clone()),
+        Call::IssueAs(gated.clone(), Capability::root()),
+    ] {
+        match ask(&mut wire, call) {
+            Reply::Error(e) => assert!(e.contains("denied"), "{e}"),
+            other => panic!("the wire kept its elevation after an HTTP logout: {other:?}"),
+        }
+    }
+    assert_eq!(
+        wire.principal, None,
+        "the recency trail stops with the logout"
+    );
 }
