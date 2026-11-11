@@ -66,6 +66,17 @@ use ikigai_cms_web::session::{Recent, RecentLog, Rp};
 /// Largest `Call` we'll read off a stream — a guard against a runaway client.
 const MAX_CALL: usize = 8 * 1024 * 1024;
 
+/// How long the page face waits for one whole HTTP request (head and body) before it drops the
+/// connection. A deadline on the request, not a timeout per read: a visitor trickling a byte at a
+/// time must not hold a task and a descriptor open for as long as they like (see
+/// `a_trickled_request_is_cut_off_at_the_read_deadline`).
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The most signed-out sessions the HTTP session table holds. Anyone can mint one
+/// (`/auth/login/start` without a cookie), so past this the oldest is evicted (see
+/// `signed_out_sessions_are_capped_and_signed_in_ones_survive`).
+const MAX_ANONYMOUS_SESSIONS: usize = 256;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configuration = cms.toml in the ikigai config home + CLI flags (flags win); no env vars.
@@ -413,6 +424,9 @@ struct HttpSession {
     /// (`urn:auth:resume`) to raise a WebTransport connection to this session's capability — so
     /// one HTTP login covers both transports. Minted lazily on `status` once authenticated.
     wire_token: Option<String>,
+    /// When this session was minted, in mint order: the oldest signed-out session is the one
+    /// evicted at `MAX_ANONYMOUS_SESSIONS`.
+    minted: u64,
 }
 
 /// A WebAuthn ceremony held between its `start` and `finish` HTTP requests (the wire holds the
@@ -690,12 +704,8 @@ fn http_auth(
                 // Grant the CURRENT server entitlement (not the scopes frozen at registration):
                 // the room-wide grant grows as sources are added, and this is a single-user room.
                 Ok((_stored, principal)) => {
-                    let mut sessions = auth.sessions.lock().unwrap();
-                    if let Some(s) = sessions.get_mut(sid) {
-                        s.scopes = Some(entitlement.to_vec());
-                        s.principal = Some(principal);
-                    }
-                    ("200 OK", json, br#"{"ok":true}"#.to_vec(), None)
+                    let cookie = sign_in(auth, sid, entitlement.to_vec(), principal);
+                    ("200 OK", json, br#"{"ok":true}"#.to_vec(), cookie)
                 }
                 Err(e) => err(&e),
             }
@@ -759,6 +769,23 @@ fn http_auth(
     }
 }
 
+/// Sign the session `sid` in with `scopes` as `principal`, under a FRESH id: the old id is
+/// forgotten and the new one is returned as the `Set-Cookie` to send. The id a ceremony starts
+/// under is handed to anyone who asks, so it must never be the one that ends up signed in
+/// (session fixation: a page on another localhost port can set a `localhost` cookie, since
+/// cookies ignore the port). `None` when `sid` names no session.
+fn sign_in(auth: &HttpAuth, sid: &str, scopes: Vec<String>, principal: String) -> Option<String> {
+    let mut sessions = auth.sessions.lock().unwrap();
+    let mut session = sessions.remove(sid)?;
+    session.scopes = Some(scopes);
+    session.principal = Some(principal);
+    session.pending = None;
+    session.wire_token = None;
+    let id = Uuid::new_v4().to_string();
+    sessions.insert(id.clone(), session);
+    Some(session_cookie(&id))
+}
+
 /// Look up the session for `sid`, or mint a fresh one. Returns its id and, when newly minted, a
 /// `Set-Cookie` to send so the browser carries it on the follow-up `finish` request.
 fn ensure_session(auth: &HttpAuth, sid: Option<&str>) -> (String, Option<String>) {
@@ -768,8 +795,28 @@ fn ensure_session(auth: &HttpAuth, sid: Option<&str>) -> (String, Option<String>
             return (sid.to_string(), None);
         }
     }
+    // Make room: evict the oldest signed-out sessions (an in-flight ceremony at most; a
+    // signed-in session is never evicted) so the table stays bounded however many are minted.
+    loop {
+        let signed_out = sessions.iter().filter(|(_, s)| s.scopes.is_none());
+        if signed_out.clone().count() < MAX_ANONYMOUS_SESSIONS {
+            break;
+        }
+        let Some(oldest) = signed_out
+            .min_by_key(|(_, s)| s.minted)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+    static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = Uuid::new_v4().to_string();
-    sessions.insert(id.clone(), HttpSession::default());
+    let session = HttpSession {
+        minted: MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ..HttpSession::default()
+    };
+    sessions.insert(id.clone(), session);
     let cookie = session_cookie(&id);
     (id, Some(cookie))
 }
@@ -889,6 +936,41 @@ async fn serve_http(
     std::process::exit(1);
 }
 
+/// Read one request off `sock`: its head, then its body up to `Content-Length` (at most 256 KiB).
+/// `None` when the peer closes before the head ends or the head passes 64 KiB.
+async fn read_request(sock: &mut TcpStream) -> std::io::Result<Option<(ReqHead, Vec<u8>)>> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    // Read up to the end of the headers (the blank line).
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 64 * 1024 {
+            return Ok(None);
+        }
+    };
+    let req = parse_head(&String::from_utf8_lossy(&buf[..header_end]));
+    // Read the body (POST) up to Content-Length.
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < req.content_length {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+        if body.len() > 256 * 1024 {
+            break;
+        }
+    }
+    Ok(Some((req, body)))
+}
+
 /// Answer one HTTP request. `/r/{iri}?args` → a fragment resolved under the caller's session
 /// capability; `/auth/*` → the passkey ceremony; anything else → a `dist/` file (or 404). One
 /// request per connection (`Connection: close`).
@@ -906,35 +988,12 @@ async fn handle_http(
     dev_open: bool,
     anonymous_budget: Duration,
 ) -> std::io::Result<()> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    // Read up to the end of the headers (the blank line).
-    let header_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        let n = sock.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 64 * 1024 {
-            return Ok(());
-        }
+    // The whole request, head and body, within one deadline (`REQUEST_READ_DEADLINE`); a request
+    // that has not arrived by then is dropped unanswered.
+    let read = tokio::time::timeout(REQUEST_READ_DEADLINE, read_request(&mut sock)).await;
+    let Ok(Some((req, body))) = read.unwrap_or(Ok(None)) else {
+        return Ok(());
     };
-    let req = parse_head(&String::from_utf8_lossy(&buf[..header_end]));
-    // Read the body (POST) up to Content-Length.
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < req.content_length {
-        let n = sock.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..n]);
-        if body.len() > 256 * 1024 {
-            break;
-        }
-    }
     let sid = req.cookies.get("cms_session").map(String::as_str);
     // The action routes take their argument in the query (`/link/keep?url=…`), so they match on the
     // path alone. A bookmark URL cannot ride in an htmx `hx-vals` body here: the review is rendered
@@ -2099,6 +2158,7 @@ mod tests {
                 principal: Some("p".into()),
                 pending: None,
                 wire_token: None,
+                minted: 0,
             },
         );
         // Its cap resolves the gated view, and the visit is recorded to that principal's trail.
@@ -2191,6 +2251,7 @@ mod tests {
                 principal: Some("p".into()),
                 pending: None,
                 wire_token: Some("tok-123".into()),
+                minted: 0,
             },
         );
         let resume = |tok: &str, session: &mut Session| {

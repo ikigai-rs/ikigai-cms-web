@@ -21,7 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{handle, percent_decode, resolve_http, serve_http, HttpAuth, PageOrigin, Session};
+use super::{
+    ensure_session, handle, percent_decode, resolve_http, serve_http, session_cap, sign_in,
+    HttpAuth, PageOrigin, Session,
+};
 use ikigai_cms_web::config::DEFAULT_ANONYMOUS_SPARQL_BUDGET;
 use ikigai_cms_web::session::{RecentLog, Rp};
 use ikigai_core::{ArgRef, Capability, Iri, Kernel, Request, Verb};
@@ -680,4 +683,106 @@ fn the_stamp_narrows_only_sparql_and_keeps_only_a_tighter_budget() {
     assert!(view.args.is_empty(), "{:?}", view.args);
     let other = stamp(with("urn:xslt:transform", ArgRef::Inline(b"9".to_vec())));
     assert_eq!(budget_of(&other).as_deref(), Some("9"));
+}
+
+/// A visitor who opens a connection and then trickles its request (or sends nothing at all) must
+/// not hold that connection open past [`super::REQUEST_READ_DEADLINE`]. Before the deadline the
+/// read had no bound of any kind, so each such connection pinned a task and a descriptor for as
+/// long as the visitor liked; a few hundred of them (launchd's default soft limit is 256) left the
+/// accept loop backing off on `EMFILE` and the room unreachable for everyone else.
+#[tokio::test]
+async fn a_trickled_request_is_cut_off_at_the_read_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = start(dir.path(), "http://localhost:8080", false).await;
+    let mut conn = None;
+    for _ in 0..50 {
+        if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            conn = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = conn.expect("page server listening");
+    let began = Instant::now();
+    let limit = super::REQUEST_READ_DEADLINE + Duration::from_secs(5);
+    // One header byte every 200ms: a per-read timeout would never fire; only a deadline on the
+    // whole request does.
+    let trickle = async {
+        for b in b"GET / HTTP/1.1\r\nHost: localhost:8080\r\nX-Slow: "
+            .iter()
+            .cycle()
+        {
+            if c.write_all(&[*b]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    let _ = tokio::time::timeout(limit, trickle).await;
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < limit,
+        "the server still held a trickled request open after {elapsed:?}"
+    );
+}
+
+/// Session fixation. The id a session is minted under (`/auth/login/start` hands one to anyone who
+/// asks, cookie or not) must not be the id that becomes signed in: otherwise a page on another
+/// localhost port, which may set cookies for `localhost` because cookies ignore the port, plants
+/// an id it minted itself, waits for the owner to sign in with it, and then holds a signed-in
+/// session. Signing in moves the session to a fresh id and sends that id as the new cookie.
+#[test]
+fn signing_in_rotates_the_session_id() {
+    let auth = HttpAuth::default();
+    // The attacker's id, minted the way `login/start` mints one.
+    let (planted, cookie) = ensure_session(&auth, None);
+    assert!(cookie.is_some(), "a fresh session is sent as a cookie");
+    let scopes = vec!["urn:cap:fs:read:/room".to_string()];
+    let set = sign_in(&auth, &planted, scopes.clone(), "owner".into());
+
+    let (_, principal) = session_cap(&auth, Some(&planted), &scopes, false);
+    assert_eq!(principal, None, "the pre-login id must not be signed in");
+    let set = set.expect("signing in sends the new session cookie");
+    let fresh = set
+        .strip_prefix("cms_session=")
+        .and_then(|v| v.split(';').next())
+        .expect("a cms_session cookie");
+    assert_ne!(fresh, planted);
+    let (_, principal) = session_cap(&auth, Some(fresh), &scopes, false);
+    assert_eq!(
+        principal.as_deref(),
+        Some("owner"),
+        "the new id is signed in"
+    );
+}
+
+/// Every `POST /auth/login/start` without a cookie mints a session, and nothing ever removed one
+/// that never signed in: a visitor could grow the table, and the process's memory, without bound
+/// (each also holds a WebAuthn challenge). Signed-out sessions are capped at
+/// [`super::MAX_ANONYMOUS_SESSIONS`], the oldest evicted first; signed-in ones are never evicted.
+#[test]
+fn signed_out_sessions_are_capped_and_signed_in_ones_survive() {
+    let auth = HttpAuth::default();
+    let scopes = vec!["urn:cap:fs:read:/room".to_string()];
+    let (owner, _) = ensure_session(&auth, None);
+    let owner = sign_in(&auth, &owner, scopes.clone(), "owner".into()).unwrap();
+    let owner = owner[..].strip_prefix("cms_session=").unwrap();
+    let owner = owner.split(';').next().unwrap().to_string();
+    let (oldest, _) = ensure_session(&auth, None);
+    let mut newest = String::new();
+    for _ in 0..(super::MAX_ANONYMOUS_SESSIONS * 4) {
+        newest = ensure_session(&auth, None).0;
+    }
+    let sessions = auth.sessions.lock().unwrap();
+    assert!(
+        sessions.len() <= super::MAX_ANONYMOUS_SESSIONS + 1,
+        "{} sessions held",
+        sessions.len()
+    );
+    assert!(!sessions.contains_key(&oldest), "the oldest is evicted");
+    assert!(sessions.contains_key(&newest), "the newest is kept");
+    assert!(
+        sessions.contains_key(&owner),
+        "a signed-in session is never evicted"
+    );
 }

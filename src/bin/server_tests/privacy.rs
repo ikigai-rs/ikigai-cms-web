@@ -368,6 +368,7 @@ fn a_signed_in_reader_still_reads_the_overlays_and_the_review() {
             principal: Some("reader".into()),
             pending: None,
             wire_token: None,
+            minted: 0,
         },
     );
     let (cap, who) = session_cap(&auth, Some("sid"), &entitlement, false);
@@ -545,6 +546,7 @@ fn named_styles_stay_public_and_a_signed_in_reader_may_send_a_stylesheet() {
             principal: Some("reader".into()),
             pending: None,
             wire_token: None,
+            minted: 0,
         },
     );
     let (cap, who) = session_cap(&auth, Some("sid"), &entitlement, false);
