@@ -19,7 +19,7 @@ Adapted from the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSI
 | Private channel | [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-cms-web/security/advisories/new), for anything security-sensitive |
 | Target | WCAG 2.2 Level AA |
 | Status | Evaluation in progress. No conformance claim. |
-| Last reviewed | 2026-11-02 |
+| Last reviewed | 2026-11-12 |
 | Next review | when `dist/index.html`, `dist/auth.js`, `dist/room.js`, a stylesheet in `styles/`, the server-rendered chrome or the vendored htmx changes, or when an accessibility check is added |
 
 ## Commitment
@@ -28,8 +28,9 @@ The reading room is the only way into the library it serves: a barrier on the si
 the tag navigation keeps a person out of their own collection. We aim at WCAG 2.2 AA for
 everything listed under "In scope". We prefer native HTML controls and the semantics htmx leaves
 alone, we check the page a browser actually renders rather than the templates, and we say plainly
-what has not been tested. Today that last part is most of this file: the browser evidence below
-is a set of one-off runs, not a gate; what CI holds is the markup and the palette.
+what has not been tested. Today that last part is most of this file: what CI holds is the markup
+and the palette, and every browser check below is Blocked, since its runs were one-off and gate
+nothing.
 
 ## Scope
 
@@ -75,8 +76,8 @@ is not, so the server refuses to start in an arrangement where nobody could sign
 - **A test must reach the room on `localhost` or over HTTPS**, never a LAN address over HTTP.
 - **Signing in needs an authenticator.** A person needs a platform authenticator or a security key
   their browser can use; the room offers no other way in. An automated run can use Chrome's
-  virtual authenticator (the DevTools Protocol `WebAuthn` domain), which is how the run below
-  enrolled and signed in.
+  virtual authenticator (the DevTools Protocol `WebAuthn` domain), which is how the 2026-10-15
+  run enrolled and signed in.
 - **`dev_open`** ungates the HTTP face on loopback only, which lets a check reach the signed-in
   views without any authenticator. It skips the sign-in panel, so a run that uses it says nothing
   about sign-in.
@@ -91,38 +92,71 @@ is not, so the server refuses to start in an arrangement where nobody could sign
   cms-server --config <scratch>/cms.toml --keystore-dir <scratch>/keys --dev-open
   ```
 
-  The runs below, before this setting existed (ledger #1684), used a build of `main` patched to
-  keep its store in a scratch directory. No source patch is needed now.
+  The 2026-10-15 runs, before this setting existed
+  ([PR 112](https://github.com/ikigai-rs/ikigai-cms-web/pull/112)), used a build of `main`
+  patched to keep its store in a scratch directory. No source patch is needed now.
 
 ## Conformance status
 
-**Evaluation in progress** against WCAG 2.2 AA. CI holds the palette to the contrast floor
-(`tests/palette.rs`) and the markup to the checks in `src/bin/server_tests/focus.rs`; no browser
-and no accessibility engine runs in CI. One automated run in a real browser, a keyboard walk and a
-narrow-viewport check were made on 2026-10-15 and found contrast failures in both color schemes
-and a keyboard barrier in the room's main navigation; the keyboard barrier was fixed the same day,
-and the rest on 2026-11-02 (see Change history). On that last run axe found nothing on the states
-it opened, which is the limit of what it says: axe reports only what a rule can detect, and part of
-the room was not opened (see Evidence). **No screen reader has been used**, and no person has
-assessed the room by hand. Do not infer a conformance claim from a green build or from this file.
+**Evaluation in progress** against WCAG 2.2 AA. No conformance claim. CI holds the palette to the
+contrast floor (`tests/palette.rs`) and the markup to the checks in
+`src/bin/server_tests/focus.rs`; no browser, no accessibility engine and no assistive technology
+runs in CI. The browser runs recorded below (2026-10-15 to 2026-11-02) were one-off scripts that CI
+does not repeat, so they are context, not current verification. **No screen reader has been
+used**, and no person has assessed the room by hand. Do not infer a conformance claim from a green
+build or from this file.
 
-## Evidence
+## How it is tested
 
-The crate's tests run on every pull request (`.github/workflows/ci.yml`, with the `server` and
-`maintenance` features); the browser runs below do not run in CI and gate nothing.
+Every check this file names has a result: **Pass** (run on `main` for this review, and passed),
+**Fail** (run, and found a barrier) or **Blocked** (not run on `main` for this review, with the
+reason; a run CI does not repeat is Blocked with its date). A Pass covers only the check it names,
+never the room's accessibility as a whole.
 
-| Check | Version | What it covers | What it does not cover |
-|---|---|---|---|
-| Rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs` (`cargo test --features "server maintenance"`) | none | The markup a view renders, for function: tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff`; no stylesheet relies on a space the XSLT engine drops, and the count line's and the review's spaces render | Any accessibility property: names, roles, focus, contrast |
-| `src/bin/server_tests/focus.rs`, same run | none | Three accessibility properties, as markup. Keyboard: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get`. Target size: in a tag view with a suggested tag, in each style, every button the view's own stylesheet styles (the suggestion's `+` and `x`) is given a `min-width` and `min-height` (or `width` and `height`) of at least 24 px. Names from content: in the same fragments, no link's words are separated only by an element boundary (a tag chip's name is `#quic 1`, a type chip's `bookmark 2`, in the markup itself). Names and state, in the same fragments: the `+`, `x` and `×` buttons carry an `aria-label` saying what they do; the selected style and sort are `aria-pressed="true"` and request nothing; each view has one `<h2>`; every `target="_blank"` link says so in text; an error fragment is `role="alert"`; the pager's nav is named. The page shell: a visible label on the search field, one `<main>` holding the panel and the room, a named nav, the live regions, `room.js` loaded | Whether focus is visible, where it goes after a swap (the browser run below), and anything a browser decides, including the size a button is actually drawn at; buttons styled only by the page shell (toolbar, pager, the clear button) |
-| `tests/palette.rs`, same run | `ikigai-a11y` 0.5.0 | The contrast floor (4.5:1, `ikigai_a11y::config::DEFAULT_MIN`, with its `ratio`) on every text color and ground the room draws, in both schemes, read from the two palette lines of `dist/room.css`. No stylesheet may write a color outside those lines, and a token used as a text `color` must have its pairs listed, so a new color cannot skip the floor. It also pins the ratios measured on 2026-10-15 for the colors that failed | A color's real ground in the browser (a translucent layer, an image); hover pairs beyond those listed; non-text contrast (SC 1.4.11), including borders and focus indicators |
-| axe-core in Google Chrome against a scratch `cms-server` (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | 14 states, each in light and dark: signed out (enroll offered, then sign-in offered), the tag index, the type index, the recent trail empty and after views, the dead-links review, the purge confirmation, a tag view in Catalog, Mosaic and Agenda, its second page, search with and without results. The passkey enrolled and signed in through Chrome's virtual authenticator. Rules tagged WCAG 2.0/2.1/2.2 A and AA, with best-practice rules reported | One viewport (1280×900). States not opened: a failed sign-in, the purge result, a promoted or dismissed suggestion, a link-check pass in progress, the error fragments, the WebTransport path's failures. Only invented data |
-| Tab walk, same run | as above | Which controls take focus, in order, on four states; where focus lands after a navigation-bar button and after the pager's "next" | Whether the order makes sense to a person; Shift+Tab; Enter and Space on each control |
-| Overflow at 320 px wide, same run | as above | Whether the page scrolls sideways at 320 CSS px (SC 1.4.10) on the sign-in panel, the tag index, and a tag view in Catalog and Agenda | Text resize and zoom to 400%; other views |
-| Keyboard re-check for the chips (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` built from the fix, signed in through Chrome's virtual authenticator, then again under `dev_open` for axe's detail: each chip focusable in the tag index, a Catalog, Mosaic and Agenda tag view, the type index and the recent trail; Tab reaches one and Enter opens its view in place with the address unchanged; axe on those views in light and dark (with `html{background:Canvas}` injected, so axe measures dark text against the dark page) | Shift+Tab; Space (a link does not take it); opening a chip in a new tab, which shows the bare fragment |
-| Accessible-name check for the chips (a one-off script, not in this repository) | playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` under `dev_open` (no authenticator), built once from `main` and once from the fix, with the same scratch data: the name Chrome's accessibility tree gives each link (DevTools Protocol `Accessibility.getFullAXTree`) in the tag index, the type index, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion; the same tag index with the chips laid out `inline`; each tag and type chip's drawn box and its parts', and a screenshot of each index | Firefox and Safari (no driver could be run here); any screen reader; the recent trail's names, since `dev_open` signs nobody in and so keeps no trail (each item is one text node, so it has no boundary to lose) |
-| Target-size re-check for the suggestion buttons (a one-off script, not in this repository) | axe-core 4.10.3, playwright-core 1.63.0, Chrome 153.0.8010.54 on macOS | Against a scratch `cms-server` under `dev_open` (no authenticator), built once from `main` and once from the fix, with the same scratch data: axe's `target-size` rule, each suggestion button's drawn size, and the page's scroll width, on three tag views with suggested tags in Catalog, Mosaic and Agenda, light and dark, at 1280 and 320 px wide | Other rules; touch input; zoom; any view without a suggested tag |
-| Barrier re-check (a one-off script, not in this repository) | axe-core 4.10.3, Playwright for Python 1.64.1, Chromium 156.0.8078.4 (Playwright's build, not Google Chrome), headless, on macOS | Against a scratch `cms-server` under `dev_open`, one built from `main` and one from the fix, with the same invented data (70 bookmarks, a suggested tag on each, one dead link of each status): the 13 states signed out, the tag and type indexes, the recent trail, the review, the purge confirmation, a tag view in each style, its second page, search with and without results, an error fragment, each in light and dark, plus a failed sign-in in light (a planted `/auth` error): 27 scans, with WCAG and best-practice rules. Enter on a control inside the room, and where focus lands (10 cases); that focus stays on the navigation bar and the search field; the page title per view; Chrome's accessibility tree (names, `pressed`, landmarks, `alert`); page scroll width at 320 px on every state; screenshots of the layouts. With the fix only: the same focus check over a stand-in for `wire.js`'s path, and sign-in and sign-out focus through `auth.js` with the WebAuthn calls and `/auth/*` answers stubbed | **A real passkey ceremony**: Chrome's virtual authenticator never answered `navigator.credentials.create` in this build, on `main` as on the fix, so no real session was opened. So not: a purge's result, the signed-in recent trail, a real failed ceremony. **The WebTransport path itself** (the codec was not built; the stand-in calls `htmx.swap` the way `wire.js` does). Book and presentation cards (their colors are only computed, in `tests/palette.rs`). Shift+Tab, zoom and text resize, hover and focus states' contrast, Firefox and Safari, any assistive technology |
+The three Pass rows were run on `main` at `2734eaa` in CI
+([run 43044750307](https://github.com/ikigai-rs/ikigai-cms-web/actions/runs/43044750307)) and
+again on this file's pull request, which changes no code. The shared Rust workflow runs
+`cargo test --workspace` once with no features, once with `--features server` and once with
+`--features maintenance`, on stable rustc 1.99.1 on Linux (and with no features on the MSRV,
+1.89.0); `focus.rs` and the server's rendering tests run in the `server` job, `tests/palette.rs`
+in every job. They read markup and CSS as text; none of them renders a page.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Rendering of the views, for function | Pass | `cargo test --workspace --features server` in CI: the rendering tests in `src/native.rs`, `src/bin/server_tests/chips.rs` and `http_face.rs`. Tag chips carry the tag they open, the context header and toolbar are present, the pager reflects position, each stylesheet renders its cards and empty states, an error fragment never reflects markup, every response carries `nosniff`; no stylesheet relies on a space the XSLT engine drops, and the count line's and the review's spaces render. Not an accessibility check: it says nothing of names, roles, focus or contrast. |
+| Markup: keyboard reach, target size, names and state | Pass | Same run (the `server` job), `src/bin/server_tests/focus.rs` (11 tests). Keyboard: in the tag index, the type index, the recent trail, a tag view in Catalog, Mosaic and Agenda, and a promoted suggestion, every `<a>` has an `href`, a link's `href` is its `hx-get`, and nothing but a button, a form or such a link carries `hx-get`. Target size: in a tag view with a suggested tag, in each style, every button the view's own stylesheet styles (the suggestion's `+` and `x`) is given a `min-width` and `min-height` (or `width` and `height`) of at least 24 px. Names from content: no link's words are separated only by an element boundary (a tag chip's name is `#quic 1`, a type chip's `bookmark 2`, in the markup itself). Names and state: the `+`, `x` and `×` buttons carry an `aria-label` saying what they do; the selected style and sort are `aria-pressed="true"` and request nothing; each view has one `<h2>`; every `target="_blank"` link says so in text; an error fragment is `role="alert"`; the pager's nav is named. The page shell: a visible label on the search field, one `<main>` holding the panel and the room, a named nav, the live regions, `room.js` loaded. The keyboard, size and name checks each have a test that shows them catching a planted failure. Does not cover: whether focus is visible or where it goes after a swap, the size a button is actually drawn at, buttons styled only by the page shell (toolbar, pager, the clear button), or anything else a browser decides. |
+| Text contrast of the palette | Pass | Same run, `tests/palette.rs` (5 tests), `ikigai-a11y` 0.5.0. The contrast floor (4.5:1, `ikigai_a11y::config::DEFAULT_MIN`, with its `ratio`) on every text color and ground the room draws, in both schemes, read from the two palette lines of `dist/room.css`. No stylesheet may write a color outside those lines, and a token used as a text `color` must have its pairs listed, so a new color cannot skip the floor. It also pins the ratios measured on 2026-10-15 for the colors that failed. Does not cover: a color's real ground in the browser (a translucent layer, an image), hover pairs beyond those listed, non-text contrast. |
+| Automated accessibility checker (axe) in a browser | Blocked | Not run on `main` for this review: no browser checker is set up in this repository or in CI. Last run 2026-11-02, before and after [PR 129](https://github.com/ikigai-rs/ikigai-cms-web/pull/129): axe-core 4.10.3 with Playwright for Python 1.64.1 and Chromium 156.0.8078.4 (Playwright's build), headless, on macOS, a one-off script not in this repository, against a scratch `cms-server` under `dev_open` with invented data; 27 scans (13 states in light and dark, plus a failed sign-in in light) and one more through a stubbed sign-in, WCAG 2.0/2.1/2.2 A and AA and best-practice rules, no violation on the fix. Earlier runs: 2026-10-15 (Google Chrome 153.0.8010.54, [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108), [PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109), [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111)). axe reports only what a rule can detect. |
+| Focus after a swap, the page title and the status line, in a browser | Blocked | Not run on `main` for this review. Last run 2026-11-02, same script and browser as the axe row: Enter on a control inside the room and where focus lands (10 cases), focus kept on the navigation bar and the search field, the page title per view; with the fix only, the same over a stand-in for `wire.js`'s path and sign-in and sign-out through `auth.js` with the WebAuthn calls stubbed. The code is `dist/room.js`, which no test in this repository runs. |
+| Keyboard Tab walk, in a browser | Blocked | Not run on `main` for this review. Last run 2026-10-15 (Google Chrome 153.0.8010.54, headless, a one-off script): which controls take focus, in order, on four states, and each chip focusable with Enter opening its view in place ([PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109)). Never covered: Shift+Tab, Space on each control, whether the order makes sense to a person. |
+| Accessible names and roles in the browser's accessibility tree | Blocked | Not run on `main` for this review. Last run 2026-11-02 (Chromium 156.0.8078.4, DevTools Protocol `Accessibility.getFullAXTree`: names, `pressed`, landmarks, `alert`), and for the chips on 2026-10-16 (Google Chrome 153.0.8010.54, [PR 113](https://github.com/ikigai-rs/ikigai-cms-web/pull/113)). Chromium only. |
+| Target size as drawn (SC 2.5.8) | Blocked | Not run on `main` for this review. Last run 2026-10-15 (axe `target-size` and drawn sizes in Google Chrome 153.0.8010.54, light and dark, 1280 and 320 px, [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111)), and axe's rule again on 2026-11-02. The markup row above holds the declared size only. |
+| Reflow at 320 CSS px (SC 1.4.10) | Blocked | Not run on `main` for this review. Last run 2026-11-02 (Chromium 156.0.8078.4): page scroll width 320 px on every state, Agenda titles wrap. |
+| Content-Security-Policy in a browser | Blocked | Not run on `main` for this review. Last checked 2026-10-17 in the desktop app's browser pane (Chromium, version not recorded), dark scheme only ([PR 114](https://github.com/ikigai-rs/ikigai-cms-web/pull/114)), and the console watched on 2026-11-02. A refused stylesheet would drop a view's own focus and target-size rules. |
+| A real passkey ceremony (enroll, sign in, a failed sign-in) | Blocked | Not run on `main` for this review. On 2026-10-15 Chrome's virtual authenticator enrolled and signed in; on 2026-11-02 it never answered `navigator.credentials.create` in Chromium 156, so the sign-in was stubbed. No person has signed in with a platform authenticator or a security key for a test. |
+| Text resize and zoom to 200% and 400% (SC 1.4.4, 1.4.10) | Blocked | Never run: no browser session was available for this review. |
+| Non-text contrast and a visible focus indicator (SC 1.4.11, 2.4.7, 2.4.11) | Blocked | Never run: `tests/palette.rs` measures text only, and no browser session was available for this review. |
+| Hover and focus states' contrast | Blocked | Never run in a browser; only the hover pairs listed in `tests/palette.rs` are held. |
+| Firefox and Safari | Blocked | Never run: every browser run above was Chrome or Chromium. The README notes Firefox may not connect the WebTransport path locally; the HTTP path has not been checked in Firefox either. |
+| The WebTransport path's swaps (`dist/wire.js`) | Blocked | Never run with the real codec; on 2026-11-02 a stand-in called `htmx.swap` the way `wire.js` does. |
+| Manual keyboard pass by a person | Blocked | No person has walked the room by keyboard; the Tab walks above were scripts. |
+| A person's review of reading order, plain language and sense without the layout | Blocked | Not done by anyone. |
+| Screen reader | Blocked | No screen reader (VoiceOver, NVDA, JAWS, Orca, TalkBack) has been used on the room; no screen-reader session was available for this review and none runs in CI. |
+| Screen magnifier | Blocked | No screen magnifier has been used on the room; none was available for this review. |
+| Speech input | Blocked | No speech-input software has been used on the room; none was available for this review. |
+| Switch access | Blocked | No switch-access software has been used on the room; none was available for this review. |
+| Braille display | Blocked | No braille display has been used on the room; none was available for this review. |
+
+**ikigai-ui's per-kind criteria.** The room does not use ikigai-ui: it is not a dependency in
+`Cargo.toml` or `Cargo.lock`, and the markup comes from this repository's own stylesheets and
+Rust. It relies on none of the per-kind criteria
+(`urn:iki:ui:criterion:kind:{kind}:target:{target}`), so none of their SEE or HEAR checks applies
+or is verified here; the checks above are the room's own.
+
+### What the browser runs found
+
+These are the records of the one-off runs named in the table, kept for what they found. They are
+history, not a description of `main` today, except where a sentence says so.
 
 On 2026-10-15, against `main` at `e86d873`: the only WCAG A/AA rule axe reported was
 `color-contrast`, in 23 of the 28 scans (every light scan, and 9 of the 14 dark ones); the
@@ -132,89 +166,92 @@ type or recent-trail chips in the tab order (0 of 4 in the tag index, 0 of 120 o
 cards). At 320 px the Agenda style scrolled sideways (343 px of content); the other three did
 not.
 
-On 2026-10-15, after the chips gained an `href` (ledger #1640): every chip was focusable (4 of 4
-in the tag index, 120 of 120 and 71 of 71 on two pages of cards, 2 of 2 in the type index, 3 of
-3 in the recent trail), and Enter on one opened its view in place. axe reported `color-contrast`
-as before and, newly, `target-size` (SC 2.5.8) on the suggestion buttons: they were always 13 by
-12 px, and axe accepts a small target only with room around it, which the tag chips beside them
-now take, since a link with an `href` counts as a target and one without did not.
+On 2026-10-15, after the chips gained an `href` ([PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109)):
+every chip was focusable (4 of 4 in the tag index, 120 of 120 and 71 of 71 on two pages of cards,
+2 of 2 in the type index, 3 of 3 in the recent trail), and Enter on one opened its view in place.
+axe reported `color-contrast` as before and, newly, `target-size` (SC 2.5.8) on the suggestion
+buttons: they were always 13 by 12 px, and axe accepts a small target only with room around it,
+which the tag chips beside them now take, since a link with an `href` counts as a target and one
+without did not.
 
-On 2026-10-15, after the suggestion buttons were given a 24 px minimum (ledger #1672): `main`
-drew them at 13.2 by 12 px (12.6 by 11 in Mosaic) and axe's `target-size` flagged every one, 6, 4
-and 2 nodes on the three views in each style, scheme and width; the fix draws each at 24 by 24 px
-and axe flagged none. The larger buttons widen the suggestion chip by about 20 px, so at 320 px
-the Agenda style, which already scrolled sideways, now does by 20 px more on a row with a
-suggestion (343 to 363 px of content); Catalog and Mosaic still fit (320 px).
+On 2026-10-15, after the suggestion buttons were given a 24 px minimum
+([PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111)): `main` drew them at 13.2 by 12 px
+(12.6 by 11 in Mosaic) and axe's `target-size` flagged every one, 6, 4 and 2 nodes on the three
+views in each style, scheme and width; the fix draws each at 24 by 24 px and axe flagged none. The
+larger buttons widen the suggestion chip by about 20 px, so at 320 px the Agenda style, which
+already scrolled sideways, then did by 20 px more on a row with a suggestion (343 to 363 px of
+content); Catalog and Mosaic still fit (320 px).
 
-On 2026-10-16, the chips' accessible names (ledger #1716). On `main`, a tag chip in the index was
-`<span>#quic</span><span>3</span>`, with nothing between the spans but the flex `gap`. Chrome
-named it `#quic 3` and a type chip `Bookmark 4` (with `text-transform: capitalize` applied),
-because it puts a space around a block-level child and a flex item is block-level; the name
-computation leaves that choice to each engine (w3c/accname#225). The text itself read `#quic3`,
-and with the chip laid out `inline`, as when its CSS is lost, Chrome named it `#quic3` too. The
-card views' tag chips, the promoted suggestion and the recent trail hold one text node each and
-were never affected. After the fix (a text space between the spans), Chrome names the chips the
-same, `#quic 3` and `Bookmark 4`, the text reads `#quic 3`, and the inline layout keeps
-`#quic 3`. Every chip's box and both index screenshots were identical before and after: a flex
-container draws no whitespace-only text, so nothing moved.
+On 2026-10-16, the chips' accessible names ([PR 113](https://github.com/ikigai-rs/ikigai-cms-web/pull/113)).
+On `main`, a tag chip in the index was `<span>#quic</span><span>3</span>`, with nothing between
+the spans but the flex `gap`. Chrome named it `#quic 3` and a type chip `Bookmark 4` (with
+`text-transform: capitalize` applied), because it puts a space around a block-level child and a
+flex item is block-level; the name computation leaves that choice to each engine
+(w3c/accname#225). The text itself read `#quic3`, and with the chip laid out `inline`, as when its
+CSS is lost, Chrome named it `#quic3` too. The card views' tag chips, the promoted suggestion and
+the recent trail hold one text node each and were never affected. After the fix (a text space
+between the spans), Chrome names the chips the same, `#quic 3` and `Bookmark 4`, the text reads
+`#quic 3`, and the inline layout keeps `#quic 3`. Every chip's box and both index screenshots were
+identical before and after: a flex container draws no whitespace-only text, so nothing moved.
 
-On 2026-10-17, the link rule and the Content-Security-Policy (ledger #1793, ledger #1794). A card
-or review title whose target is not `http:`, `https:` or a path on the room's own origin now
-renders as text in a `<span>` with the same class, not as a link: it is no longer in the tab
-order, by design, since there is nothing safe to open. The page shell's CSS moved from an inline
-`<style>` to `dist/room.css`, loaded at the same place, and each view keeps its own `<style>`,
-admitted by hash. The suggestion chips gained two hidden inputs, which take no focus and have no
-name. Checked in the desktop app's browser pane (Chromium, version not recorded), dark scheme
-only, against a scratch `cms-server` under `dev_open` with planted data: no policy violation on
-load or across the tag index, a tag view in each style, a promoted suggestion and a reopened
-chip; each view's own rules applied (the chips' 999 px radius, the cards' 12 px, the suggestion
-buttons' 24 px minimum); a style block the policy does not list was refused. No before-and-after
-screenshot comparison was made, and no accessibility tool was run.
+On 2026-10-17, the link rule and the Content-Security-Policy
+([PR 114](https://github.com/ikigai-rs/ikigai-cms-web/pull/114)). A card or review title whose
+target is not `http:`, `https:` or a path on the room's own origin now renders as text in a
+`<span>` with the same class, not as a link: it is no longer in the tab order, by design, since
+there is nothing safe to open. The page shell's CSS moved from an inline `<style>` to
+`dist/room.css`, loaded at the same place, and each view keeps its own `<style>`, admitted by hash.
+The suggestion chips gained two hidden inputs, which take no focus and have no name. Checked in the
+desktop app's browser pane (Chromium, version not recorded), dark scheme only, against a scratch
+`cms-server` under `dev_open` with planted data: no policy violation on load or across the tag
+index, a tag view in each style, a promoted suggestion and a reopened chip; each view's own rules
+applied (the chips' 999 px radius, the cards' 12 px, the suggestion buttons' 24 px minimum); a
+style block the policy does not list was refused. No before-and-after screenshot comparison was
+made, and no accessibility tool was run.
 
-On 2026-11-02, the barrier re-check (ledger #1641), `main` before and the fix after, same script
-and data on the 27 scans both ran. axe on `main`: `color-contrast` in 24 scans (920 nodes),
-`landmark-one-main` and `region` in all 27, `landmark-unique` in 10. On the fix: no violation of
-any rule, in those 27 and in one more with the room open through the stubbed sign-in. Focus on
-`main` fell to `body` in all 10 cases, the toolbar's and the purge buttons' included, as the source
-had suggested. On the fix: to the view's heading after a whole view (pager, toolbar, clear, chips,
-purge, cancel), to the chip after a promotion, to "kept" after a keep, to the next suggestion's
-button after a dismissal, or to the card's first tag if it was the last. The navigation bar and the
-search field kept focus on both. No policy violation appeared in the console.
+On 2026-11-02, the barrier re-check ([PR 129](https://github.com/ikigai-rs/ikigai-cms-web/pull/129)),
+`main` before and the fix after, same script and data (70 bookmarks, a suggested tag on each, one
+dead link of each status) on the 27 scans both ran. axe on `main`: `color-contrast` in 24 scans
+(920 nodes), `landmark-one-main` and `region` in all 27, `landmark-unique` in 10. On the fix: no
+violation of any rule, in those 27 and in one more with the room open through the stubbed sign-in.
+Focus on `main` fell to `body` in all 10 cases, the toolbar's and the purge buttons' included, as
+the source had suggested. On the fix: to the view's heading after a whole view (pager, toolbar,
+clear, chips, purge, cancel), to the chip after a promotion, to "kept" after a keep, to the next
+suggestion's button after a dismissal, or to the card's first tag if it was the last. The
+navigation bar and the search field kept focus on both. No policy violation appeared in the
+console. Not opened in that run: a purge's result, the signed-in recent trail, a real failed
+ceremony, book and presentation cards (their colors are only computed, in `tests/palette.rs`).
 
 That run corrected or added to what was known. Beyond the failures listed on 2026-10-15, axe also
 found the `refused` badge on both schemes and `unreachable` on light, the index's counts (4.09:1
 through `opacity`), the empty recent trail (2.93:1 and 3.59:1) and the pager's dimmed edges. The
-Book kind label's old color (`#9e7b33`) also fails when computed, 3.71:1 on the page and
-3.94:1 on a card; no book was in this data. The Agenda overflow depends on the data: `main`
+Book kind label's old color (`#9e7b33`) also failed when computed, 3.71:1 on the page and
+3.94:1 on a card; no book was in this data. The Agenda overflow depended on the data: `main`
 measured 320 px with three short tags on a row and no suggestion, 343 px in the first run, and 434
-px with a suggestion on every row. What it did regardless is worse than the scrolling: at 320 px
+px with a suggestion on every row. What it did regardless was worse than the scrolling: at 320 px
 each row's title was squeezed to no width at all, so the cards showed no titles. On the fix the
-page is 320 px wide on every state and the titles wrap.
-
-Reading order, plain language, whether the views make sense without the visual layout, and the
-whole experience with assistive technology are for a person to judge, and none of that has been
-done.
+page was 320 px wide on every state and the titles wrapped.
 
 ## Browsers and assistive technology, as tested
 
-Only what has actually been run. This is not a list of what is supported.
+Only what has actually been run. This is not a list of what is supported, and none of it is
+repeated by CI.
 
 | Platform | Browser | Assistive technology | What | When |
 |---|---|---|---|---|
-| macOS | Google Chrome 153.0.8010.54, headless | none | The axe run, the Tab walk and the 320 px check above, light and dark | 2026-10-15 |
-| macOS | Google Chrome 153.0.8010.54, headless | none | The keyboard re-check for the chips above, light and dark | 2026-10-15 |
-| macOS | Google Chrome 153.0.8010.54, headless | none | The target-size re-check for the suggestion buttons above, light and dark, 1280 and 320 px | 2026-10-15 |
-| macOS | Google Chrome 153.0.8010.54, headless | none | The accessible-name check for the chips above, light only, 1280 px | 2026-10-16 |
-| macOS | Chromium 156.0.8078.4 (Playwright's build), headless | none | The barrier re-check above, light and dark, 1280 and 320 px | 2026-11-02 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The first axe run, the Tab walk and the 320 px check, light and dark | 2026-10-15 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The keyboard re-check for the chips, light and dark | 2026-10-15 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The target-size re-check for the suggestion buttons, light and dark, 1280 and 320 px | 2026-10-15 |
+| macOS | Google Chrome 153.0.8010.54, headless | none | The accessible-name check for the chips, light only, 1280 px | 2026-10-16 |
+| macOS | Chromium in the desktop app's browser pane, version not recorded | none | The Content-Security-Policy check, dark only | 2026-10-17 |
+| macOS | Chromium 156.0.8078.4 (Playwright's build), headless | none | The barrier re-check, light and dark, 1280 and 320 px | 2026-11-02 |
 
-**No screen reader, screen magnifier, speech-input or switch-access software has been used to test
-this repository.** No other browser has been run. The README notes that Firefox may not connect
-the WebTransport path locally; the room works without it over HTTP, but that has not been checked
-in Firefox either.
+**No screen reader, screen magnifier, speech-input, switch-access software or braille display has
+been used to test this repository.** No other browser has been run.
 
 ## Known limitations
 
-From the runs above and from reading the source on 2026-11-02.
+From the runs above and from reading the source on 2026-11-02; each was read again against `main`
+at `2734eaa` on 2026-11-12 and still holds.
 
 | Barrier or gap | Where | Impact | Workaround |
 |---|---|---|---|
@@ -228,11 +265,11 @@ No list like this is complete. Please report what you find.
 
 A change to anything in scope:
 
-1. runs `cargo test --features "server maintenance"` (CI runs it too, and it must pass); that
-   holds the palette and the markup, and no browser runs in CI, so a change to the page, a
-   stylesheet or the server-rendered chrome says in its pull request how it was checked, and in
-   which color scheme; a new color is a token in `dist/room.css` with its pairs in
-   `tests/palette.rs`;
+1. runs `cargo test --features "server maintenance"` (CI runs the tests too, and they must
+   pass); that holds the palette and the markup, and no browser runs in CI, so a change to the
+   page, a stylesheet or the server-rendered chrome gives every check in "How it is tested" a
+   result in its pull request, Pass, Fail or Blocked, and says in which color scheme; a new color
+   is a token in `dist/room.css` with its pairs in `tests/palette.rs`;
 2. keeps native semantics, uses a `<button>` or a link with an `href` for anything a person
    activates, adds ARIA only where HTML cannot say it, and keeps visible labels as the accessible
    names (SC 2.5.3);
@@ -244,14 +281,24 @@ A change to anything in scope:
 
 ### Pull request evidence
 
+Say what a user does differently, and which views, states and color schemes it touches, then
+give each check a row. A check nobody ran is Blocked with the reason, never left out and never
+"not applicable"; a screen reader nobody used is Blocked.
+
 ```markdown
 ## Accessibility
 
-- What a user does differently, and which views, states and color schemes it touches:
-- Automated: cargo test: pass / fail; any browser check run, with its tool and version:
-- By hand (keyboard, zoom, narrow screen), with browser and version, or "not done":
-- Assistive technology, with name and version, or "not tested":
-- Not tested, and known limitations:
+What a user does differently, and which views, states and color schemes it touches:
+
+| Check | Result | Evidence |
+|---|---|---|
+| Markup: keyboard reach, target size, names and state | Pass / Fail | `cargo test --features "server maintenance"`, rustc version |
+| Text contrast of the palette | Pass / Fail | `tests/palette.rs`, same run |
+| Automated accessibility checker (axe) in a browser | Pass / Fail / Blocked | tool, browser and versions, states and schemes, or why it could not run |
+| Manual keyboard pass by a person | Pass / Fail / Blocked | browser and version, or why it could not run |
+| Screen reader | Pass / Fail / Blocked | name and version with browser, or why it could not run |
+
+Known limitations, and what was not tested:
 ```
 
 ## Coding agents and automation
@@ -302,12 +349,12 @@ before any conformance claim.
 | Date | Change | Evidence |
 |---|---|---|
 | 2026-10-15 | This file, from one axe run in Chrome, a keyboard walk and a 320 px check | [PR 108](https://github.com/ikigai-rs/ikigai-cms-web/pull/108) |
-| 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1, ledger #1640); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; [PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109) |
-| 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8, ledger #1672); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111) |
-| 2026-10-16 | A test server keeps its passkey store in a scratch directory with `--keystore-dir` (ledger #1684), so a browser check needs no source patch; the testing notes say so. The rendering tests now refuse a stylesheet that relies on a space the XSLT engine drops (a whitespace-only `<xsl:text>` or a no-break space, ledger #1693); none of the room's stylesheets does, so no view changed | `config.rs` keystore tests; `native.rs` whitespace tests; [PR 112](https://github.com/ikigai-rs/ikigai-cms-web/pull/112) |
-| 2026-10-16 | Tag and type chips in the indexes carry a text space between the label and the count, so the name an engine computes from their content is `#quic 3` whatever it does at an element boundary (ledger #1716). Chrome already named them so, through layout alone; the text read `#quic3`. Nothing on screen changed | `server_tests/focus.rs`; Chrome's accessibility tree, chip boxes and screenshots before and after; this pull request |
-
-| 2026-11-02 | The rest of the barriers from the first run (ledger #1641), removed from Known limitations: the muted, passkey-button, red, suggestion and badge colors, now tokens held to the floor in both schemes (`tests/palette.rs`); focus after a swap, and the page title and a status line (`dist/room.js`; `dist/wire.js` signals its swaps); names for the `+`, `x` and `×` buttons; `aria-pressed` on the toolbar; a visible search label; `role="alert"` on failures; `<main>` and named navs; Agenda at 320 px; a warning on new-tab links; a heading on every view. Added three smaller gaps found on the way | `tests/palette.rs`; `server_tests/focus.rs`; axe, focus and the accessibility tree in Chromium before and after, light and dark; no real passkey ceremony, no screen reader; this pull request |
+| 2026-10-15 | Tag chips, type chips and recent-trail items are links with an `href`, so a keyboard reaches and opens them (SC 2.1.1); removed from Known limitations. Added the suggestion buttons' target size, which axe flags now that the chips beside them are targets | `server_tests/focus.rs`; a keyboard and axe re-check in Chrome, light and dark; [PR 109](https://github.com/ikigai-rs/ikigai-cms-web/pull/109) |
+| 2026-10-15 | The suggestion buttons are at least 24 by 24 CSS px in every style (SC 2.5.8); removed from Known limitations. Noted that this widens the Agenda style's overflow at 320 px by about 20 px on a row with a suggestion | `server_tests/focus.rs`; axe `target-size` and drawn sizes in Chrome before and after, light and dark, 1280 and 320 px; [PR 111](https://github.com/ikigai-rs/ikigai-cms-web/pull/111) |
+| 2026-10-16 | A test server keeps its passkey store in a scratch directory with `--keystore-dir`, so a browser check needs no source patch; the testing notes say so. The rendering tests now refuse a stylesheet that relies on a space the XSLT engine drops (a whitespace-only `<xsl:text>` or a no-break space); none of the room's stylesheets does, so no view changed | `config.rs` keystore tests; `native.rs` whitespace tests; [PR 112](https://github.com/ikigai-rs/ikigai-cms-web/pull/112) |
+| 2026-10-16 | Tag and type chips in the indexes carry a text space between the label and the count, so the name an engine computes from their content is `#quic 3` whatever it does at an element boundary. Chrome already named them so, through layout alone; the text read `#quic3`. Nothing on screen changed | `server_tests/focus.rs`; Chrome's accessibility tree, chip boxes and screenshots before and after; [PR 113](https://github.com/ikigai-rs/ikigai-cms-web/pull/113) |
+| 2026-11-02 | The rest of the barriers from the first run, removed from Known limitations: the muted, passkey-button, red, suggestion and badge colors, now tokens held to the floor in both schemes (`tests/palette.rs`); focus after a swap, and the page title and a status line (`dist/room.js`; `dist/wire.js` signals its swaps); names for the `+`, `x` and `×` buttons; `aria-pressed` on the toolbar; a visible search label; `role="alert"` on failures; `<main>` and named navs; Agenda at 320 px; a warning on new-tab links; a heading on every view. Added three smaller gaps found on the way | `tests/palette.rs`; `server_tests/focus.rs`; axe, focus and the accessibility tree in Chromium before and after, light and dark; no real passkey ceremony, no screen reader; [PR 129](https://github.com/ikigai-rs/ikigai-cms-web/pull/129) |
+| 2026-11-12 | Every check is a row in a `Check \| Result \| Evidence` table with Pass, Fail or Blocked: the markup, palette and rendering tests Pass on `main`, every browser run (which CI does not repeat) is Blocked with its date, and each assistive technology, manual pass, zoom, non-text contrast and Firefox and Safari is Blocked as never run. Ledger numbers replaced with pull requests. Said the room uses none of ikigai-ui's per-kind criteria. No code changed | CI on `main` at `2734eaa` ([run 43044750307](https://github.com/ikigai-rs/ikigai-cms-web/actions/runs/43044750307)) and on this file's pull request |
 
 ## References
 
