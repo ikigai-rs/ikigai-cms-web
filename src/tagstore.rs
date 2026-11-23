@@ -158,6 +158,31 @@ pub fn entries(path: &Path) -> Vec<Entry> {
     text.lines().filter_map(parse_line).collect()
 }
 
+/// [`entries`] for a read that is about to be written back: the locked read-modify-write and the
+/// migration. Strict where `entries` is tolerant, because whatever this read misses, the rewrite
+/// deletes. A missing file is empty (the first decision creates it); a file that cannot be read
+/// (an I/O error, bytes that are not UTF-8) or holds a non-blank line that is not one canonical
+/// statement is an error, so the decision is reported as not made and the file left as it is.
+fn entries_for_rewrite(path: &Path) -> std::io::Result<Vec<Entry>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(n, line)| {
+            parse_line(line).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("line {} is not an overlay statement; not rewriting", n + 1),
+                )
+            })
+        })
+        .collect()
+}
+
 fn parse_line(line: &str) -> Option<Entry> {
     // One line is one N-Triples statement, read by oxttl: the same reading of the literal's
     // escapes that `urn:cms:graph` gives the file, so the tag a mutation sees is the tag the room
@@ -292,7 +317,7 @@ fn write_entries(path: &Path, entries: &[Entry], predicate: &str) -> std::io::Re
 /// silently dropped.
 fn update<T>(path: &Path, predicate: &str, f: impl FnOnce(&mut Vec<Entry>) -> T) -> Option<T> {
     let result = crate::filelock::with_lock(path, || {
-        let before = entries(path);
+        let before = entries_for_rewrite(path)?;
         let mut after = before.clone();
         let out = f(&mut after);
         if after != before {
@@ -599,7 +624,11 @@ impl TagPaths {
             (&self.suggestions, CMS_SUGGESTED),
             (&self.dismissed, CMS_DISMISSED),
         ] {
-            let before = entries(path);
+            let before = entries_for_rewrite(path).map_err(|e| MigrationRefused {
+                file: path.clone(),
+                lost: Vec::new(),
+                io: Some(e.to_string()),
+            })?;
             let after: Vec<Entry> = before
                 .iter()
                 .map(|e| Entry {
@@ -1012,6 +1041,59 @@ mod tests {
         assert_eq!(report.at_risk, 1);
         assert!(report.rewritten.is_empty() && report.backups.is_empty());
         assert!(tags.approved_turtle().contains("<urn:cms:book:aaa>"));
+    }
+
+    /// A decision must never cost the earlier ones. The locked read-modify-write once read the
+    /// file through the tolerant [`entries`], so a file it could not read (here: one byte that is
+    /// not UTF-8) came back as "no entries", and the write that followed replaced every earlier
+    /// approval with the one just made.
+    #[test]
+    fn an_unreadable_overlay_is_not_replaced_by_the_next_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let tags = TagPaths::in_dir(dir.path());
+        let mut bytes = format!(
+            "<urn:cms:book:a> <{DC_SUBJECT}> \"rust\" .\n<urn:cms:book:b> <{DC_SUBJECT}> \"wasm\" .\n"
+        )
+        .into_bytes();
+        bytes.extend_from_slice(
+            b"<urn:cms:book:c> <http://purl.org/dc/elements/1.1/subject> \"caf\xe9\" .\n",
+        );
+        std::fs::write(&tags.approved, &bytes).unwrap();
+
+        assert!(
+            !tags.approve("urn:cms:book:d", "quic"),
+            "a decision that cannot be merged into the file is reported as not made"
+        );
+        assert_eq!(
+            std::fs::read(&tags.approved).unwrap(),
+            bytes,
+            "the earlier decisions are untouched"
+        );
+    }
+
+    /// The same loss line by line: a line the reader cannot parse was skipped on read and so
+    /// dropped on the rewrite. The file is left as it is, and the decision reported as not made.
+    #[test]
+    fn an_unparseable_overlay_line_is_not_dropped_by_the_next_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let tags = TagPaths::in_dir(dir.path());
+        let text = format!(
+            "<urn:cms:book:a> <{DC_SUBJECT}> \"rust\" .\n<urn:cms:book:b> <{DC_SUBJECT}> \"unterminated .\n"
+        );
+        std::fs::write(&tags.suggestions, &text).unwrap();
+
+        tags.add_suggestion("urn:cms:book:c", "quic");
+        assert_eq!(
+            std::fs::read_to_string(&tags.suggestions).unwrap(),
+            text,
+            "the unparseable line is not silently dropped"
+        );
+        // A missing file is still simply empty: the first decision creates it.
+        let fresh = TagPaths::in_dir(&dir.path().join("fresh"));
+        std::fs::create_dir_all(dir.path().join("fresh")).unwrap();
+        fresh.add_suggestion("urn:cms:book:a", "rust");
+        assert!(fresh.approve("urn:cms:book:a", "rust"));
+        assert_eq!(entries(&fresh.approved).len(), 1);
     }
 
     #[test]
