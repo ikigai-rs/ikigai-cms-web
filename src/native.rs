@@ -1007,7 +1007,11 @@ impl Endpoint for TagApprove {
         serves(inv, &self.describe())?;
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
-        self.tags.approve(&book, &tag);
+        // A decision the overlay refused (unreadable, unwritable) is an error, never the promoted
+        // chip: the reader would see a tag approved that was never written.
+        if self.tags.try_approve(&book, &tag).is_none() {
+            return Err(not_recorded("approved"));
+        }
         // The segment is RFC 3986's unreserved set, the same output as SPARQL's `ENCODE_FOR_URI`,
         // which the stylesheets' chips are built from; the server's `/r/` route decodes it back.
         let (t, seg) = (html_text(&tag), url_segment(&tag));
@@ -1032,6 +1036,15 @@ impl Endpoint for TagApprove {
     }
 }
 
+/// The refusal a tag action answers when its overlay could not record the decision. The overlay
+/// and the cause are in the server log ([`crate::tagstore`]'s `update`); the reader is told only
+/// that nothing changed, so the suggestion stays and can be tried again.
+fn not_recorded(decision: &str) -> Error {
+    Error::Endpoint(format!(
+        "the tag overlay could not be written, so the tag was not {decision}; nothing changed"
+    ))
+}
+
 /// `urn:cms:tag-reject` (Sink) — dismiss a suggestion, returning nothing so the `x` button removes
 /// its pending chip.
 struct TagReject {
@@ -1044,7 +1057,9 @@ impl Endpoint for TagReject {
         serves(inv, &self.describe())?;
         let book = book_arg(inv)?;
         let tag = tag_arg(inv)?.to_string();
-        self.tags.reject(&book, &tag);
+        if self.tags.try_reject(&book, &tag).is_none() {
+            return Err(not_recorded("dismissed"));
+        }
         Ok(Representation::new(
             ReprType::new("text/html").with_param("charset", "utf-8"),
             Vec::new(),
@@ -1949,6 +1964,44 @@ mod tests {
                 .iter()
                 .any(|e| e.iri == s && e.tag == "networking-suggested"),
             "suggestion landed in the approved overlay"
+        );
+    }
+
+    /// A decision the overlay refuses to record must not come back as a success. `update` refuses
+    /// to rewrite an overlay it cannot read whole (ledger #4028), and promised the refusal is
+    /// "reported as not made" — but `urn:cms:tag-approve` and `urn:cms:tag-reject` dropped the
+    /// store's answer and returned the approved chip / the empty swap anyway, so the reader saw a
+    /// tag promoted (or a suggestion dismissed) that was never written.
+    #[test]
+    fn a_tag_decision_the_overlay_cannot_record_is_refused_not_reported_done() {
+        let (dir, kernel) = kernel_over_fixture();
+        let tags = crate::tagstore::TagPaths::in_dir(dir.path());
+        let book = "urn:cms:bookmark:unrecordable";
+        tags.add_suggestion(book, "pending");
+        // One byte that is not UTF-8: the strict reader refuses the file, so nothing is written.
+        for overlay in [&tags.approved, &tags.dismissed] {
+            let mut bytes =
+                b"<urn:cms:bookmark:kept> <http://purl.org/dc/elements/1.1/subject> \"rust\" .\n"
+                    .to_vec();
+            bytes.push(0xFF);
+            std::fs::write(overlay, bytes).unwrap();
+        }
+        for action in ["urn:cms:tag-approve", "urn:cms:tag-reject"] {
+            let req = Request::new(Verb::Sink, Iri::parse(action).unwrap())
+                .with_arg("book", ArgRef::Inline(book.as_bytes().to_vec()))
+                .with_arg("tag", ArgRef::Inline(b"pending".to_vec()));
+            let answer = Resolver::issue(&kernel, req);
+            assert!(
+                answer.is_err(),
+                "{action} reported success though nothing was recorded: {:?}",
+                answer.map(|(r, _)| String::from_utf8_lossy(&r.bytes).into_owned())
+            );
+        }
+        assert!(
+            crate::tagstore::entries(&tags.suggestions)
+                .iter()
+                .any(|e| e.iri == book && e.tag == "pending"),
+            "the suggestion is still pending, so the reader can try again"
         );
     }
 

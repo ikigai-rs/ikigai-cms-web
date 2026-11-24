@@ -1696,6 +1696,20 @@ impl LinkAction {
 /// How many times [`strike_bookmarks`] re-reads a file that changed under it before refusing.
 const STRIKE_ATTEMPTS: usize = 3;
 
+/// The lock [`strike_bookmarks`] holds for `bookmarks_iri`, one per file for the process's life.
+/// An async lock, because it is held across the kernel reads and writes the strike awaits. It
+/// covers this process only (the page server's tasks and its maintenance kernel); a writer outside
+/// it is the case the re-read below exists for.
+fn strike_lock(bookmarks_iri: &str) -> std::sync::Arc<futures::lock::Mutex<()>> {
+    type Locks = std::sync::Mutex<HashMap<String, std::sync::Arc<futures::lock::Mutex<()>>>>;
+    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Locks::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(locks.entry(bookmarks_iri.to_string()).or_default())
+}
+
 /// Strike `urls` from the bookmarks file AS IT IS NOW and write the result back through the
 /// kernel, backing up exactly the text that was struck. Returns how many entries were struck; zero
 /// writes nothing (an identical rewrite would cut the golden thread for no reason).
@@ -1719,6 +1733,11 @@ async fn strike_bookmarks(
     let iri = Iri::parse(bookmarks_iri)
         .map_err(|e| Error::Endpoint(format!("bad bookmarks iri: {e}")))?;
     let bak = Iri::parse(bak_iri).map_err(|e| Error::Endpoint(format!("bad backup iri: {e}")))?;
+    // One strike at a time per file in this process: the page server runs each click on its own
+    // task, and two strikes interleaved write the backup and the file over each other (see
+    // `concurrent_per_card_removals_all_land`). Held across the reads and both writes.
+    let lock = strike_lock(bookmarks_iri);
+    let _held = lock.lock().await;
     for _ in 0..STRIKE_ATTEMPTS {
         let text = inv.source(&iri).await?.bytes;
         let (new_text, removed) = strike(&String::from_utf8_lossy(&text), urls);
@@ -3743,6 +3762,49 @@ mod tests {
         let org = std::fs::read_to_string(status_path.with_file_name("dead-links.org")).unwrap();
         assert!(!org.contains("walled.example"), "{org}");
         assert!(org.contains("other.example"), "{org}");
+    }
+
+    /// Concurrent per-card removals must all land. The page server runs each request on its own
+    /// task of a multi-threaded runtime, so `x` clicks in quick succession strike the bookmarks
+    /// file at once, and each strike writes the shared backup and then the file. On c54bb72, 11 of
+    /// 12 concurrent removals came back refused (`….one.bak changed on disk while the request was
+    /// being served; retry`), shown in the room as a failed action. Strikes are serialized per
+    /// file in this process now, so each one reads the file the previous one wrote.
+    #[test]
+    fn concurrent_per_card_removals_all_land() {
+        const N: usize = 12;
+        let mut org = String::from("* Bookmarks\n");
+        for i in 0..N {
+            org.push_str(&format!("** [[https://drop{i}.example][Drop {i}]]\n"));
+        }
+        org.push_str("** [[https://stay.example][Stay]]\n");
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let (kernel, _status) =
+                failing_kernel(dir.path(), &org, REFUSED_ERR, Arc::new(AtomicU32::new(0)));
+            let barrier = std::sync::Barrier::new(N);
+            std::thread::scope(|s| {
+                for i in 0..N {
+                    let (kernel, barrier) = (&kernel, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        let url = format!("https://drop{i}.example");
+                        assert!(sink_url(kernel, "urn:cms:link-remove", &url).contains("removed"));
+                    });
+                }
+            });
+            let text =
+                std::fs::read_to_string(dir.path().join("old-org/pinboard-bookmarks.org")).unwrap();
+            let survivors: Vec<usize> = (0..N)
+                .filter(|i| text.contains(&format!("drop{i}.example")))
+                .collect();
+            assert!(
+                survivors.is_empty(),
+                "round {round}: removals reported done but resurrected by a concurrent one: \
+                 {survivors:?}\n{text}"
+            );
+            assert!(text.contains("stay.example"), "{text}");
+        }
     }
 
     #[test]
