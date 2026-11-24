@@ -396,16 +396,21 @@ impl TagPaths {
     /// next `+` is a no-op), never one that is neither. The locks are taken one at a time, never
     /// nested, so no lock order can deadlock against another writer.
     pub fn approve(&self, iri: &str, tag: &str) -> bool {
+        self.try_approve(iri, tag).unwrap_or(false)
+    }
+
+    /// [`TagPaths::approve`], telling "not recorded" apart from "recorded, nothing was pending":
+    /// `None` when the approved overlay could not be written (the tag is NOT approved), else
+    /// whether the suggestion was present. A caller that answers a reader uses this one, so a
+    /// refused write is never shown as a promoted tag.
+    pub fn try_approve(&self, iri: &str, tag: &str) -> Option<bool> {
         let (target, raw) = self.targets(iri, tag);
-        let landed = update(&self.approved, DC_SUBJECT, |app| {
+        update(&self.approved, DC_SUBJECT, |app| {
             if !app.contains(&target) {
                 app.push(target.clone());
             }
-        });
-        if landed.is_none() {
-            return false;
-        }
-        Self::drop_suggestion(&self.suggestions, &target, &raw)
+        })?;
+        Some(Self::drop_suggestion(&self.suggestions, &target, &raw))
     }
 
     /// Dismiss a suggestion: drop it from the suggestions overlay AND remember the dismissal, so
@@ -414,11 +419,17 @@ impl TagPaths {
     ///
     /// The dismissal is recorded first, for the reason [`TagPaths::approve`] lands its tag first.
     pub fn reject(&self, iri: &str, tag: &str) -> bool {
+        self.try_reject(iri, tag).unwrap_or(false)
+    }
+
+    /// [`TagPaths::reject`], telling "not recorded" apart from "recorded, nothing was pending":
+    /// `None` when the dismissal could not be written, else whether the suggestion was present.
+    pub fn try_reject(&self, iri: &str, tag: &str) -> Option<bool> {
         let (target, raw) = self.targets(iri, tag);
         if !self.dismiss(iri, tag) {
-            return false;
+            return None;
         }
-        Self::drop_suggestion(&self.suggestions, &target, &raw)
+        Some(Self::drop_suggestion(&self.suggestions, &target, &raw))
     }
 
     /// Remove a pending suggestion (both key forms), under the suggestions overlay's lock. Whether
